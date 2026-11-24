@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# M2a A2 isolation harness (contract §3 "Isolation acceptance"), disposable and local.
+#
+#   integration/m2a/isolation/run        # exit 0 PASS, 1 FAIL, 2 prerequisite missing
+#
+# Boundary: one `--network none` namespace (loopback only, no routes) holding the
+# two registered TLS fixture lanes and a DNS sink; the subject joins it with
+# `--network container:`. The canary sink sits on the pre-existing default docker
+# bridge, i.e. beyond the boundary. Nothing creates docker networks, edits host
+# firewall/sysctls, mounts the docker socket, adds capabilities or runs privileged:
+# every container runs as the host uid with --cap-drop ALL, no-new-privileges and a
+# read-only rootfs. The only host input besides the runner image is a copy of the
+# host strace binary + its libraries, executed through its own loader inside the
+# container (ptrace of a child needs no capability).
+#
+# Observers (all outside the subject's code): canary log, lane log, DNS-sink log,
+# in-boundary probe, per-process strace of file + network syscalls, sentinel
+# sha256 inventories taken on the host before/after. Controls:
+#   positive  probe DNS query -> DNS sink; outside verifier -> canary; fs-control
+#             reads/writes sentinel paths under strace; subject's allowed requests
+#             -> lanes a and b
+#   red       misbehaving subject inside the boundary (must be detected by strace,
+#             DNS sink, sentinel hashes) and with the boundary removed (must reach
+#             the canary). If either red control is NOT detected the run FAILS.
+# Verdict: verify.py, fail closed on any missing/unparseable observation.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+STRACE_BIN="${TELELEM_ISOLATION_STRACE:-/usr/bin/strace}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+NAME="tl-iso-$STAMP"
+RUN="$HERE/_run/$STAMP"
+NONCE="$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+UIDGID="$(id -u):$(id -g)"
+
+prereq() { echo "isolation: PREREQUISITE MISSING: $*" >&2; exit 2; }
+say() { echo "==> $*"; }
+
+# ── prerequisites (bounded; nothing here changes the host) ────────────────────
+command -v docker >/dev/null || prereq "docker CLI"
+docker info >/dev/null 2>&1 || prereq "a reachable docker daemon for the invoking user"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || prereq "runner image $IMAGE (scripts/setup)"
+[[ -x "$STRACE_BIN" ]] || prereq "host strace at $STRACE_BIN (or set TELELEM_ISOLATION_STRACE)"
+for d in mint hpax; do
+  [[ -d "$ROOT/_build/test/lib/$d/ebin" ]] || prereq "_build/test/lib/$d/ebin (scripts/setup)"
+done
+command -v sha256sum >/dev/null || prereq "sha256sum"
+
+mkdir -p "$RUN"/{ebin,pki,fx,sbx/store,strace,verifier,verdict,obs/canary,obs/boundary,audit}
+chmod 700 "$RUN"
+
+cleanup() {
+  local ids
+  ids="$(docker ps -aq --filter "name=^${NAME}-" 2>/dev/null || true)"
+  [[ -n "$ids" ]] && docker rm -f $ids >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# Strace bundle: binary, its libraries and the loader it was linked against.
+cp -L "$STRACE_BIN" "$RUN/strace/strace"
+loader=""
+while read -r lib; do
+  [[ -n "$lib" ]] || continue
+  cp -L "$lib" "$RUN/strace/"
+  [[ "$lib" == *ld-linux* ]] && loader="$(basename "$lib")"
+done < <(ldd "$STRACE_BIN" | awk '/=>/ && $3 ~ /^\// {print $3} /^[[:space:]]*\/.*ld-linux/ {print $1}')
+[[ -n "$loader" ]] || prereq "dynamic loader for $STRACE_BIN (static strace is not handled)"
+STRACE="/opt/strace/$loader --library-path /opt/strace /opt/strace/strace"
+
+COMMON=(--pull never --user "$UIDGID" --cap-drop ALL --security-opt no-new-privileges
+        --read-only --tmpfs /tmp:rw,size=64m,mode=1777 -e HOME=/tmp -w /tmp)
+OBS_PY=(-v "$HERE/observers.py:/h/observers.py:ro")
+# Subject resolver config. TELELEM_ISOLATION_NO_INETRC=1 drops it to reproduce the
+# BEAM boot-time hostname lookup finding (expected verdict: FAIL).
+INETRC_ENV=(-e ERL_INETRC=/h/sandbox.inetrc)
+[[ "${TELELEM_ISOLATION_NO_INETRC:-0}" == 1 ]] && INETRC_ENV=()
+
+# drun NAME SECS LOG docker-run-args... : named, detached, bounded; kills on timeout.
+# (Killing a foreground `docker run` client would leave the container running.)
+drun() {
+  local n="$NAME-$1" secs="$2" log="$3" cid rc; shift 3
+  cid="$(docker run -d --name "$n" "$@")" || return 125
+  rc="$(timeout "$secs" docker wait "$cid")" || { docker kill "$cid" >/dev/null 2>&1; rc=124; }
+  docker logs "$cid" >"$log" 2>&1 || true
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+  [[ "$rc" == 124 ]] && echo "isolation: $n timed out after ${secs}s" >&2
+  return "$rc"
+}
+
+mark() {
+  local c d l
+  c=$(cat "$RUN/obs/canary/canary.jsonl" 2>/dev/null | wc -l)
+  d=$(cat "$RUN/obs/boundary/dns.jsonl" 2>/dev/null | wc -l)
+  l=$(cat "$RUN/obs/boundary/lanes.jsonl" 2>/dev/null | wc -l)
+  printf '{"phase":"%s","canary":%d,"dns":%d,"lanes":%d}\n' "$1" "$c" "$d" "$l" >>"$RUN/verifier/marks.jsonl"
+}
+
+wait_file() {
+  for _ in $(seq 1 200); do [[ -s "$1" ]] && return 0; sleep 0.05; done
+  echo "isolation: $1 not ready" >&2; return 1
+}
+
+say "run dir ${RUN#"$ROOT"/}  nonce $NONCE"
+
+# ── build: sandbox modules + throwaway PKI, both offline ──────────────────────
+# elixirc writes to the container's /tmp, then copies: `elixirc -o <bind mount>`
+# was observed to spin indefinitely on this runner.
+drun build 180 "$RUN/build.log" --network none "${COMMON[@]}" \
+  -v "$ROOT/lib/telelem/sandbox:/src:ro" -v "$RUN/ebin:/ebin" "$IMAGE" \
+  sh -ec 'mkdir /tmp/ebin && cd /tmp/ebin && elixirc --warnings-as-errors /src/*.ex && cp ./*.beam /ebin/' \
+  || { cat "$RUN/build.log" >&2; echo "isolation: FAIL (sandbox modules do not compile)" >&2; exit 1; }
+
+drun pki 60 "$RUN/pki.log" --network none "${COMMON[@]}" -v "$RUN/pki:/pki" -w /pki "$IMAGE" sh -ec '
+  printf "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n" > leaf.ext
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout ca.key -out ca.pem -days 2 \
+    -subj "/CN=telelem isolation throwaway CA" \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout leaf.key -out leaf.csr -subj "/CN=127.0.0.1"
+  openssl x509 -req -in leaf.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out leaf.pem -days 2 -extfile leaf.ext
+' >"$RUN/pki.log" 2>&1 || { cat "$RUN/pki.log" >&2; exit 1; }
+cp "$RUN/pki/ca.pem" "$RUN/fx/ca.pem"   # the subject sees only the CA certificate
+printf 'nameserver 127.0.0.53\noptions timeout:1 attempts:1\n' >"$RUN/resolv.conf"
+
+# ── observers ─────────────────────────────────────────────────────────────────
+docker run -d --name "$NAME-canary" --network bridge "${COMMON[@]}" "${OBS_PY[@]}" \
+  -v "$RUN/obs/canary:/obs" "$IMAGE" python3 -I /h/observers.py canary --obs /obs --nonce "$NONCE" >/dev/null
+docker run -d --name "$NAME-boundary" --network none "${COMMON[@]}" "${OBS_PY[@]}" \
+  -v "$RUN/obs/boundary:/obs" -v "$RUN/pki:/pki:ro" "$IMAGE" \
+  python3 -I /h/observers.py boundary --obs /obs --pki /pki >/dev/null
+wait_file "$RUN/obs/canary/ready.json"
+wait_file "$RUN/obs/boundary/ready.json"
+CANARY_IP="$(docker inspect -f '{{with index .NetworkSettings.Networks "bridge"}}{{.IPAddress}}{{end}}' "$NAME-canary")"
+[[ "$CANARY_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "isolation: no canary IP" >&2; exit 1; }
+printf '{"canary_ip":"%s","nonce":"%s","image":"%s"}\n' "$CANARY_IP" "$NONCE" "$IMAGE" >"$RUN/verifier/env.json"
+say "canary $CANARY_IP (default bridge); boundary netns $NAME-boundary (none)"
+mark start
+
+# ── bootstrap documents (sandbox root /sbx, fixture root /fx inside the subject) ──
+target() { printf '{"host":"%s","port":%d,"ca_file":"/fx/ca.pem"}' "$1" "$2"; }
+doc() {
+   printf '{"version":2,"tenant_id":"local","mode":"sandbox","fixture_targets":{"a":%s,"b":%s},"sandbox_store_root":"/sbx/store","sandbox_signer_ref":"sandbox:local-fixture"}\n' "$1" "$2"
+}
+doc "$(target 127.0.0.1 18443)" "$(target 127.0.0.1 18444)" >"$RUN/sbx/bootstrap.json"
+doc "$(target "$CANARY_IP" 443)" "$(target 127.0.0.1 18444)" >"$RUN/sbx/bootstrap-disallowed.json"
+
+# ── positive controls for the network observers ───────────────────────────────
+drun probe 60 "$RUN/verifier/probe.log" --network "container:$NAME-boundary" "${COMMON[@]}" "${OBS_PY[@]}" \
+  -v "$RUN/verifier:/out" "$IMAGE" python3 -I /h/observers.py probe --canary-ip "$CANARY_IP" --nonce "$NONCE" --out /out/probe.json
+mark probe
+drun outside 60 "$RUN/verifier/outside.log" --network bridge "${COMMON[@]}" "${OBS_PY[@]}" \
+  -v "$RUN/verifier:/out" "$IMAGE" python3 -I /h/observers.py outside-control --canary-ip "$CANARY_IP" --nonce "$NONCE" --out /out/outside.json
+mark outside
+
+# ── sentinels: distinct, non-secret, production-shaped, one fresh set per phase ──
+plant() {
+  local s="$RUN/sentinels/$1"
+  mkdir -p "$s"/{config,store,secrets,scratch}
+  printf 'TELELEM ISOLATION SENTINEL - NOT A SECRET - kind=prod-config phase=%s nonce=%s\n' "$1" "$NONCE" >"$s/config/telelem-prod-config.sentinel.json"
+  printf 'TELELEM ISOLATION SENTINEL - NOT A SECRET - kind=prod-store phase=%s nonce=%s\n' "$1" "$NONCE" >"$s/store/telelem-prod-receipts.sentinel.db"
+  printf 'TELELEM ISOLATION SENTINEL - NOT A SECRET - kind=prod-signer phase=%s nonce=%s\n' "$1" "$NONCE" >"$s/secrets/telelem-prod-signer.sentinel.key"
+}
+inventory() {  # independent of the subject: host-side, before and after
+  (cd "$RUN/sentinels/$1" && find config store secrets -print0 | sort -z | xargs -0 -r stat -c '%n %F %s %a' \
+     && find config store secrets -type f -print0 | sort -z | xargs -0 -r sha256sum) >"$RUN/verifier/sentinels-$1-$2.txt"
+}
+
+# run_subject PHASE NETWORK CONTROL(0|1) SUBJECT_ARGS...
+run_subject() {
+  local phase="$1" net="$2" control="$3"; shift 3
+  local s="$RUN/sentinels/$phase" a="$RUN/audit/$phase" cid ip rc
+  mkdir -p "$a"
+  plant "$phase"; inventory "$phase" before
+  cid="$(docker run -d --name "$NAME-$phase" --network "$net" "${COMMON[@]}" "${OBS_PY[@]}" \
+    -v "$HERE/subject.exs:/h/subject.exs:ro" -v "$RUN/ebin:/h/ebin:ro" \
+    -v "$ROOT/_build/test/lib/mint/ebin:/h/deps/mint:ro" -v "$ROOT/_build/test/lib/hpax/ebin:/h/deps/hpax:ro" \
+    -v "$RUN/strace:/opt/strace:ro" -v "$RUN/fx:/fx:ro" -v "$RUN/sbx:/sbx:ro" -v "$a:/audit" \
+    -v "$RUN/resolv.conf:/etc/resolv.conf:ro" \
+    -v "$s/config:/etc/telelem/production" \
+    -v "$s/store:/var/lib/telelem/production/store" \
+    -v "$s/secrets:/run/secrets/telelem-production" \
+    -v "$s/scratch:/var/lib/telelem/production/control-scratch" \
+    -v "$HERE/sandbox.inetrc:/h/sandbox.inetrc:ro" "${INETRC_ENV[@]}" \
+    -e "ST=$STRACE -f -ff -qq -yy -s 256 -e trace=%file,%network -e signal=none" -e "CONTROL=$control" \
+    "$IMAGE" bash -ec '
+      mkdir -p /audit/control /audit/subject
+      if [ "$CONTROL" = 1 ]; then
+        $ST -o /audit/control/t python3 -I /h/observers.py fs-control \
+          --read /etc/telelem/production/telelem-prod-config.sentinel.json \
+          --stat /run/secrets/telelem-production/telelem-prod-signer.sentinel.key \
+          --write /var/lib/telelem/production/control-scratch/fs-control.written \
+          --out /audit/control-result.json
+      fi
+      exec $ST -o /audit/subject/t elixir -pa /h/ebin -pa /h/deps/mint -pa /h/deps/hpax /h/subject.exs "$@"
+    ' subject "$@")"
+  ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid")"
+  rc="$(timeout 180 docker wait "$cid" || { docker kill "$cid" >/dev/null 2>&1; echo timeout; })"
+  docker logs "$cid" >"$RUN/verifier/$phase.log" 2>&1 || true
+  docker rm -f "$cid" >/dev/null 2>&1 || true
+  printf '{"phase":"%s","network":"%s","exit":"%s","container_ip":"%s"}\n' "$phase" "$net" "$rc" "$ip" \
+    >"$RUN/verifier/$phase.json"
+  inventory "$phase" after
+  mark "$phase"
+  say "$phase: exit $rc"
+}
+
+run_subject good "container:$NAME-boundary" 1 good /sbx/bootstrap.json /audit/subject-result.json
+run_subject red_boundary "container:$NAME-boundary" 0 misbehave "$CANARY_IP" "$NONCE" /audit/subject-result.json
+run_subject red_bridge bridge 0 misbehave "$CANARY_IP" "$NONCE" /audit/subject-result.json
+
+cleanup   # stop observers before judging; their logs are complete
+
+# ── verdict (offline container; reads the run dir read-only) ───────────────────
+set +e
+drun verify 120 "$RUN/verdict/verify.log" --network none "${COMMON[@]}" -v "$HERE/verify.py:/h/verify.py:ro" \
+  -v "$RUN:/run-dir:ro" -v "$RUN/verdict:/verdict" "$IMAGE" \
+  python3 -I /h/verify.py /run-dir /verdict/verdict.json
+status=$?
+cat "$RUN/verdict/verify.log"
+set -e
+say "verdict: ${RUN#"$ROOT"/}/verdict/verdict.json (exit $status)"
+exit "$status"

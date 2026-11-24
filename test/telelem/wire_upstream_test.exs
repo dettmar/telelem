@@ -80,7 +80,7 @@ defmodule Telelem.WireUpstreamTest do
 
     {:ok, {_, port}} = ThousandIsland.listener_info(bandit)
     sup = start_supervised!(DynamicSupervisor)
-    %{port: port, cacerts: client[:cacerts], sup: sup}
+    %{port: port, cacerts: client[:cacerts], sup: sup, server: server}
   end
 
   @small [
@@ -91,14 +91,15 @@ defmodule Telelem.WireUpstreamTest do
     cleanup_timeout_ms: 300
   ]
 
-  defp start(ctx, limits_kw \\ @small, lane_kw \\ []) do
+  defp start(ctx, limits_kw \\ @small, lane_kw \\ [], handoff_kw \\ [], upstream_kw \\ []) do
     limits = Limits.new(limits_kw)
 
     {:ok, h} =
       DynamicSupervisor.start_child(
         ctx.sup,
         {Handoff,
-         requester: self(), attempts: [:primary], cleanup_timeout: limits.cleanup_timeout_ms}
+         [requester: self(), attempts: [:primary], cleanup_timeout: limits.cleanup_timeout_ms] ++
+           handoff_kw}
       )
 
     lane =
@@ -111,12 +112,14 @@ defmodule Telelem.WireUpstreamTest do
       DynamicSupervisor.start_child(
         ctx.sup,
         {Upstream,
-         handoff: h,
-         id: :primary,
-         controller: self(),
-         lane: lane,
-         body: ~s({"stream":true}),
-         limits: limits}
+         [
+           handoff: h,
+           id: :primary,
+           controller: self(),
+           lane: lane,
+           body: ~s({"stream":true}),
+           limits: limits
+         ] ++ upstream_kw}
       )
 
     %{h: h, pid: pid, limits: limits, mon: Process.monitor(pid)}
@@ -423,5 +426,407 @@ defmodule Telelem.WireUpstreamTest do
     assert {:failed, _} = r.outcome
     assert r.reason == {:upstream_error_event, "boom"}
     assert r.data == []
+  end
+
+  # ── terminal authorization through the pinned admission authority (M2a) ──
+  #
+  # A real Telelem.Admission.Authority grants the terminal. Orders are forced
+  # by suspending the authority while the attempt's grant request is queued;
+  # the only wait is a bounded spin on message_queue_len.
+
+  defp wait_q(p, n, until \\ System.monotonic_time(:millisecond) + 5_000) do
+    cond do
+      elem(Process.info(p, :message_queue_len), 1) >= n ->
+        :ok
+
+      System.monotonic_time(:millisecond) > until ->
+        flunk("queue of #{inspect(p)} never reached #{n}")
+
+      true ->
+        wait_q(p, n, until)
+    end
+  end
+
+  defp kill!(p) do
+    m = Process.monitor(p)
+    Process.exit(p, :kill)
+    assert_receive {:DOWN, ^m, _, _, _}, 1_000
+  end
+
+  defp authority!(tmp_dir) do
+    sup =
+      start_supervised!(
+        {Telelem.Instance,
+         id: :wire_upstream_authority,
+         limits: %{slots: 4, units: 20},
+         spool_dir: Path.join(tmp_dir, "spool"),
+         transport: {Telelem.Test.Admission.TcpTransport, %{port: 1, label: "unused"}},
+         reserve_ttl: nil}
+      )
+
+    Telelem.Instance.authority(Telelem.Instance.handle(sup))
+  end
+
+  # Released, everything before [DONE] transferred; returns the live pieces.
+  defp streaming_to_done(ctx, handoff_kw, upstream_kw \\ []) do
+    auth = authority!(ctx.tmp_dir)
+
+    a =
+      start(
+        ctx,
+        @small,
+        [],
+        Keyword.merge(
+          [
+            admission_authority: auth,
+            terminal_deadline: System.monotonic_time(:millisecond) + 10_000
+          ],
+          handoff_kw
+        ),
+        upstream_kw
+      )
+
+    up = upstream!()
+    send(a.pid, {:telelem_wire_credit, a.h, 1_000_000})
+    ev = event(1)
+    push(up, ev)
+    push(up, @stop)
+    h = a.h
+    assert_receive {@tag_h, ^h, {:elected, :primary}}, 2_000
+    assert_receive {@tag_h, ^h, {:data, ^ev}}, 2_000
+    assert_receive {@tag_h, ^h, {:data, @stop}}, 2_000
+    Map.merge(a, %{auth: auth, up: up})
+  end
+
+  @tag :tmp_dir
+  test "authority dies with the attempt's grant request unanswered: no [DONE] reaches the requester, incomplete",
+       ctx do
+    a = streaming_to_done(ctx, [])
+    :sys.suspend(a.auth)
+    push(a.up, @done)
+    send(a.up, :finish)
+    # The attempt's terminal request is now queued at the suspended authority...
+    wait_q(a.auth, 1)
+    # ...and the authority dies without answering it.
+    kill!(a.auth)
+
+    {msgs, report} = collect(a.h)
+
+    refute {:data, @done} in msgs,
+           "marker delivered although the authority died first: #{inspect(msgs)}"
+
+    assert {:incomplete, {:authority_down, :killed}} in msgs
+    refute Enum.any?(msgs, &match?({:done, _}, &1))
+    assert report.authority == :lost and report.committed and report.authorization == :admission
+    assert_receive {:telelem_wire, _, :primary, {:ended, {:finish_refused, :cancelled}, _}}, 2_000
+  end
+
+  @tag :tmp_dir
+  test "admission default mode: the granted [DONE] and done are adjacent", ctx do
+    a = streaming_to_done(ctx, [])
+    push(a.up, @done)
+    send(a.up, :finish)
+    {msgs, report} = collect(a.h)
+    assert Enum.take(msgs, -2) == [{:data, @done}, {:done, {:upstream_done, "stop"}}]
+    assert report.authorization == :admission and report.authority == :up
+  end
+
+  @tag :tmp_dir
+  test "authority killed before the body completes: winner cancelled, [DONE] never forwarded",
+       ctx do
+    a = streaming_to_done(ctx, [])
+    kill!(a.auth)
+    {msgs, report} = collect(a.h)
+    assert msgs == [{:incomplete, {:authority_down, :killed}}]
+    assert report.authority == :lost
+
+    assert_receive {:telelem_wire, _, :primary,
+                    {:ended, {:cancelled, {:authority_down, :killed}}, _}},
+                   2_000
+  end
+
+  @tag :tmp_dir
+  test "terminal_ack: [DONE] handed over as {:terminal, _, deadline}; done only after the confirmed write, even if the authority dies first",
+       ctx do
+    a = streaming_to_done(ctx, terminal_ack: true)
+    h = a.h
+    push(a.up, @done)
+    send(a.up, :finish)
+    assert_receive {@tag_h, ^h, {:terminal, @done, d}} when is_integer(d), 2_000
+    assert_receive {:telelem_wire, _, :primary, {:ended, :finished, stats}}, 2_000
+    assert stats.events_forwarded == 3
+    # Upstream complete and the attempt closed; still no outcome.
+    assert Handoff.status(h).outcome == nil
+    kill!(a.auth)
+    assert Handoff.status(h).authority == :lost
+    refute_received {@tag_h, ^h, {_, _}}
+    assert :ok = Handoff.terminal_written(h, :ok)
+    {msgs, report} = collect(h)
+    assert msgs == [{:done, {:upstream_done, "stop"}}]
+    assert report.terminal == %{upstream: :complete, downstream: :written}
+  end
+
+  @tag :tmp_dir
+  test "terminal_ack: a failed downstream write of [DONE] is incomplete, never done", ctx do
+    a = streaming_to_done(ctx, terminal_ack: true)
+    h = a.h
+    push(a.up, @done)
+    send(a.up, :finish)
+    assert_receive {@tag_h, ^h, {:terminal, @done, _}}, 2_000
+    assert :ok = Handoff.terminal_written(h, {:error, :closed})
+    {msgs, report} = collect(h)
+    assert msgs == [{:incomplete, {:downstream_write, :closed}}]
+    assert report.terminal.downstream == {:error, :closed}
+  end
+
+  # ── timed terminal authorization: the attempt supplies the shared deadline ──
+  #
+  # The exact arguments of the attempt's Handoff.finish call are captured with
+  # an isolated call-trace session on the attempt process (OTP 27+ `:trace`),
+  # so the deadline it passes is asserted by value, not inferred from timing.
+  # The coordinator is then wedged (:sys.suspend) with the finish call queued,
+  # and the effect is observed end to end: when the attempt gives up.
+
+  @grace 1_000
+
+  defp trace_finish_calls(pid) do
+    session = :trace.session_create(:wire_upstream_finish, self(), [])
+    on_exit(fn -> :trace.session_destroy(session) end)
+    # :local also catches finish/3 -> finish/4 inside Handoff.
+    :trace.function(session, {Handoff, :finish, :_}, true, [:local])
+    1 = :trace.process(session, pid, true, [:call])
+    session
+  end
+
+  # Releases [DONE] with the coordinator wedged; returns once the attempt's
+  # finish call is queued at the coordinator, with that call's arguments.
+  defp finish_into_wedged_coordinator(a) do
+    pid = a.pid
+    h = a.h
+    trace_finish_calls(pid)
+    :sys.suspend(h)
+    push(a.up, @done)
+    send(a.up, :finish)
+    assert_receive {:trace, ^pid, :call, {Handoff, :finish, args}}, 2_000
+    wait_q(h, 1)
+    args
+  end
+
+  @tag :tmp_dir
+  test "timed attempt passes the coordinator's exact terminal_deadline to finish/4 and is fenced at deadline + grace, not the 5s call timeout",
+       ctx do
+    d = System.monotonic_time(:millisecond) + 2_000
+    a = streaming_to_done(ctx, [terminal_deadline: d], terminal_deadline: d)
+    h = a.h
+    hm = Process.monitor(h)
+
+    args = finish_into_wedged_coordinator(a)
+    assert args == [h, {:upstream_done, "stop"}, @done, [deadline: d]]
+    # finish/4 is entered directly: no legacy finish/3 frame.
+    pid = a.pid
+    refute_received {:trace, ^pid, :call, {Handoff, :finish, [_, _, _]}}
+    called = System.monotonic_time(:millisecond)
+    assert called < d, "finish reached the coordinator only after d; test proves nothing"
+
+    assert_receive {:telelem_wire, _, :primary, {:ended, :finish_unconfirmed, stats}}, 4_000
+    t = System.monotonic_time(:millisecond)
+    assert t >= d + @grace
+    # Legacy would wait the 5s call timeout from `called` (>= d + 3_000 here).
+    assert t < d + @grace + 500, "fenced #{t - d}ms after d"
+    assert stats.cleaned_ack == {:error, :handoff_down}
+    assert_receive {:DOWN, ^hm, :process, ^h, :killed}, 1_000
+    refute_received {@tag_h, ^h, {:data, @done}}
+    refute_received {@tag_h, ^h, {:terminal, _, _}}
+    refute_received {@tag_h, ^h, {:done, _}}
+  end
+
+  @tag :tmp_dir
+  test "control: without :terminal_deadline the attempt calls legacy finish/3 and keeps waiting past deadline + grace",
+       ctx do
+    d = System.monotonic_time(:millisecond) + 1_500
+    a = streaming_to_done(ctx, terminal_deadline: d)
+    h = a.h
+
+    args = finish_into_wedged_coordinator(a)
+    assert args == [h, {:upstream_done, "stop"}, @done]
+    pid = a.pid
+    assert_receive {:trace, ^pid, :call, {Handoff, :finish, [^h, _, _, []]}}, 1_000
+    assert System.monotonic_time(:millisecond) < d
+
+    # Well past deadline + grace the legacy attempt is still waiting...
+    refute_receive {:telelem_wire, _, :primary, {:ended, _, _}},
+                   max(d + @grace + 300 - System.monotonic_time(:millisecond), 0)
+
+    # ...so the coordinator's reply still reaches it: refused at the deadline.
+    :sys.resume(h)
+
+    assert_receive {:telelem_wire, _, :primary, {:ended, {:finish_refused, :cancelled}, _}},
+                   2_000
+
+    refute_received {@tag_h, ^h, {:data, @done}}
+  end
+
+  test "a non-integer :terminal_deadline is rejected before the attempt is spawned" do
+    assert_raise ArgumentError, ~r/terminal_deadline/, fn ->
+      Upstream.start_link(handoff: self(), terminal_deadline: :soon)
+    end
+  end
+
+  # ── supported framing only: raw loopback TLS upstream (no Bandit) ──
+  #
+  # A hand-written HTTP/1.1 server on 127.0.0.1 sends exactly the bytes below.
+  # Mint reports {:done, ref} for a close-delimited body (shown directly by the
+  # first test), so :done alone must not count as completion.
+
+  defp chunked(events),
+    do:
+      Enum.map_join(events, &(Integer.to_string(byte_size(&1), 16) <> "\r\n" <> &1 <> "\r\n")) <>
+        "0\r\n\r\n"
+
+  defp sse_events, do: [event(1), @stop, @done]
+
+  @sse_head "content-type: text/event-stream\r\n"
+
+  defp raw_response(:close_delimited),
+    do: "HTTP/1.1 200 OK\r\n" <> @sse_head <> "\r\n" <> Enum.join(sse_events())
+
+  defp raw_response(:content_length) do
+    body = Enum.join(sse_events())
+    "HTTP/1.1 200 OK\r\n" <> @sse_head <> "content-length: #{byte_size(body)}\r\n\r\n" <> body
+  end
+
+  defp raw_response(:http10_chunked),
+    do:
+      "HTTP/1.0 200 OK\r\n" <>
+        @sse_head <> "transfer-encoding: chunked\r\n\r\n" <> chunked(sse_events())
+
+  defp raw_response(:gzip_chunked),
+    do:
+      "HTTP/1.1 200 OK\r\n" <>
+        @sse_head <> "transfer-encoding: gzip, chunked\r\n\r\n" <> chunked(sse_events())
+
+  defp raw_response(:chunked),
+    do:
+      "HTTP/1.1 200 OK\r\n" <>
+        @sse_head <> "transfer-encoding: chunked\r\n\r\n" <> chunked(sse_events())
+
+  # One-shot TLS server: reads the request, writes `parts` (pausing between
+  # them, so the status line can straddle deliveries) and closes cleanly.
+  defp raw_server(ctx, parts) do
+    {:ok, l} =
+      :ssl.listen(0,
+        ip: {127, 0, 0, 1},
+        cert: ctx.server[:cert],
+        key: ctx.server[:key],
+        cacerts: ctx.server[:cacerts],
+        active: false,
+        mode: :binary,
+        reuseaddr: true
+      )
+
+    {:ok, {_, port}} = :ssl.sockname(l)
+    test = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, t} = :ssl.transport_accept(l, 5_000)
+        {:ok, s} = :ssl.handshake(t, 5_000)
+        send(test, {:raw_request, recv_request(s, "")})
+
+        for {p, i} <- Enum.with_index(parts) do
+          if i > 0, do: Process.sleep(30)
+          _ = :ssl.send(s, p)
+        end
+
+        send(test, :raw_sent)
+        _ = :ssl.close(s)
+        :ssl.close(l)
+      end)
+
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    port
+  end
+
+  defp recv_request(s, acc) do
+    if String.ends_with?(acc, ~s({"stream":true})) do
+      acc
+    else
+      {:ok, d} = :ssl.recv(s, 0, 5_000)
+      recv_request(s, acc <> d)
+    end
+  end
+
+  defp run_raw(ctx, parts) do
+    a = start(ctx, @small, port: raw_server(ctx, parts))
+    send(a.pid, {:telelem_wire_credit, a.h, 1_000_000})
+    assert_receive {:raw_request, "POST /v1/chat/completions HTTP/1.1\r\n" <> _}, 5_000
+    {msgs, report} = collect(a.h)
+    assert_receive {:telelem_wire, _, :primary, {:ended, reason, _}}, 2_000
+    %{msgs: msgs, report: report, reason: reason}
+  end
+
+  test "control: Mint itself reports {:done, ref} for a close-delimited SSE body", ctx do
+    port = raw_server(ctx, [raw_response(:close_delimited)])
+
+    {:ok, conn} =
+      Mint.HTTP.connect(:https, "127.0.0.1", port,
+        protocols: [:http1],
+        transport_opts: [cacerts: ctx.cacerts]
+      )
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "POST", "/v1/chat/completions", [], ~s({"stream":true}))
+
+    assert_receive :raw_sent, 5_000
+    {responses, _conn} = mint_until_done(conn, ref, [])
+    assert {:done, ref} in responses
+    body = for({:data, ^ref, d} <- responses, do: d) |> IO.iodata_to_binary()
+    assert String.ends_with?(body, @done)
+  end
+
+  defp mint_until_done(conn, ref, acc) do
+    receive do
+      msg ->
+        case Mint.HTTP.stream(conn, msg) do
+          {:ok, conn, rs} ->
+            acc = acc ++ rs
+            if {:done, ref} in rs, do: {acc, conn}, else: mint_until_done(conn, ref, acc)
+
+          {:error, conn, _e, rs} ->
+            {acc ++ rs, conn}
+
+          :unknown ->
+            mint_until_done(conn, ref, acc)
+        end
+    after
+      3_000 -> flunk("Mint never finished: #{inspect(acc)}")
+    end
+  end
+
+  test "close-delimited, content-length, HTTP/1.0 and non-plain chunked bodies never complete; nothing is forwarded",
+       ctx do
+    for {kind, framing} <- [
+          close_delimited: :close_delimited,
+          content_length: :content_length,
+          http10_chunked: {:http_version, {:http, {1, 0}}},
+          gzip_chunked: {:transfer_encoding, ["gzip", "chunked"]}
+        ] do
+      r = run_raw(ctx, [raw_response(kind)])
+      assert r.reason == {:protocol_violation, {:unsupported_framing, framing}}, inspect(kind)
+      assert r.msgs == [{:failed, :no_winner}], inspect({kind, r.msgs})
+      refute r.report.committed
+    end
+  end
+
+  test "valid control: the same raw server with HTTP/1.1 chunked framing completes with the exact [DONE]",
+       ctx do
+    resp = raw_response(:chunked)
+    # Also split inside the status line, so it straddles two TLS deliveries.
+    for parts <- [[resp], [binary_part(resp, 0, 5), binary_part(resp, 5, byte_size(resp) - 5)]] do
+      r = run_raw(ctx, parts)
+      assert r.reason == :finished
+      assert List.last(for {:data, d} <- r.msgs, do: d) == @done
+      assert {:done, {:upstream_done, "stop"}} in r.msgs
+    end
   end
 end

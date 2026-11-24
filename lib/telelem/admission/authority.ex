@@ -50,6 +50,23 @@ defmodule Telelem.Admission.Authority do
 
   ## Observations
 
+  ## Terminal grants (M2a)
+
+  `request_terminal_grant/2` asks this authority, through its own mailbox,
+  whether a stream may declare completion. The authority answers
+  `{:telelem_terminal_grant, self(), nonce, incarnation}` to the requesting
+  process while it is handling that message. Because a process's messages and
+  its exit reach a given receiver in the order they were sent, a grant is
+  either received **before** this authority's `:DOWN`, or it was never issued.
+  Issuing a grant is the linearization point of terminal authorization
+  against the instance fence: a grant issued before death stays valid
+  whatever the requester does afterwards, and no grant can follow death. The
+  grant changes no ledger state, it is not spend authority, and an unused
+  grant needs no cleanup. Only `Telelem.Handoff`'s `:admission_authority`
+  mode sends this request.
+
+  ## Observations
+
   Every process in the directory's subscriber list receives
   `{:telelem_admission, tag, event}`, where `event` is one of:
 
@@ -89,6 +106,18 @@ defmodule Telelem.Admission.Authority do
 
   @spec reconcile(GenServer.server(), grant_id(), non_neg_integer()) :: result()
   def reconcile(auth, gid, actual), do: GenServer.call(auth, {:reconcile, gid, actual})
+
+  @doc """
+  Asks the authority `auth` (a pid, never re-resolved) for a terminal grant.
+  Asynchronous: the reply is `{:telelem_terminal_grant, auth, nonce,
+  incarnation}`, sent to the caller, or nothing if `auth` dies first (watch it
+  with a monitor). See "Terminal grants".
+  """
+  @spec request_terminal_grant(pid(), reference()) :: :ok
+  def request_terminal_grant(auth, nonce) when is_pid(auth) and is_reference(nonce) do
+    send(auth, {:telelem_terminal_authorize, self(), nonce})
+    :ok
+  end
 
   @doc "Ledger observations plus `stale_rejections` and the authority pid."
   @spec snapshot(GenServer.server()) :: map()
@@ -208,6 +237,14 @@ defmodule Telelem.Admission.Authority do
       _ ->
         {:noreply, s}
     end
+  end
+
+  # Answered while this incarnation is alive and handling its mailbox; that is
+  # the whole decision (see "Terminal grants").
+  def handle_info({:telelem_terminal_authorize, from, nonce}, s)
+      when is_pid(from) and is_reference(nonce) do
+    send(from, {:telelem_terminal_grant, self(), nonce, s.ledger.incarnation})
+    {:noreply, s}
   end
 
   def handle_info(_msg, s), do: {:noreply, s}
