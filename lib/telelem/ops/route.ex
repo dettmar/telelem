@@ -35,8 +35,12 @@ defmodule Telelem.Ops.Route do
       `{:error, {:apply_outcome_unknown, %{cause: cause, expected_rev: e,
       plan_digest: d}}}` with `cause` `:store_unavailable` (call exited,
       raised or threw, e.g. a timeout) or `:store_integrity` (reply not
-      well formed, or inconsistent with the request). The write may or may
-      not have committed. Ops does not retry, and must not report this as a
+      well formed, or inconsistent with the request). A `{:conflict, record}`
+      reply is usable only if `record` is well formed, has a `rev` greater
+      than the base apply read, and is accepted by the injected `Revisions`
+      module as a base revision (as `read/3` probes it); otherwise it is
+      `:store_integrity` and none of its data is returned. The write may or
+      may not have committed. Ops does not retry, and must not report this as a
       failure: the caller reads back and compares `last_plan_digest` with `d`
       (§4). A match confirms the plan is applied; a mismatch does not prove it
       never landed, since a later write may have superseded it.
@@ -128,47 +132,65 @@ defmodule Telelem.Ops.Route do
       {mod, arg} = ctx.store
       expected = %{rev: record.revision.rev, digest: record.revision.digest}
 
-      store_call(fn ->
+      sent = %{
+        ctx: ctx,
+        route_id: route_id,
+        expected: expected,
+        proposed: proposed,
+        plan_digest: recomputed,
+        expected_rev: expected_rev
+      }
+
+      contained(fn ->
         mod.compare_and_write(arg, tenant, route_id, expected, proposed, recomputed)
       end)
-      |> written(route_id, expected, proposed, recomputed, expected_rev)
+      |> written(sent)
     end
   end
 
-  # Interpret a compare-and-write reply. Anything but a well-formed success
-  # for exactly this proposal, or a well-formed conflict, is outcome-unknown.
-  defp written({:returned, {:ok, record}}, route_id, _expected, proposed, digest, e) do
-    if record?(record, route_id) and same_revision?(record.revision, proposed) and
-         record.last_plan_digest == digest,
+  # Interpret a compare-and-write reply. Only a well-formed success for
+  # exactly this proposal, or a usable conflict (`stale_conflict?/2`), is
+  # reported as such; anything else is outcome-unknown. Ops never retries.
+  defp written({:returned, {:ok, record}}, s) do
+    if record?(record, s.route_id) and same_revision?(record.revision, s.proposed) and
+         record.last_plan_digest == s.plan_digest,
        do: {:ok, %{effective_revision: record.revision, plan_digest: record.last_plan_digest}},
-       else: outcome_unknown(:store_integrity, e, digest)
+       else: outcome_unknown(:store_integrity, s)
   end
 
-  defp written({:returned, {:conflict, :not_found}}, _route_id, _expected, _proposed, _d, e),
-    do: conflict(:stale_revision, e, nil)
+  defp written({:returned, {:conflict, :not_found}}, s),
+    do: conflict(:stale_revision, s.expected_rev, nil)
 
-  defp written({:returned, {:conflict, record}}, route_id, expected, _proposed, digest, e) do
-    if record?(record, route_id) and
-         not (record.revision.rev == expected.rev and record.revision.digest == expected.digest),
-       do: conflict(:stale_revision, e, record),
-       else: outcome_unknown(:store_integrity, e, digest)
+  defp written({:returned, {:conflict, record}}, s) do
+    if stale_conflict?(record, s),
+      do: conflict(:stale_revision, s.expected_rev, record),
+      else: outcome_unknown(:store_integrity, s)
   end
 
-  defp written({:returned, _malformed}, _route_id, _expected, _proposed, digest, e),
-    do: outcome_unknown(:store_integrity, e, digest)
+  defp written({:returned, _malformed}, s), do: outcome_unknown(:store_integrity, s)
+  defp written(:failed, s), do: outcome_unknown(:store_unavailable, s)
 
-  defp written(:failed, _route_id, _expected, _proposed, digest, e),
-    do: outcome_unknown(:store_unavailable, e, digest)
+  # A conflict record is reported (its `rev` and `last_plan_digest` reach the
+  # caller) only if it is well formed, strictly newer than the base this apply
+  # read (revisions only advance, so an equal or older `rev` contradicts the
+  # fetch), and accepted by the injected `Revisions` module as a base
+  # revision, the same check `read/3` applies. The check is contained: a
+  # revision module that raises here yields outcome-unknown, not a crash
+  # after a write that may have committed.
+  defp stale_conflict?(record, s) do
+    record?(record, s.route_id) and record.revision.rev > s.expected.rev and
+      contained(fn -> probe(s.ctx, record.revision) end) == {:returned, :ok}
+  end
 
   # Field-wise, so a store may return an equal plain map instead of a struct.
   defp same_revision?(written, proposed),
     do: Enum.all?(@revision_fields, &(Map.get(written, &1) == Map.get(proposed, &1)))
 
-  defp outcome_unknown(cause, expected_rev, plan_digest),
+  defp outcome_unknown(cause, s),
     do:
       {:error,
        {:apply_outcome_unknown,
-        %{cause: cause, expected_rev: expected_rev, plan_digest: plan_digest}}}
+        %{cause: cause, expected_rev: s.expected_rev, plan_digest: s.plan_digest}}}
 
   @spec read(principal(), Context.t(), String.t()) ::
           {:ok, %{effective_revision: map(), last_plan_digest: String.t() | nil}}
@@ -254,7 +276,7 @@ defmodule Telelem.Ops.Route do
   ## Store and revision boundary
 
   defp fetch(%Context{store: {mod, arg}}, tenant, route_id) do
-    case store_call(fn -> mod.fetch(arg, tenant, route_id) end) do
+    case contained(fn -> mod.fetch(arg, tenant, route_id) end) do
       {:returned, :not_found} ->
         :not_found
 
@@ -270,8 +292,9 @@ defmodule Telelem.Ops.Route do
   end
 
   # Store adapters may exit (GenServer timeout, noproc), raise (driver errors)
-  # or throw. None of that, nor its reason, crosses the handler boundary.
-  defp store_call(fun) do
+  # or throw. None of that, nor its reason, crosses the handler boundary. Also
+  # used for the post-CAS conflict check, which must not crash either.
+  defp contained(fun) do
     {:returned, fun.()}
   catch
     _kind, _reason -> :failed

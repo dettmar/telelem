@@ -879,3 +879,201 @@ defmodule Telelem.Ops.StoreFaultTest do
     end
   end
 end
+
+defmodule Telelem.OpsTest.RaisingProbeRevisions do
+  @moduledoc """
+  Accepts rev 1 as a base like `FakeRevisions`, but raises when asked to
+  accept any later revision (as the post-CAS conflict check does).
+  """
+  @behaviour Telelem.Ops.Revisions
+
+  @impl true
+  def with_preferred(%{rev: 1} = current, preferred),
+    do: Telelem.OpsTest.FakeRevisions.with_preferred(current, preferred)
+
+  def with_preferred(_current, _preferred), do: raise("s3cr3t-reason-do-not-echo")
+end
+
+defmodule Telelem.Ops.ConflictIntegrityTest do
+  @moduledoc """
+  Deterministic probe for the post-CAS conflict path. A `{:conflict, record}`
+  reply from `compare_and_write/6` is a clean `:stale_revision` only if that
+  record is a sound revision under the injected revision contract and newer
+  than the base apply read. Anything else is unusable: apply reports
+  `:apply_outcome_unknown` with cause `:store_integrity`, echoes no stored data,
+  and does not retry. Replies are scripted with `ScriptedStore`; nothing sleeps.
+  """
+  use ExUnit.Case, async: true
+
+  alias Telelem.Ops.{CLI, Context, MemoryStore, Route}
+  alias Telelem.OpsTest.{FakeRevisions, RaisingProbeRevisions, ScriptedStore}
+  import Telelem.OpsTest.Fixtures
+
+  @secret "s3cr3t-reason-do-not-echo"
+
+  setup do
+    store = seeded_store()
+    {:ok, rec1} = MemoryStore.fetch(store, "local", "chat")
+    {:ok, rev2} = FakeRevisions.with_preferred(rec1.revision, "b")
+    other_digest = String.duplicate("e", 64)
+    %{store: store, ctx: ctx(store), rec1: rec1, rev2: rev2, other: other_digest}
+  end
+
+  # A ScriptedStore whose compare-and-write records each call to the test
+  # process and returns `reply` without touching the real store.
+  defp replying(store, reply, revisions \\ FakeRevisions) do
+    test = self()
+
+    %Context{
+      mode: :sandbox,
+      revisions: revisions,
+      store:
+        {ScriptedStore,
+         %{
+           server: store,
+           cas: fn _real ->
+             send(test, :cas_called)
+             reply
+           end
+         }}
+    }
+  end
+
+  defp assert_unknown(ctx, d) do
+    assert {:error,
+            {:apply_outcome_unknown, %{cause: :store_integrity, expected_rev: 1, plan_digest: ^d}}} =
+             Route.apply(operator(), ctx, "chat", 1, "b", d)
+
+    # Exactly one compare-and-write: no blind retry.
+    assert_received :cas_called
+    refute_received :cas_called
+
+    {status, out} =
+      CLI.run(
+        [
+          "apply",
+          JSON.encode!(%{route_id: "chat", expected_rev: 1, preferred: "b", plan_digest: d})
+        ],
+        operator(),
+        ctx
+      )
+
+    assert_received :cas_called
+    refute_received :cas_called
+    assert status == 5
+    refute out =~ @secret
+
+    # Fixed body: no current_rev, last_plan_digest or other stored data.
+    assert JSON.decode!(out) == %{
+             "ok" => false,
+             "op" => "apply",
+             "error" => "apply_outcome_unknown",
+             "cause" => "store_integrity",
+             "expected_rev" => 1,
+             "plan_digest" => d,
+             "resolve" => "read_and_compare_last_plan_digest"
+           }
+  end
+
+  defp plan_b(c) do
+    {:ok, %{plan_digest: d}} = Route.plan(operator(), c.ctx, "chat", 1, "b")
+    d
+  end
+
+  test "Sol repro: newer conflict record with a digest that does not verify", c do
+    d = plan_b(c)
+    # Structurally valid rev 2, a control changed after hashing.
+    tampered = %{revision: %{c.rev2 | deadline_ms: 1}, last_plan_digest: c.other}
+    assert_unknown(replying(c.store, {:conflict, tampered}), d)
+
+    # Same, with the digest replaced by another well-formed hex string.
+    forged = %{revision: %{c.rev2 | digest: c.other}, last_plan_digest: c.other}
+    assert_unknown(replying(c.store, {:conflict, forged}), d)
+
+    # Nothing was written, and the store still holds rev 1.
+    assert {:ok, %{effective_revision: %{rev: 1}, last_plan_digest: nil}} =
+             Route.read(operator(), c.ctx, "chat")
+  end
+
+  test "newer conflict record the revision module refuses (digest consistent)", c do
+    d = plan_b(c)
+    bad = FakeRevisions.rehash(%{c.rev2 | preferred: "z"})
+    assert_unknown(replying(c.store, {:conflict, %{revision: bad, last_plan_digest: nil}}), d)
+  end
+
+  test "conflict record at or below the base revision is unusable", c do
+    d = plan_b(c)
+    # Same rev as the base apply read, but a different (self-consistent) revision.
+    same_rev = FakeRevisions.rehash(%{c.rev2 | rev: 1})
+    assert same_rev.digest != c.rec1.revision.digest
+
+    assert_unknown(
+      replying(c.store, {:conflict, %{revision: same_rev, last_plan_digest: nil}}),
+      d
+    )
+
+    # Exactly the base revision (the store says it does not match itself).
+    assert_unknown(replying(c.store, {:conflict, c.rec1}), d)
+  end
+
+  test "an older conflict record (store went backwards) is unusable", c do
+    {:ok, %{plan_digest: d1}} = Route.plan(operator(), c.ctx, "chat", 1, "b")
+    {:ok, _} = Route.apply(operator(), c.ctx, "chat", 1, "b", d1)
+    {:ok, %{plan_digest: d2}} = Route.plan(operator(), c.ctx, "chat", 2, "a")
+
+    ctx = replying(c.store, {:conflict, c.rec1})
+
+    assert {:error,
+            {:apply_outcome_unknown,
+             %{cause: :store_integrity, expected_rev: 2, plan_digest: ^d2}}} =
+             Route.apply(operator(), ctx, "chat", 2, "a", d2)
+
+    assert_received :cas_called
+    refute_received :cas_called
+  end
+
+  test "a revision module that raises while checking the conflict record", c do
+    ctx = %{
+      replying(
+        c.store,
+        {:conflict, %{revision: c.rev2, last_plan_digest: c.other}},
+        RaisingProbeRevisions
+      )
+      | revisions: RaisingProbeRevisions
+    }
+
+    {:ok, %{plan_digest: d}} = Route.plan(operator(), ctx, "chat", 1, "b")
+    assert_unknown(ctx, d)
+  end
+
+  test "control: a sound newer conflict record is still a clean stale revision", c do
+    d = plan_b(c)
+    good = %{revision: c.rev2, last_plan_digest: c.other}
+    ctx = replying(c.store, {:conflict, good})
+
+    assert {:conflict,
+            %{reason: :stale_revision, expected_rev: 1, current_rev: 2, last_plan_digest: other}} =
+             Route.apply(operator(), ctx, "chat", 1, "b", d)
+
+    assert other == c.other
+    assert_received :cas_called
+    refute_received :cas_called
+
+    # A plain map (not the revision module's own term) is fine too.
+    plain = %{good | revision: Map.new(c.rev2)}
+
+    assert {:conflict, %{reason: :stale_revision, current_rev: 2}} =
+             Route.apply(operator(), replying(c.store, {:conflict, plain}), "chat", 1, "b", d)
+
+    # Route removed between fetch and write: no record to check, still stale.
+    assert {:conflict, %{reason: :stale_revision, current_rev: nil, last_plan_digest: nil}} =
+             Route.apply(
+               operator(),
+               replying(c.store, {:conflict, :not_found}),
+               "chat",
+               1,
+               "b",
+               d
+             )
+  end
+end

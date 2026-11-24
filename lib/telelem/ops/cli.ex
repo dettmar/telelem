@@ -20,7 +20,7 @@ defmodule Telelem.Ops.CLI do
   | 2 | `invalid` / `usage` | bad request; `field` names the request field |
   | 3 | `denied` | principal lacks authority |
   | 4 | `not_found` | no such route for this tenant |
-  | 5 | `apply_outcome_unknown` | apply only: the compare-and-write was sent but no well-formed reply came back (`cause`: `store_unavailable` or `store_integrity`). The write **may have committed**. Do not reissue blindly: `read` and compare `last_plan_digest` with the returned `plan_digest` (§4). |
+  | 5 | `apply_outcome_unknown` | apply only: the compare-and-write was sent but no usable reply came back (none, malformed, or a conflict whose record fails integrity checks) (`cause`: `store_unavailable` or `store_integrity`). The write **may have committed**. Do not reissue blindly: `read` and compare `last_plan_digest` with the returned `plan_digest` (§4). |
   | 69 | `unavailable` | `reason: store_unavailable`; the store could not be read, nothing written by this call; safe to retry |
   | 70 | `internal` | `reason: store_integrity` (stored record or store reply malformed or corrupt) or `revision_invariant`; nothing written by this call |
 

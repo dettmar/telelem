@@ -1,3 +1,22 @@
+defmodule Telelem.Ops.RouteRevisionIntegrationTest.HookStore do
+  @moduledoc """
+  `MemoryStore` wrapper whose compare-and-write calls `cas.(real)` with a
+  thunk for the real call, so a test can interleave a write or replace the
+  reply. Each compare-and-write is reported to `test` as `:cas_called`.
+  """
+  @behaviour Telelem.Ops.RevisionStore
+  alias Telelem.Ops.MemoryStore
+
+  @impl true
+  def fetch(%{server: s}, tenant, route), do: MemoryStore.fetch(s, tenant, route)
+
+  @impl true
+  def compare_and_write(%{server: s, cas: cas, test: test}, tenant, route, expected, new, d) do
+    send(test, :cas_called)
+    cas.(fn -> MemoryStore.compare_and_write(s, tenant, route, expected, new, d) end)
+  end
+end
+
 defmodule Telelem.Ops.RouteRevisionIntegrationTest do
   @moduledoc """
   Ops handlers with A1's `Telelem.Route.Revision` injected directly (it
@@ -7,6 +26,7 @@ defmodule Telelem.Ops.RouteRevisionIntegrationTest do
   use ExUnit.Case, async: true
 
   alias Telelem.Ops.{CLI, Context, MemoryStore, Route}
+  alias Telelem.Ops.RouteRevisionIntegrationTest.HookStore
   alias Telelem.Route.Revision
 
   @op %{
@@ -31,7 +51,12 @@ defmodule Telelem.Ops.RouteRevisionIntegrationTest do
       )
 
     :ok = MemoryStore.seed(store, "local", rev1)
-    %{rev1: rev1, ctx: %Context{mode: :sandbox, store: {MemoryStore, store}, revisions: Revision}}
+
+    %{
+      rev1: rev1,
+      store: store,
+      ctx: %Context{mode: :sandbox, store: {MemoryStore, store}, revisions: Revision}
+    }
   end
 
   test "contract example: prefer b against rev 1, read back rev 2", %{ctx: ctx, rev1: rev1} do
@@ -104,5 +129,70 @@ defmodule Telelem.Ops.RouteRevisionIntegrationTest do
              Route.apply(@op, ctx, "chat", 1, "a", d)
 
     assert :ok = Revision.verify(r)
+  end
+
+  describe "post-CAS conflict record under A1's contract" do
+    defp hooked(c, cas),
+      do: %{c.ctx | store: {HookStore, %{server: c.store, cas: cas, test: self()}}}
+
+    test "a genuine concurrent write is a clean stale revision", c do
+      {:ok, %{plan_digest: d}} = Route.plan(@op, c.ctx, "chat", 1, "b")
+      {:ok, %{plan_digest: other}} = Route.plan(@op, c.ctx, "chat", 1, "a")
+
+      # Another operator's apply lands after this one read rev 1.
+      race = fn real ->
+        {:ok, _} = Route.apply(@op, c.ctx, "chat", 1, "a", other)
+        real.()
+      end
+
+      assert {:conflict,
+              %{
+                reason: :stale_revision,
+                expected_rev: 1,
+                current_rev: 2,
+                last_plan_digest: ^other
+              }} =
+               Route.apply(@op, hooked(c, race), "chat", 1, "b", d)
+
+      assert_received :cas_called
+      refute_received :cas_called
+    end
+
+    test "a conflict record whose A1 digest does not verify is outcome unknown", c do
+      {:ok, %{plan_digest: d, proposed: rev2}} = Route.plan(@op, c.ctx, "chat", 1, "b")
+      decoy = String.duplicate("e", 64)
+
+      for revision <- [
+            # Control changed after hashing (A1: :digest_mismatch).
+            %{rev2 | deadline_ms: 1},
+            # Digest swapped for another well-formed one.
+            %{rev2 | digest: decoy},
+            # Same as a plain map, as a decoding store might return it.
+            Map.from_struct(%{rev2 | max_attempts: 1})
+          ] do
+        reply = {:conflict, %{revision: revision, last_plan_digest: decoy}}
+        ctx = hooked(c, fn _real -> reply end)
+
+        assert {:error,
+                {:apply_outcome_unknown,
+                 %{cause: :store_integrity, expected_rev: 1, plan_digest: ^d}}} =
+                 Route.apply(@op, ctx, "chat", 1, "b", d)
+
+        assert_received :cas_called
+        refute_received :cas_called
+
+        req = JSON.encode!(%{route_id: "chat", expected_rev: 1, preferred: "b", plan_digest: d})
+        assert {5, out} = CLI.run(["apply", req], @op, ctx)
+        assert_received :cas_called
+        refute_received :cas_called
+        refute out =~ decoy
+        assert %{"cause" => "store_integrity"} = body = JSON.decode!(out)
+        refute Map.has_key?(body, "current_rev")
+      end
+
+      # Nothing was written by these applies.
+      assert {:ok, %{effective_revision: %Revision{rev: 1}, last_plan_digest: nil}} =
+               Route.read(@op, c.ctx, "chat")
+    end
   end
 end

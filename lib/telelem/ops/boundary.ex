@@ -41,8 +41,10 @@ defmodule Telelem.Ops.RevisionStore do
 
   `compare_and_write/6` must be atomic: it writes only if the stored revision
   still has exactly `expected.rev` **and** `expected.digest`, and otherwise
-  returns the current record unchanged. `Telelem.Ops.MemoryStore` is the
-  reference implementation.
+  returns the current record unchanged. That conflict record must be a sound
+  stored revision (one `Revisions` accepts as a base) with a `rev` greater
+  than `expected.rev`; ops reports any other conflict reply as apply outcome
+  unknown. `Telelem.Ops.MemoryStore` is the reference implementation.
 
   Calls should be bounded in time. Either callback may exit, raise or throw on
   failure; ops never propagates the reason. A failed `fetch/3` is reported as
