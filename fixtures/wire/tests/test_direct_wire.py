@@ -33,6 +33,7 @@ def test_valid_terminal_stream_and_keepalive_counts(fx):
         assert r["content"] == "Hello from lane a."
     assert r1["usage"] == {"completion_tokens": 5, "prompt_tokens": 7, "total_tokens": 12,
                            "completion_tokens_details": None, "prompt_tokens_details": None}
+    assert fx.wait_settled("a")  # ack: SDK returns at [DONE], before the fixture commits "complete"
     a = fx.counts("a")
     assert (a["requests"], a["chat_completions"]) == (2, 2)
     # The pinned sync SDK closes the response at `data: [DONE]` without reading the 0-chunk, so the
@@ -108,6 +109,7 @@ def test_heartbeat_only_stream_finite(fx):
     r = run_stream(client(fx))
     # Visible to the SDK as an empty, *successful* iteration: no chunk, no finish_reason, no exception.
     assert (r["exception"], r["chunks"], r["finish_reason"]) == (None, 0, None)
+    assert fx.wait_settled("a")
     rec = fx.requests("a")[0]
     assert rec["events_sent"] == [": keep-alive\n\n"] * 4
     assert rec["outcome"] == "complete"
@@ -148,6 +150,7 @@ def test_heartbeat_indefinite_release_ends_cleanly(fx):
     assert fx.release(lane="a") == ["a-1"]
     t.join(5)
     assert result["exception"] is None and result["chunks"] == 0
+    assert fx.wait_settled("a")
     assert fx.requests("a")[0]["outcome"] == "complete"
 
 
@@ -161,7 +164,7 @@ def test_reset_after_tool_fragment_visible_incomplete(fx):
     assert r["finish_reason"] is None
     assert r["exception"]["type"] == "openai.APIConnectionError"
     assert "ConnectionResetError" in causes(r)
-    rec = fx.requests("a")[0]
+    rec = fx.requests("a")[0]  # no barrier: abrupt-close outcomes are committed before the close
     assert rec["outcome"] == "reset"
     assert all("[DONE]" not in e and "finish_reason\":\"" not in e for e in rec["events_sent"])
     a, b = fx.counts("a"), fx.counts("b")
@@ -322,6 +325,7 @@ def test_unary_valid_and_reset(fx):
     fx.set_fault("a", "reset_after_tool_fragment")
     with pytest.raises(openai.APIConnectionError):
         c.chat.completions.create(**CHAT_ARGS)
+    assert fx.wait_settled("a")  # the unary "complete" is committed after its last byte
     assert fx.counts("a")["outcomes"] == {"complete": 1, "reset": 1}
 
 
@@ -345,6 +349,7 @@ def test_unknown_route_counted(fx):
 
 def test_reset_counts(fx):
     run_stream(client(fx))
+    assert fx.wait_settled()
     fx.reset_counts()
     assert fx.counts("a")["requests"] == 0 and fx.requests("a") == []
 
@@ -368,3 +373,66 @@ def test_trust_material_is_ephemeral():
     sd = f._state_dir
     f.stop()
     assert not sd.exists()
+
+
+# --- observation ordering (the TEL-004 gate race) --------------------------------------------------------
+
+def test_abrupt_close_outcome_committed_before_close(fx, monkeypatch):
+    """Structural barrier: at the moment the fixture closes abruptly, the record already holds its outcome,
+    so no client can observe a reset that the fixture has not recorded."""
+    seen = []
+    orig = WireFixture._abort
+
+    def checked_abort(self, conn, mode):
+        with self._cond:
+            seen.append([(r.id, r.outcome, r.phase) for r in self._records if r.outcome is None or r.phase != "done"])
+        orig(self, conn, mode)
+
+    monkeypatch.setattr(WireFixture, "_abort", checked_abort)
+    for spec in ({"kind": "reset_after_tool_fragment"}, {"kind": "reset_after_tool_fragment", "close": "fin"}):
+        fx.set_fault("a", spec)
+        assert run_stream(client(fx))["exception"] is not None
+    fx.set_fault("a", "reset_after_tool_fragment")
+    with pytest.raises(openai.APIConnectionError):
+        client(fx).chat.completions.create(**CHAT_ARGS)  # unary variant
+    assert seen == [[], [], []]  # nothing unfinished at any of the three closes
+
+
+def test_complete_outcome_needs_ack_and_ack_waits(fx, monkeypatch):
+    """Forced interleaving of the original gate failure, without sleeps: hold the fixture's commit of
+    "complete" until the client has observed the end of the stream. Reading the record without the
+    barrier sees no outcome; wait_settled() then returns only after the commit."""
+    client_observed = threading.Event()
+    commit_reached = threading.Event()
+    orig = WireFixture._finish
+
+    def gated_finish(self, lane, rec, outcome):
+        if outcome == "complete":
+            commit_reached.set()
+            assert client_observed.wait(5), "client never observed the stream end"
+        orig(self, lane, rec, outcome)
+
+    monkeypatch.setattr(WireFixture, "_finish", gated_finish)
+    r = run_stream(client(fx))
+    assert r["finish_reason"] == "stop" and r["exception"] is None
+    assert commit_reached.wait(5)
+    before = fx.requests("a")[0]["outcome"]
+    assert not fx.wait_settled("a", timeout=0)  # not yet committed
+    client_observed.set()
+    assert fx.wait_settled("a", timeout=5)
+    assert (before, fx.requests("a")[0]["outcome"]) == (None, "complete")
+    assert fx.counts("a")["outcomes"] == {"complete": 1}
+
+
+def test_wait_settled_blocks_while_held(fx):
+    fx.set_fault("a", "stall", after_events=0)
+    result = {}
+    t = threading.Thread(target=lambda: result.update(run_stream(client(fx))), daemon=True)
+    t.start()
+    assert fx.wait_request("a", 1, phase="holding", timeout=5)
+    assert not fx.wait_settled("a", timeout=0)
+    assert fx.wait_settled("b", timeout=0)  # per-lane
+    fx.release("a-1")
+    assert fx.wait_settled("a", timeout=5)
+    t.join(5)
+    assert result["finish_reason"] == "stop"

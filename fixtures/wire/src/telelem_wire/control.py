@@ -101,6 +101,9 @@ def _make_handler(ctl: ControlServer):
                     return self._send(200, {"ok": True})
                 if parts == ["wait"]:
                     timeout = float(b.get("timeout", 5.0))
+                    if b.get("settled"):
+                        ok = fx.wait_settled(b.get("lane"), timeout)
+                        return self._send(200 if ok else 408, {"ok": ok, "counts": fx.counts()})
                     if "counter" in b:
                         ok = fx.wait_counter(b["lane"], b["counter"], int(b.get("at_least", 1)), timeout)
                         return self._send(200 if ok else 408, {"ok": ok, "counts": fx.counts(b["lane"])})

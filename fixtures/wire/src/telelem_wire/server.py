@@ -460,7 +460,9 @@ class WireFixture:
         return d
 
     def reset_counts(self) -> None:
-        """Zero counters and drop request records (lane faults and ports are kept)."""
+        """Zero counters and drop finished request records (lane faults and ports are kept).
+        Unfinished records are kept and their outcome counts toward the new counters; call
+        wait_settled() first for a clean slate."""
         with self._cond:
             for l in self.lanes.values():
                 l.counters = _Counters()
@@ -478,6 +480,18 @@ class WireFixture:
                 if left <= 0:
                     return False
                 self._cond.wait(left)
+
+    def wait_settled(self, lane: str | None = None, timeout: float = 5.0) -> bool:
+        """Ack barrier: block until every request record (of ``lane``, or all lanes) has an outcome.
+
+        Ordering contract: arrival fields (tcp_accepts, tls_ok, requests, chat_completions, by_path,
+        record creation, fault selection) are committed BEFORE the first response byte, and an
+        abrupt-close outcome (reset / fin_truncated / max_hold_rst) is committed BEFORE the close.
+        Everything else that describes how a response ended (outcome, phase "done", completed,
+        outcomes, client_closed, final events_sent / byte counts) is committed AFTER the last byte the
+        client may already have seen. Call this after a client observation and before reading those."""
+        return self.wait_for(
+            lambda fx: all(r.outcome is not None for r in fx._records if lane is None or r.lane == lane), timeout)
 
     def wait_counter(self, lane: str, counter: str, at_least: int, timeout: float = 5.0) -> bool:
         return self.wait_for(lambda fx: getattr(fx.lanes[lane].counters, counter) >= at_least, timeout)
@@ -843,8 +857,8 @@ class WireFixture:
                     if res == "released":
                         break
                     if n is None and time.monotonic() - held_since > self.max_hold:
-                        self._abort(conn, "rst")
                         self._finish(lane, rec, "max_hold_rst")
+                        self._abort(conn, "rst")
                         return False
             if spec["end"] == "hold":
                 return self._hold_then(lane, conn, rec, "rst")
@@ -862,8 +876,8 @@ class WireFixture:
                         "function": {"arguments": spec["fragment"]}}]}))
             if spec["hold"]:
                 return self._hold_then(lane, conn, rec, spec["close"])
-            self._abort(conn, spec["close"])
             self._finish(lane, rec, "reset" if spec["close"] == "rst" else "fin_truncated")
+            self._abort(conn, spec["close"])
             return False
 
         if kind == "stall":
@@ -878,8 +892,8 @@ class WireFixture:
                 if res == "client_closed":
                     raise _ClientGone("stall")
                 if res == "timeout":
-                    self._abort(conn, "rst")
                     self._finish(lane, rec, "max_hold_rst")
+                    self._abort(conn, "rst")
                     return False
                 self._note(rec, phase="streaming")
                 for ev in evs[k:]:
@@ -897,11 +911,11 @@ class WireFixture:
         res = self._hold(rec, self.max_hold)
         if res == "client_closed":
             raise _ClientGone("hold")
-        self._abort(conn, close)
         if res == "timeout":
             self._finish(lane, rec, "max_hold_rst")
         else:
             self._finish(lane, rec, "reset" if close == "rst" else "fin_truncated")
+        self._abort(conn, close)
         return False
 
     def _unary(self, lane: Lane, conn: _Conn, rec: RequestRecord, body: dict[str, Any], spec: dict[str, Any]) -> bool:
@@ -931,8 +945,8 @@ class WireFixture:
                 rec.events_sent.append(data[:cut].decode())
                 rec.body_bytes_sent += cut
                 rec.wire_bytes_sent += cut
-            self._abort(conn, spec["close"])
             self._finish(lane, rec, "reset" if spec["close"] == "rst" else "fin_truncated")
+            self._abort(conn, spec["close"])
             return False
         # stall / heartbeat on unary: headers only, then hold.
         return self._hold_then(lane, conn, rec, "rst")

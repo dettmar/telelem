@@ -20,8 +20,9 @@ def _arrivals(fx: WireFixture) -> dict[str, dict[str, int]]:
 
 def valid_terminal(fx: WireFixture) -> dict[str, Any]:
     obs = run_stream(sdk_client(fx.lane("a").base_url, fx.ca_file))
+    settled = fx.wait_settled("a")  # ack: the SDK returns at [DONE], before the fixture records "complete"
     rec = fx.requests("a")[0]
-    ok = (obs["exception"] is None and obs["finish_reason"] == "stop" and obs["content"] == "Hello from lane a."
+    ok = (settled and obs["exception"] is None and obs["finish_reason"] == "stop" and obs["content"] == "Hello from lane a."
           and rec["events_sent"][-1] == "data: [DONE]\n\n" and rec["outcome"] == "complete")
     return {"sdk": obs, "fixture_outcome": rec["outcome"], "last_event_sent": rec["events_sent"][-1], "passed": ok}
 
@@ -42,8 +43,9 @@ def connect_refused(fx: WireFixture) -> dict[str, Any]:
 def heartbeat_only(fx: WireFixture) -> dict[str, Any]:
     fx.set_fault("a", "heartbeat", count=3, interval=0.01)
     obs = run_stream(sdk_client(fx.lane("a").base_url, fx.ca_file))
+    settled = fx.wait_settled("a")
     rec = fx.requests("a")[0]
-    ok = (obs["exception"] is None and obs["chunks"] == 0 and obs["finish_reason"] is None
+    ok = (settled and obs["exception"] is None and obs["chunks"] == 0 and obs["finish_reason"] is None
           and all(e.startswith(":") for e in rec["events_sent"]) and len(rec["events_sent"]) == 3)
     return {"sdk": obs, "events_sent": rec["events_sent"], "fixture_outcome": rec["outcome"],
             "note": "clean chunked end, zero data events, no [DONE]: SDK iterator ends silently with 0 chunks",
@@ -53,6 +55,8 @@ def heartbeat_only(fx: WireFixture) -> dict[str, Any]:
 def reset_after_tool_fragment(fx: WireFixture) -> dict[str, Any]:
     fx.set_fault("a", "reset_after_tool_fragment")
     obs = run_stream(sdk_client(fx.lane("a").base_url, fx.ca_file))
+    # No barrier on purpose: the fixture commits an abrupt-close outcome BEFORE closing, so once the
+    # SDK has seen the reset the record must already say "reset".
     rec = fx.requests("a")[0]
     cause = " | ".join(obs["exception"]["cause_chain"]) if obs["exception"] else ""
     c = fx.counts()
@@ -110,6 +114,8 @@ def run_reference() -> dict[str, Any]:
                 r = fn(fx)
             except Exception as e:
                 r = {"passed": False, "error": describe_exception(e)}
+            r["settled"] = fx.wait_settled()  # ack before reporting outcome counts
             r["arrivals"] = _arrivals(fx)
+            r["passed"] = r["passed"] and r["settled"]
         results[name] = r
     return {"scenarios": results, "all_passed": all(r["passed"] for r in results.values())}

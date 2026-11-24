@@ -62,6 +62,7 @@ def test_serve_ready_line_control_and_stdin_eof_exit(tmp_path):
         assert _call(ctl, "POST", "/lanes/a/queue", {"faults": [{"kind": "reset_after_tool_fragment"}]})[0] == 200
         r = run_stream(sdk_client(info["lanes"]["a"]["base_url"], info["ca_file"]))
         assert r["tool_args"] == TOOL_FRAGMENT and r["exception"] is not None
+        assert _call(ctl, "POST", "/wait", {"settled": True, "timeout": 5})[0] == 200  # ack before reading outcomes
         code, c = _call(ctl, "GET", "/counts")
         assert c["a"]["outcomes"] == {"reset": 1} and c["b"]["outcomes"] == {"complete": 1}
         assert c["a"]["tcp_accepts"] == 1  # the refused attempt was never accepted
@@ -95,4 +96,5 @@ def test_probe_cli_against_server():
 def test_scenarios_reference_run():
     out = subprocess.run([sys.executable, "-m", "telelem_wire.cli", "scenarios"], capture_output=True, text=True, timeout=120)
     report = json.loads(out.stdout)
-    assert out.returncode == 0 and report["all_passed"], json.dumps(report, indent=1)[:4000]
+    failed = {k: v for k, v in report["scenarios"].items() if not v["passed"]}
+    assert out.returncode == 0 and report["all_passed"] and not failed, json.dumps(failed, indent=1) + out.stderr[-2000:]

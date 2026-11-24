@@ -68,6 +68,26 @@ Per lane: `tcp_accepts`, `tls_ok`, `tls_failed`, `requests`, `chat_completions`,
 `client_closed`, `by_path{"POST /v1/chat/completions": n}`, `outcomes{complete|reset|fin_truncated|client_closed|max_hold_rst|shutdown|error: n}`.
 A refused connect is **never accepted, so it is never counted**: `tcp_accepts` stays 0. That zero is the evidence.
 
+### Observation ordering: when to call the settle barrier
+
+The client and the fixture run on separate threads, so the fixture defines which records it commits
+before the client can see anything:
+
+* **Before the first response byte:** `tcp_accepts`, `tls_ok`, `requests`, `chat_completions`, `by_path`,
+  creation of the request record and the selected `fault`. These are safe to read as soon as the client has
+  seen any response or error from the lane.
+* **Before the abrupt close:** the outcomes `reset`, `fin_truncated` and `max_hold_rst`. Once the SDK has raised
+  for a reset, the record already says `reset`.
+* **After the last byte, so the client can be ahead:** `complete` (the SDK returns at `[DONE]`), a unary or
+  `status` `complete`, `client_closed`, `phase="done"`, `completed`, `outcomes`, and the final `events_sent` and
+  byte counts.
+
+Read the third group only behind the ack barrier `fx.wait_settled(lane=None, timeout=5)`, or
+`POST /wait {"settled": true[, "lane": "a"]}` on the control plane. The barrier blocks until every request
+record on that lane (or on all lanes) has an outcome, and returns False (408 on the control plane) on timeout.
+It covers only requests the fixture has already parsed. An *absence* claim such as "lane b got no
+replacement dispatch" needs its own causal end point on the gateway side.
+
 Each request record (`requests()`, `GET /requests[/<id>]`) contains:
 
 * `id` (`a-1`, `a-2`, …, also sent as the `x-request-id` response header) and `conn_id`
@@ -92,6 +112,7 @@ with WireFixture(faults={"a": "refuse"}, max_hold=10) as fx:      # lanes ("a", 
     fx.set_fault("a", "reset_after_tool_fragment")                 # or "stall", after_events=2 …
     fx.queue_faults("b", [{"kind": "status", "code": 429}])
     rec = fx.wait_request("a", 1, phase="holding", timeout=5)     # condition variable, no sleeps
+    assert fx.wait_settled()                                       # ack before reading outcome/outcomes
     fx.release(lane="a")                                           # a release after "holding" is never lost
     fx.wait_counter("b", "requests", 1, timeout=5)
     assert fx.counts("b")["requests"] == 0                         # "no replacement dispatch"
@@ -137,7 +158,7 @@ Control plane: plain HTTP with JSON bodies, bound to loopback only, no auth. Any
 | `POST /lanes/<lane>/fault` `{"kind":"stall","after_events":2}` | set the lane default (400 on an unknown kind or param) |
 | `POST /lanes/<lane>/queue` `{"faults":[{"kind":"reset_after_tool_fragment"}]}` | add one-shot faults |
 | `POST /release` `{"lane":"a"}` or `{"request_id":"a-1"}` | release held requests → `{"released":[ids]}` |
-| `POST /wait` `{"lane":"a","counter":"requests","at_least":1,"timeout":5}` or `{"lane":"a","nth":1,"phase":"holding","timeout":5}` | blocks until true → 200, or 408 on timeout |
+| `POST /wait` `{"lane":"a","counter":"requests","at_least":1,"timeout":5}`, `{"lane":"a","nth":1,"phase":"holding","timeout":5}` or `{"settled":true[,"lane":"a"],"timeout":5}` | blocks until true → 200, or 408 on timeout |
 | `POST /reset` | zero the counters and drop finished records |
 | `POST /shutdown` | stop the process |
 
