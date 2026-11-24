@@ -1,0 +1,309 @@
+#!/bin/bash
+# Tests for scripts/with-route-store-lock (M2a TEL-015 local prerequisite).
+#
+#   integration/m2a/store-lock/run            # exit 0 PASS, 1 FAIL, 2 prerequisite missing
+#   TELELEM_STORE_LOCK_BEAM=0 integration/m2a/store-lock/run   # skip the docker checks (10, 11)
+#
+# Everything runs in a fresh `mktemp -d` directory that is removed on exit. The writers
+# are harmless local stand-ins (holder.sh, sh -c 'echo > file'). Handshakes go through
+# FIFOs, not sleeps. `read -t` timeouts only stop a broken run from hanging, and a
+# timeout counts as FAIL. The kernel's own view comes from /proc/locks and /proc/*/fd.
+#
+# Optional docker checks, in the pinned runner image with --network none, a read-only
+# rootfs, --cap-drop ALL and the host uid: (10, beam-check.sh) the same wrapper execs a
+# real `erl`; (11) a container that sees a host-locked store via a bind mount is refused.
+# They are SKIPPED, and reported as such, if docker or the image is unavailable.
+# Nothing here touches the checkout, host settings or any network.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+WRAP="$ROOT/scripts/with-route-store-lock"
+HOLDER="$HERE/holder.sh"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+T=20 # safety timeout (s) for one handshake
+
+for need in "$WRAP" "$HOLDER"; do [[ -x $need ]] || { echo "missing or not executable: $need" >&2; exit 2; }; done
+[[ -r /proc/locks ]] || { echo "/proc/locks unreadable" >&2; exit 2; }
+[[ $(uname -s) == Linux ]] || { echo "Linux only" >&2; exit 2; }
+
+BASE=$(mktemp -d "${TMPDIR:-/tmp}/telelem-store-lock.XXXXXX") || exit 2
+BASE=$(realpath -e "$BASE")
+case $(stat -f -c %T "$BASE") in
+  ext2/ext3 | xfs | btrfs | zfs | tmpfs) ;;
+  *) echo "temp dir $BASE is on an unsupported filesystem; set TMPDIR" >&2; rm -rf "$BASE"; exit 2 ;;
+esac
+
+mkfifo "$BASE/tick"; exec {TICK}<>"$BASE/tick" # never written: read -t on it is a bounded pause
+PIDS=()
+cleanup() {
+  local p
+  for p in "${PIDS[@]}"; do kill -KILL "$p" 2>/dev/null; done
+  wait 2>/dev/null
+  rm -rf -- "$BASE"
+}
+trap cleanup EXIT
+
+PASS=0 FAIL=0 SKIP=0
+ok() { printf 'ok   %s\n' "$*"; PASS=$((PASS + 1)); }
+bad() { printf 'FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
+expect() { # desc actual wanted
+  if [[ $2 == "$3" ]]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi
+}
+
+# ---------------------------------------------------------------------------------------
+N=0
+new_case() { # -> sets STORE (approved store dir, mode 700, with a seed file) and CTL
+  N=$((N + 1))
+  local d="$BASE/c$N"
+  mkdir -m 700 "$d" "$d/store" "$d/ctl"
+  printf 'seed\n' >"$d/store/seed"
+  mkfifo "$d/ctl/ready" "$d/ctl/release" "$d/ctl/child-release"
+  STORE="$d/store" CTL="$d/ctl"
+  exec {R}<>"$CTL/ready" {W}<>"$CTL/release" {CW}<>"$CTL/child-release"
+}
+end_case() { exec {R}>&- {W}>&- {CW}>&-; }
+
+# /proc/locks key for an inode: "MAJ:MIN:INO" (hex major/minor, decimal inode).
+lock_key() {
+  local ma mi ino
+  read -r ma mi ino < <(stat -c '%Hd %Ld %i' -- "$1")
+  printf '%02x:%02x:%d' "$ma" "$mi" "$ino"
+}
+# /proc/locks lists the PID of the flock(1) helper that took the lock (it has exited),
+# and hides such locks entirely outside the initial PID namespace. Every "0 left" check
+# below is therefore preceded by a "1 held" check on the same key in the same case.
+kernel_flocks() { # number of granted exclusive flocks with /proc/locks key $1
+  awk -v k="$1" '$2 == "FLOCK" && $4 == "WRITE" && $6 == k { n++ } END { print n + 0 }' /proc/locks
+}
+fd_flock() { # exclusive flock lines attached to fd $3 of pid $1 with key $2 (kernel fdinfo)
+  grep -cE "^lock:.*FLOCK +ADVISORY +WRITE .* $2 " "/proc/$1/fdinfo/$3" 2>/dev/null
+}
+fd_holders() { # sorted PIDs with an open fd whose target is exactly $1
+  find /proc/[0-9]*/fd -maxdepth 1 -lname "$1" 2>/dev/null | sed -E 's#^/proc/([0-9]+)/fd/.*#\1#' | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+snapshot() { find "$1" -printf '%P|%i|%s|%T@|%m\n' | sort; }
+
+start_holder() { # code mode -> HPID; reads holder report into RPT
+  "$WRAP" "$STORE" -- "$HOLDER" "$CTL" "$1" "$2" 2>"$CTL/holder.err" &
+  HPID=$!
+  PIDS+=("$HPID")
+}
+read_ctl() { RPT=; read -r -t "$T" RPT <&"$R" || RPT="timeout"; }
+release() { printf 'go\n' >&"$W"; }
+contend() { # store -> rc; command would create MUTATED in the store
+  "$WRAP" "$1" -- /bin/sh -c 'printf x >"$1/MUTATED"' sh "$1" 2>"$BASE/contend.err"
+}
+
+# ---------------------------------------------------------------------------------------
+echo "# 1. preconditions: rejected with the documented status, command never run"
+pre() { # desc want_rc store [extra env...]
+  local desc=$1 want=$2 store=$3 marker="$BASE/pre.marker" rc
+  shift 3
+  rm -f "$marker"
+  env "$@" "$WRAP" "$store" -- /bin/sh -c 'printf x >"$1"' sh "$marker" 2>"$BASE/pre.err"
+  rc=$?
+  if [[ $rc == "$want" && ! -e $marker ]] && grep -q '^with-route-store-lock: ' "$BASE/pre.err"; then
+    ok "$desc -> $rc"
+  else
+    bad "$desc (rc $rc, want $want, marker $([[ -e $marker ]] && echo present || echo absent)): $(head -c 300 "$BASE/pre.err")"
+  fi
+}
+new_case
+"$WRAP" >/dev/null 2>&1; expect "bare invocation is a usage error" "$?" 64
+pre "empty path" 78 ""
+"$WRAP" "$STORE" /bin/true 2>/dev/null; expect "missing -- is a usage error" "$?" 64
+"$WRAP" "$STORE" -- 2>/dev/null; expect "missing command is a usage error" "$?" 64
+pre "relative path" 78 "${STORE#/}"
+pre "missing directory" 78 "$STORE.missing"
+pre "regular file" 78 "$STORE/seed"
+ln -s "$STORE" "$BASE/c$N/link"
+pre "symlink to the store" 78 "$BASE/c$N/link"
+ln -s "$BASE/c$N" "$BASE/c$N-link"
+pre "symlink in a parent component" 78 "$BASE/c$N-link/store"
+pre "non-canonical path (trailing slash)" 78 "$STORE/"
+pre "non-canonical path (dot component)" 78 "$BASE/c$N/./store"
+pre "non-canonical path (dot-dot component)" 78 "$BASE/c$N/ctl/../store"
+chmod 0770 "$STORE"; pre "group-writable store" 78 "$STORE"
+chmod 0707 "$STORE"; pre "other-writable store" 78 "$STORE"
+chmod 0700 "$STORE"
+pre "root directory" 78 "/"
+expect "store unchanged by rejected runs" "$(ls -A "$STORE")" "seed"
+end_case
+
+echo "# 2. exec, no fork: the writer is the wrapper's PID and holds the locked directory fd"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 0 plain
+read_ctl
+read -r tag rpid rfd rflags rdir <<<"$RPT"
+expect "holder reported ready" "$tag" ready
+expect "writer PID == wrapper PID (\$!)" "$rpid" "$HPID"
+expect "TELELEM_ROUTE_STORE_LOCK_DIR is the store" "$rdir" "$STORE"
+expect "lock fd target is the store directory" "$(readlink "/proc/$HPID/fd/$rfd")" "$STORE"
+expect "lock fd is the same inode as the store" "$(stat -L -c '%d:%i' "/proc/$HPID/fd/$rfd")" "$(stat -c '%d:%i' "$STORE")"
+if [[ $rflags =~ ^[0-7]+$ ]] && (((8#$rflags & 8#2000000) == 0)); then ok "lock fd has no O_CLOEXEC (fdinfo flags $rflags)"; else bad "lock fd flags '$rflags'"; fi
+expect "only the writer has the store open" "$(fd_holders "$STORE")" "$HPID"
+expect "kernel shows one exclusive flock on the store inode $KEY" "$(kernel_flocks "$KEY")" 1
+expect "that flock is attached to the writer's own fd (fdinfo)" "$(fd_flock "$HPID" "$KEY" "$rfd")" 1
+expect "process tree: writer's command is holder.sh" "$(tr '\0' ' ' <"/proc/$HPID/cmdline" | awk '{print $2}')" "$HOLDER"
+release
+wait "$HPID"; expect "holder exit status passed through" "$?" 0
+end_case
+
+echo "# 3. concurrent writers (startup/provision) are rejected before any mutation"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 0 plain   # role: startup
+read_ctl
+before=$(snapshot "$STORE")
+contend "$STORE"; expect "second startup rejected busy" "$?" 75
+grep -q 'busy' "$BASE/contend.err" && ok "busy reason on stderr" || bad "no busy reason: $(cat "$BASE/contend.err")"
+"$WRAP" "$STORE" -- /bin/sh -c 'mkdir "$1/init" && printf v1 >"$1/init/format"' sh "$STORE" 2>/dev/null
+expect "explicit provision (initializer) rejected busy" "$?" 75
+FAKE="$BASE/fakebin"; mkdir -m 700 "$FAKE"
+printf '#!/bin/sh\nprintf x >"%s"\nexit 0\n' "$BASE/fake-flock-used" >"$FAKE/flock"; chmod 755 "$FAKE/flock"
+PATH="$FAKE:$PATH" contend "$STORE"; expect "PATH-shadowed flock is ignored; still busy" "$?" 75
+expect "shadow flock never executed" "$([[ -e $BASE/fake-flock-used ]] && echo used || echo unused)" unused
+expect "store tree byte-for-byte and mtime unchanged" "$(snapshot "$STORE")" "$before"
+expect "still exactly one flock, still the writer's" "$(kernel_flocks "$KEY") $(fd_holders "$STORE")" "1 $HPID"
+release; wait "$HPID"
+end_case
+
+new_case
+start_holder 0 plain   # role: explicit provision holding the store
+read_ctl
+before=$(snapshot "$STORE")
+contend "$STORE"; expect "startup rejected while provision holds the store" "$?" 75
+expect "store unchanged" "$(snapshot "$STORE")" "$before"
+release; wait "$HPID"
+end_case
+
+echo "# 4. normal exit releases; exit code passes through; caller PATH restored for the command"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 7 plain
+read_ctl
+expect "held before release" "$(kernel_flocks "$KEY")" 1
+release
+wait "$HPID"; expect "writer exit status 7 passed through" "$?" 7
+expect "no flock left after exit (no sleep)" "$(kernel_flocks "$KEY")" 0
+contend "$STORE"; expect "next writer acquires" "$?" 0
+"$WRAP" "$STORE" -- /bin/sh -c 'grep -c "^lock:.*FLOCK" /proc/$$/fdinfo/$TELELEM_ROUTE_STORE_LOCK_FD' >"$BASE/self.out" 2>&1
+expect "a fresh holder's fd carries the lock (fdinfo)" "$(cat "$BASE/self.out")" 1
+expect "next writer ran" "$(cat "$STORE/MUTATED" 2>/dev/null)" x
+out=$(PATH="/nonexistent-telelem:$PATH" "$WRAP" "$STORE" -- /bin/sh -c 'printf %s "$PATH"')
+expect "COMMAND sees the caller's PATH" "$out" "/nonexistent-telelem:$PATH"
+"$WRAP" "$STORE" -- telelem-no-such-command-$$ 2>/dev/null; expect "exec failure reports 127" "$?" 127
+expect "no flock left after exec failure" "$(kernel_flocks "$KEY")" 0
+end_case
+
+echo "# 5. abrupt exit (SIGKILL) releases"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 0 plain
+read_ctl
+expect "held before kill" "$(kernel_flocks "$KEY")" 1
+kill -KILL "$HPID"; { wait "$HPID"; } 2>/dev/null; expect "writer died by SIGKILL" "$?" 137
+expect "no flock left after SIGKILL (no sleep)" "$(kernel_flocks "$KEY")" 0
+contend "$STORE"; expect "next writer acquires after crash" "$?" 0
+end_case
+
+echo "# 6. lock covers the writer's own shutdown path"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 0 term
+read_ctl
+kill -TERM "$HPID"
+read_ctl
+expect "writer is in its SIGTERM shutdown handler" "$RPT" "stopping $HPID"
+before=$(snapshot "$STORE")
+contend "$STORE"; expect "writer rejected during holder shutdown" "$?" 75
+expect "store unchanged during shutdown" "$(snapshot "$STORE")" "$before"
+release; wait "$HPID"; expect "shutdown completed" "$?" 0
+contend "$STORE"; expect "acquires after shutdown completes" "$?" 0
+end_case
+
+echo "# 7. children that inherit the fd keep the store locked after the writer dies (fail-safe)"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 0 child
+read_ctl; read -r _ cpid <<<"$RPT"; PIDS+=("$cpid")
+read_ctl
+expect "holders are writer and its child" "$(fd_holders "$STORE")" "$(printf '%s\n' "$HPID" "$cpid" | sort -n | tr '\n' ' ' | sed 's/ $//')"
+kill -KILL "$HPID"; { wait "$HPID"; } 2>/dev/null
+contend "$STORE"; expect "still busy: orphaned child holds the inherited lock" "$?" 75
+expect "one flock remains" "$(kernel_flocks "$KEY")" 1
+cfd=$(find "/proc/$cpid/fd" -maxdepth 1 -lname "$STORE" -printf '%f\n' | head -1)
+expect "the flock is on the orphan's inherited fd" "$(fd_flock "$cpid" "$KEY" "$cfd")" 1
+printf 'go\n' >&"$CW"
+# The child is not ours to wait(2) for: poll the observed condition, bounded by $T.
+for ((i = 0; i < T * 20; i++)); do [[ -z $(fd_holders "$STORE") ]] && break; read -r -t 0.05 <&"$TICK"; done
+expect "child exited and dropped the fd" "$(fd_holders "$STORE")" ""
+contend "$STORE"; expect "acquires once the last inheritor is gone" "$?" 0
+end_case
+
+echo "# 8. control: a writer that closes the fd loses the lock (why the no-close contract exists)"
+new_case
+KEY=$(lock_key "$STORE")
+start_holder 0 close
+read_ctl
+expect "writer alive but no flock" "$(kill -0 "$HPID" && echo alive) $(kernel_flocks "$KEY")" "alive 0"
+contend "$STORE"; expect "second writer gets in (detected loss)" "$?" 0
+release; wait "$HPID"
+end_case
+
+echo "# 9. limit: replacing the path defeats the lock (immutable-path assumption)"
+new_case
+start_holder 0 plain
+read_ctl
+mv "$STORE" "$STORE.old" && mkdir -m 700 "$STORE"
+contend "$STORE"; expect "a writer on the replacement directory acquires (documented limit)" "$?" 0
+expect "original inode still locked by the first writer" "$(kernel_flocks "$(lock_key "$STORE.old")")" 1
+release; wait "$HPID"
+end_case
+
+# ---------------------------------------------------------------------------------------
+echo "# 10-11. runner image (no network): real erl exec chain; same inode across namespaces"
+DOCKER=(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges
+  --user "$(id -u):$(id -g)" -v "$WRAP:/opt/lock/with-route-store-lock:ro")
+if [[ ${TELELEM_STORE_LOCK_BEAM:-1} == 0 ]]; then
+  echo "skip BEAM and namespace checks (TELELEM_STORE_LOCK_BEAM=0)"; SKIP=$((SKIP + 2))
+elif ! command -v docker >/dev/null 2>&1 || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "skip BEAM and namespace checks (docker or image $IMAGE unavailable)"; SKIP=$((SKIP + 2))
+else
+  # 11: the host writer holds the lock; a container that sees the same directory inode
+  # at a different path (/store, bind mount, other mount and PID namespaces) is refused.
+  new_case
+  start_holder 0 plain
+  read_ctl
+  before=$(snapshot "$STORE")
+  "${DOCKER[@]}" -v "$STORE:/store" "$IMAGE" /opt/lock/with-route-store-lock /store -- \
+    /bin/sh -c 'printf x >/store/MUTATED' 2>"$BASE/ns.err"
+  rc=$?
+  expect "container writer on the same inode via /store is rejected busy" "$rc $(grep -c busy "$BASE/ns.err")" "75 1"
+  expect "store unchanged by the container" "$(snapshot "$STORE")" "$before"
+  release; wait "$HPID"
+  "${DOCKER[@]}" -v "$STORE:/store" "$IMAGE" /opt/lock/with-route-store-lock /store -- \
+    /bin/sh -c 'printf x >/store/MUTATED' 2>"$BASE/ns.err"
+  expect "control: the same container command acquires once the host writer exits" "$? $(cat "$STORE/MUTATED" 2>/dev/null)" "0 x"
+  end_case
+
+  out=$("${DOCKER[@]}" --tmpfs /work:rw,exec,mode=1777 -e HOME=/work \
+    -v "$HERE/beam-check.sh:/opt/lock/beam-check.sh:ro" \
+    "$IMAGE" /bin/bash /opt/lock/beam-check.sh 2>&1)
+  rc=$?
+  while IFS= read -r line; do
+    case $line in
+      ok\ *) ok "beam: ${line#ok }" ;;
+      FAIL\ *) bad "beam: ${line#FAIL }" ;;
+      info\ *) echo "     ${line#info }" ;;
+    esac
+  done <<<"$out"
+  [[ $rc == 0 ]] || bad "beam-check exited $rc: $(tail -5 <<<"$out")"
+fi
+
+echo
+echo "passed $PASS, failed $FAIL, skipped $SKIP"
+((FAIL == 0)) || exit 1
+exit 0
