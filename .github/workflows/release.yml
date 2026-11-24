@@ -1,0 +1,182 @@
+# Manual, opt-in source release for telelem. It never runs on push or tag events.
+#
+#   Actions -> release -> Run workflow (from main), tag=vX.Y.Z, publish=false|true
+#
+# 1. validate:  run from main; the tag already exists, is strict vX.Y.Z, matches
+#               mix.exs, and its commit is on main. This workflow never creates a tag.
+# 2. ci, security: the same gates as push/PR, run on the validated commit.
+# 3. package:   read-only. Builds a versioned source archive (git archive) and a
+#               provenance text, plus SHA256SUMS. These are source files only:
+#               no binary, image or deploy.
+# 4. publish:   only with publish=true. The only job with write permission. It
+#               checks out nothing and runs no repository scripts. It re-checks
+#               the tag and the checksums, then creates a DRAFT release on the
+#               existing tag (gh --verify-tag). A maintainer reviews it and
+#               publishes it by hand.
+#
+# Action pins (verified upstream on 2026-11-24; see ci.yml for the rest):
+#   actions/checkout          v7.0.1 3d3c42e5aac5ba805825da76410c181273ba90b1
+#   actions/upload-artifact   v7.0.2 cf430e030ddbb5b0abf93d22962f4752f3646cd9
+#   actions/download-artifact v8.0.2 9000827ccba6bdab643e8b6fd33ac0654aef8333
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag on main, vMAJOR.MINOR.PATCH (must equal mix.exs version)
+        type: string
+        required: true
+      publish:
+        description: Create a draft GitHub release from the checked artifacts (default is a dry run)
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: validate tag and commit
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.check.outputs.sha }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history and tags, for the ancestry check
+          persist-credentials: false
+      - id: check
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || { echo "::error::tag must be vMAJOR.MINOR.PATCH, got '$TAG'"; exit 1; }
+          version="${TAG#v}"
+          sha="$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}")" \
+            || { echo "::error::tag $TAG does not exist; create and push it first (this workflow never tags)"; exit 1; }
+          git merge-base --is-ancestor "$sha" refs/remotes/origin/main \
+            || { echo "::error::$TAG ($sha) is not on main"; exit 1; }
+          mix_version="$(git show "$sha:mix.exs" | sed -nE 's/^ *version: "([^"]+)",?$/\1/p')"
+          [[ "$mix_version" == "$version" ]] \
+            || { echo "::error::mix.exs version '$mix_version' != tag version '$version'"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release $TAG -> $sha (on main, mix.exs $mix_version)"
+
+  ci:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.sha }}
+
+  security:
+    # Owned separately. Contract: `on: workflow_call` with an optional string
+    # input `ref` (commit to scan), needing no more than contents: read.
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/security.yml
+    with:
+      ref: ${{ needs.validate.outputs.sha }}
+
+  package:
+    name: source archive, provenance, SHA256SUMS
+    needs: [validate, ci, security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - name: Build (git only; no repository scripts run)
+        env:
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          ACTOR: ${{ github.triggering_actor }}
+        run: |
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]] || { echo "::error::checkout is not $SHA"; exit 1; }
+          out="$RUNNER_TEMP/dist"; mkdir -p "$out"
+          name="telelem-$VERSION"
+          git archive --format=tar.gz --prefix="$name/" -o "$out/$name-src.tar.gz" "$SHA"
+          base="$(sed -nE 's/^FROM (.+)$/\1/p' scripts/Dockerfile)"
+          {
+            echo "telelem $TAG source release (provenance, plain text, unsigned)"
+            echo
+            echo "artifact:        $name-src.tar.gz  (git archive of the commit; source only, no binary)"
+            echo "tag:             $TAG"
+            echo "commit:          $SHA"
+            echo "tree:            $(git rev-parse "$SHA^{tree}")"
+            echo "commit date:     $(git show -s --format=%cI "$SHA")"
+            echo "mix.exs version: $VERSION"
+            echo "mix.lock sha256: $(sha256sum mix.lock | cut -d' ' -f1)"
+            echo "uv.lock sha256:  $(sha256sum fixtures/wire/uv.lock | cut -d' ' -f1)  (fixtures/wire)"
+            echo "runner base:     $base  (scripts/Dockerfile)"
+            echo
+            echo "built by:        $RUN_URL"
+            echo "workflow:        $WORKFLOW_REF @ $WORKFLOW_SHA"
+            echo "triggered by:    $ACTOR"
+            echo "gates passed:    ci.yml (shell, elixir, fixture, m1), security.yml, run on $SHA in this run"
+            echo "build host:      ${ImageOS:-unknown} ${ImageVersion:-unknown}, $(git --version)"
+          } > "$out/$name-provenance.txt"
+          (cd "$out" && sha256sum "$name-src.tar.gz" "$name-provenance.txt" > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ inputs.tag }}
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: draft GitHub release (write)
+    needs: [validate, package]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # No checkout: nothing from the repository runs with write permission.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ inputs.tag }}
+          path: dist
+      - name: Verify checksums and tag, then create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ needs.validate.outputs.sha }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cd dist
+          sha256sum --strict -c SHA256SUMS
+          # The tag must still point at the commit that passed the gates (it may be annotated).
+          read -r type obj < <(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
+          [[ "$type" == tag ]] && obj="$(gh api "repos/$GH_REPO/git/tags/$obj" --jq .object.sha)"
+          [[ "$obj" == "$SHA" ]] || { echo "::error::tag $TAG now points at $obj, gates ran on $SHA"; exit 1; }
+          gh release create "$TAG" --verify-tag --draft \
+            --title "telelem $TAG" \
+            --notes-file "telelem-$VERSION-provenance.txt" \
+            "telelem-$VERSION-src.tar.gz" "telelem-$VERSION-provenance.txt" SHA256SUMS
