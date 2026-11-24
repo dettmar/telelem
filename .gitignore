@@ -1,0 +1,16 @@
+# Mix build output and fetched dependencies (recreated by scripts/setup)
+/_build/
+/deps/
+/cover/
+/doc/
+erl_crash.dump
+*.ez
+/telelem-*.tar
+
+# Per-checkout runner state: container HOME and Hex cache (scripts/mix)
+/.cache/
+
+# Python tooling caches (fixture owns its own environment and lock)
+__pycache__/
+*.py[cod]
+.venv/

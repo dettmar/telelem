@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Run any `mix` command for telelem in the pinned runner (TEL-001).
+#
+#   scripts/mix test                    # offline: container has no network
+#   scripts/mix test --seed 123 test/x_test.exs
+#   TELELEM_NETWORK=bridge scripts/mix deps.get   # online; scripts/setup does this
+#   TELELEM_NETWORK=host scripts/mix test         # reach loopback fixtures on the host
+#
+# Environment:
+#   TELELEM_RUNNER   auto (default) | docker | local
+#                    auto = docker if a daemon answers, else `mix` on PATH.
+#   TELELEM_NETWORK  none (default) | host | bridge   (docker runner only)
+#                    none/host also set HEX_OFFLINE=1, so Hex never fetches.
+#   TELELEM_IMAGE    runner image tag (default below; built by scripts/setup)
+#   Passed through when set: MIX_ENV, ERL_AFLAGS, ELIXIR_ERL_OPTIONS and any
+#   TELELEM_TEST_* variable (local test settings only; never provider creds).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+RUNNER="${TELELEM_RUNNER:-auto}"
+NETWORK="${TELELEM_NETWORK:-none}"
+
+die() { echo "scripts/mix: $*" >&2; exit 2; }
+
+case "$NETWORK" in none | host | bridge) ;; *) die "TELELEM_NETWORK must be none|host|bridge, got '$NETWORK'" ;; esac
+
+if [[ "$RUNNER" == auto ]]; then
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    RUNNER=docker
+  elif command -v mix >/dev/null 2>&1; then
+    RUNNER=local
+  else
+    die "no working docker daemon and no mix on PATH"
+  fi
+fi
+
+mkdir -p "$ROOT/.cache/home" "$ROOT/.cache/hex"
+
+case "$RUNNER" in
+docker)
+  docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || die "image $IMAGE not found; run scripts/setup first (needs network once)"
+
+  env_args=(-e HOME=/work/.cache/home -e HEX_HOME=/work/.cache/hex)
+  [[ "$NETWORK" != bridge ]] && env_args+=(-e HEX_OFFLINE=1)
+  for v in MIX_ENV ERL_AFLAGS ELIXIR_ERL_OPTIONS $(compgen -v TELELEM_TEST_ || true); do
+    [[ -n "${!v+x}" ]] && env_args+=(-e "$v=${!v}")
+  done
+
+  tty_args=(-i)
+  [[ -t 0 && -t 1 ]] && tty_args=(-it)
+
+  exec docker run --rm "${tty_args[@]}" \
+    --network "$NETWORK" \
+    --user "$(id -u):$(id -g)" \
+    -v "$ROOT:/work" -w /work \
+    "${env_args[@]}" \
+    "$IMAGE" mix "$@"
+  ;;
+local)
+  command -v mix >/dev/null 2>&1 || die "TELELEM_RUNNER=local but no mix on PATH"
+  want="1.20.5 / OTP 28"
+  have="$(elixir -e 'IO.write(System.version() <> " / OTP " <> System.otp_release())')"
+  [[ "$have" == "$want" ]] \
+    || echo "scripts/mix: WARNING local toolchain is $have, pinned runner is $want; results are not comparable" >&2
+  # Local mode cannot remove network access; it only stops Hex from fetching.
+  export HEX_HOME="$ROOT/.cache/hex"
+  [[ "$NETWORK" != bridge ]] && export HEX_OFFLINE=1
+  cd "$ROOT"
+  exec mix "$@"
+  ;;
+*)
+  die "TELELEM_RUNNER must be auto|docker|local, got '$RUNNER'"
+  ;;
+esac

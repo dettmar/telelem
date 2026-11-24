@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# One-time, ONLINE dependency setup for telelem (TEL-001).
+#
+#   scripts/setup            # build runner image, fetch locked deps, compile deps
+#   scripts/setup --relock   # maintainers only: allow mix.lock to change
+#
+# Afterwards every `scripts/mix ...` call runs with --network none.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+export TELELEM_IMAGE="$IMAGE"
+
+relock=0
+[[ "${1:-}" == --relock ]] && relock=1
+
+if [[ "${TELELEM_RUNNER:-auto}" != local ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  echo "==> [online] building $IMAGE"
+  docker build --pull=false -t "$IMAGE" -f "$ROOT/scripts/Dockerfile" "$ROOT/scripts"
+  export TELELEM_RUNNER=docker
+else
+  echo "==> docker unavailable; using local mix ($(command -v mix || echo none))"
+  export TELELEM_RUNNER=local
+fi
+
+echo "==> [online] fetching dependencies"
+if [[ $relock -eq 0 && -f "$ROOT/mix.lock" ]]; then
+  TELELEM_NETWORK=bridge "$ROOT/scripts/mix" deps.get --check-locked
+else
+  TELELEM_NETWORK=bridge "$ROOT/scripts/mix" deps.get
+fi
+
+echo "==> [offline] compiling dependencies for dev and test"
+MIX_ENV=dev "$ROOT/scripts/mix" deps.compile
+MIX_ENV=test "$ROOT/scripts/mix" deps.compile
+
+echo "==> [offline] reporting versions"
+MIX_ENV=test "$ROOT/scripts/mix" run --no-start scripts/versions.exs
+
+echo "==> setup done; run: scripts/mix test"
