@@ -67,6 +67,38 @@ defmodule Telelem.AdmissionModelTest do
        {:advance, 1},
        {:advance, 10}
      ]},
+    {"C2: crash retires a live owner's never-dispatched hold; nothing can revive it",
+     %{slots: 1, units: 10, ttl: 5},
+     [
+       {:reserve, 0, 0, 5},
+       :crash_authority,
+       {:reserve, 1, 1, 1},
+       {:authorize, 1},
+       {:reserve, 0, 0, 5},
+       {:authorize, 0},
+       {:cancel, 0},
+       {:advance, 10},
+       {:reconcile, 0, 0},
+       {:kill_owner, 0},
+       {:settle, 1, 1}
+     ]},
+    {"C1: replaced instance: old token is foreign, cannot touch a fresh grant, exposure unknown",
+     %{slots: 2, units: 10, ttl: 5},
+     [
+       {:reserve, 0, 0, 4},
+       {:authorize, 0},
+       :replace_instance,
+       {:reserve, 1, 1, 3},
+       {:cancel, 0},
+       {:settle, 0, 4},
+       {:reconcile, 0, 4},
+       {:kill_owner, 0},
+       {:advance, 10},
+       {:reserve, 0, 0, 4},
+       {:cancel, 0},
+       :replace_instance,
+       {:cancel, 0}
+     ]},
     {"all-or-none reserve and op-id idempotence", %{slots: 1, units: 5, ttl: 3},
      [
        {:reserve, 0, 0, 3},
@@ -133,7 +165,8 @@ defmodule Telelem.AdmissionModelTest do
                 [{:kill_owner, o}, {:settle, op, a}],
                 [{:kill_owner, o}, {:reconcile, op, a}],
                 [:crash_authority, {:settle, op, a}],
-                [:crash_authority, {:kill_owner, o}, {:reconcile, op, a}]
+                [:crash_authority, {:kill_owner, o}, {:reconcile, op, a}],
+                [:replace_instance, {:cancel, op}, {:reserve, op, o, u}]
               ]) do
       [{:reserve, op, o, u}, {:authorize, op} | tail]
     end
@@ -151,6 +184,7 @@ defmodule Telelem.AdmissionModelTest do
       {2, tuple({constant(:reconcile), op, integer(0..6)})},
       {2, tuple({constant(:kill_owner), owner})},
       {1, constant(:crash_authority)},
+      {1, constant(:replace_instance)},
       {2, tuple({constant(:advance), integer(1..4)})}
     ])
   end
@@ -168,27 +202,19 @@ defmodule Telelem.AdmissionModelTest do
   def run_sequence!(config, cmds, dir) do
     uniq = System.unique_integer([:positive])
     clock_id = {:clock, uniq}
-    inst_id = {:model, uniq}
     clock = start_supervised!({ManualClock, id: clock_id})
-
-    sup =
-      start_supervised!(
-        {Instance,
-         id: inst_id,
-         scope: %{route: "model"},
-         limits: %{slots: config.slots, units: config.units},
-         spool_dir: Path.join(dir, "run-#{uniq}"),
-         transport: {NoTransport, nil},
-         clock: {ManualClock, clock},
-         reserve_ttl: config.ttl,
-         max_restarts: 10_000,
-         max_seconds: 1}
-      )
-
-    inst = Instance.handle(sup)
-    :ok = Instance.subscribe(inst)
     Process.put(:admission_model_owners, %{})
-    ctx = %{inst: inst, clock: clock, tag: inst.tag, owners: %{}, gids: %{}}
+
+    ctx =
+      start_life(%{
+        config: config,
+        uniq: uniq,
+        life: 0,
+        spool: Path.join(dir, "run-#{uniq}"),
+        clock: clock,
+        owners: %{},
+        gids: %{}
+      })
 
     try do
       cmds
@@ -208,12 +234,37 @@ defmodule Telelem.AdmissionModelTest do
       end)
     after
       for {_, pid} <- ctx_owners(), do: Process.exit(pid, :kill)
-      stop_supervised(inst_id)
+      stop_supervised(Process.get(:admission_model_instance))
       stop_supervised(clock_id)
-      flush(ctx.tag)
+      flush()
     end
 
     :ok
+  end
+
+  # One instance life: same spool dir, clock and limits; a fresh supervisor
+  # (and so a fresh instance id) each time.
+  defp start_life(ctx) do
+    inst_id = {:model, ctx.uniq, ctx.life}
+
+    sup =
+      start_supervised!(
+        {Instance,
+         id: inst_id,
+         scope: %{route: "model"},
+         limits: %{slots: ctx.config.slots, units: ctx.config.units},
+         spool_dir: ctx.spool,
+         transport: {NoTransport, nil},
+         clock: {ManualClock, ctx.clock},
+         reserve_ttl: ctx.config.ttl,
+         max_restarts: 10_000,
+         max_seconds: 1}
+      )
+
+    inst = Instance.handle(sup)
+    :ok = Instance.subscribe(inst)
+    Process.put(:admission_model_instance, inst_id)
+    Map.merge(ctx, %{inst: inst, inst_id: inst_id, tag: inst.tag})
   end
 
   # Owners are tracked in the process dictionary as well, so `after` can kill
@@ -231,7 +282,9 @@ defmodule Telelem.AdmissionModelTest do
 
     ctx =
       case r do
-        {tag, gid} when tag in [:ok, :duplicate] -> %{ctx | gids: Map.put_new(ctx.gids, op, gid)}
+        # A fresh grant supersedes a token kept from a replaced instance life.
+        {:ok, gid} -> %{ctx | gids: Map.put(ctx.gids, op, gid)}
+        {:duplicate, gid} -> %{ctx | gids: Map.put_new(ctx.gids, op, gid)}
         _ -> ctx
       end
 
@@ -291,6 +344,15 @@ defmodule Telelem.AdmissionModelTest do
     end
   end
 
+  defp exec(ctx, :replace_instance) do
+    old = Instance.authority(ctx.inst)
+    :ok = stop_supervised(ctx.inst_id)
+    refute Process.alive?(old)
+    flush(ctx.tag)
+    ctx = start_life(%{ctx | life: ctx.life + 1})
+    {if(Instance.instance_id(ctx.inst) != nil, do: :replaced, else: :no_instance_id), ctx}
+  end
+
   defp exec(ctx, {:advance, ms}) do
     fired = ManualClock.advance(ctx.clock, ms)
     tag = ctx.tag
@@ -331,8 +393,11 @@ defmodule Telelem.AdmissionModelTest do
   end
 
   # Unknown ops get a well-formed token for the current incarnation that names no grant.
-  defp gid(ctx, op),
-    do: Map.get_lazy(ctx.gids, op, fn -> {Instance.incarnation(ctx.inst), 1_000_000 + op} end)
+  defp gid(ctx, op) do
+    Map.get_lazy(ctx.gids, op, fn ->
+      {Instance.instance_id(ctx.inst), Instance.incarnation(ctx.inst), 1_000_000 + op}
+    end)
+  end
 
   defp norm({:ok, _}), do: :ok
   defp norm({:duplicate, _}), do: :duplicate
@@ -349,6 +414,8 @@ defmodule Telelem.AdmissionModelTest do
       encumbered_units: s.encumbered_units,
       spent_units: s.spent_units,
       available_units: s.available_units,
+      prior_instances: s.coverage.prior_instances,
+      prior_exposure: s.coverage.prior_exposure,
       states: Map.new(s.grants, fn {_, g} -> {g.op_id, g.state} end)
     }
   end
@@ -356,6 +423,14 @@ defmodule Telelem.AdmissionModelTest do
   defp flush(tag) do
     receive do
       {:telelem_admission, ^tag, _} -> flush(tag)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp flush do
+    receive do
+      {:telelem_admission, _, _} -> flush()
     after
       0 -> :ok
     end

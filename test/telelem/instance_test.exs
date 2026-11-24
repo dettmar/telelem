@@ -57,6 +57,8 @@ defmodule Telelem.InstanceTest do
     assert Instance.authority(a) != Instance.authority(b)
     assert Instance.snapshot(a).limits == %{slots: 2, units: 10}
     assert Instance.snapshot(b).limits == %{slots: 3, units: 20}
+    assert Instance.instance_id(a) != Instance.instance_id(b)
+    assert byte_size(Instance.instance_id(a)) == 16
 
     # B serves a dispatched request on a held socket.
     {:ok, wb} = Instance.start_work(b, "op-1", 4)
@@ -100,11 +102,12 @@ defmodule Telelem.InstanceTest do
     assert {:error, :closed} = recv!(sa1)
     assert {:error, :closed} = recv!(sa2)
 
+    # The fence retires the never-dispatched grant and holds the dispatched one.
+    assert_receive {:telelem_admission, ^tag_a, {:fenced, 2, %{released: [^ga2], held: [^ga1]}}}
     assert_receive {:telelem_admission, ^tag_a, {:authority_up, new_auth, 2}}
     assert new_auth != old_auth and Instance.authority(a) == new_auth
-    # The successor re-monitors the fenced owners and sees each die exactly once.
+    # The successor re-monitors the held grant's owner and sees it die exactly once.
     assert_receive {:telelem_admission, ^tag_a, {:owner_down, ^wa1, [{^ga1, {:ok, ^ga1}}]}}
-    assert_receive {:telelem_admission, ^tag_a, {:owner_down, ^wa2, [{^ga2, {:ok, ^ga2}}]}}
 
     snap_a = Instance.snapshot(a)
     assert %{incarnation: 2, active: 0, reserved_units: 0, spent_units: 0} = snap_a
@@ -123,7 +126,8 @@ defmodule Telelem.InstanceTest do
     {:ok, wa3} = Instance.start_work(a, "op-3", 2)
     {sa3, "hello A op-3"} = TcpTransport.accept!(la)
     %{grant: ga3, incarnation: 2} = Worker.info(wa3)
-    assert elem(ga3, 0) == 2
+    assert {iid, 2, _} = ga3
+    assert iid == Instance.instance_id(a) and iid != Instance.instance_id(b)
 
     # Late timers armed by incarnation 1 reach incarnation 2 (the manual clock
     # resolves the destination at fire time) and are fenced.

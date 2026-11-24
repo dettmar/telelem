@@ -14,17 +14,26 @@ defmodule Telelem.Test.Admission.Model do
       {:settle, op, actual} | {:reconcile, op, actual}
       {:kill_owner, owner_ix}          # owner death
       :crash_authority                 # kill the authority; the successor fences
+      :replace_instance                # stop and restart the whole instance (new life)
       {:advance, ms}                   # manual clock; due TTL timers fire in order
 
   Rules the model encodes:
 
-    * reserve is all-or-none (one slot and the units) and idempotent per op
-      for the same owner and units; any other reuse of the op id conflicts
-    * a token is only valid in the incarnation that issued it
+    * reserve is all-or-none (one slot and the units). Re-reserving a known
+      op with the same owner and units is `:duplicate` only while its grant
+      is live in the current incarnation; it is `:stale_incarnation` if the
+      grant is from a fenced incarnation and `{:op_closed, state}` otherwise.
+      Another owner or other units conflict.
+    * a token is only valid in the incarnation that issued it, and never in
+      another instance life (`:foreign_instance`)
+    * an authority crash retires every never-dispatched grant at once
+      (refund); a dispatched grant stays live and exposed until its owner dies
     * owner death releases a live slot once and refunds only never-dispatched
       units; dispatched units stay exposed until a settle/reconcile
     * a TTL timer only releases a grant that is still reserved, in its own
-      incarnation
+      incarnation. A timer from a replaced instance is not delivered.
+    * replacing the instance forgets the ledger. Exposure from the old life
+      is reported as unknown (`prior_instances` > 0), never as zero.
   """
 
   def new(%{slots: slots, units: units, ttl: ttl}) do
@@ -37,7 +46,9 @@ defmodule Telelem.Test.Admission.Model do
       tseq: 0,
       grants: %{},
       timers: [],
-      gens: %{}
+      gens: %{},
+      life: 0,
+      foreign: MapSet.new()
     }
   end
 
@@ -49,11 +60,17 @@ defmodule Telelem.Test.Admission.Model do
     me = owner(m, ix)
 
     case m.grants[op] do
-      %{owner: ^me, units: ^units} ->
+      %{owner: o, units: u} when o != me or u != units ->
+        {{:error, :op_conflict}, m}
+
+      %{inc: inc} when inc != m.inc ->
+        {{:error, :stale_incarnation}, m}
+
+      %{st: st} when st in [:reserved, :dispatched] ->
         {:duplicate, m}
 
-      %{} ->
-        {{:error, :op_conflict}, m}
+      %{st: st} ->
+        {{:error, {:op_closed, st}}, m}
 
       nil ->
         live = Enum.count(Map.values(m.grants), &(&1.st == :reserved or &1.st == :dispatched))
@@ -76,14 +93,15 @@ defmodule Telelem.Test.Admission.Model do
 
           true ->
             g = %{owner: me, units: units, st: :reserved, inc: m.inc, actual: nil}
-            timer = {m.now + m.ttl, m.tseq, op, m.inc}
+            timer = {m.now + m.ttl, m.tseq, op, m.inc, m.life}
 
             {:ok,
              %{
                m
                | grants: Map.put(m.grants, op, g),
                  timers: m.timers ++ [timer],
-                 tseq: m.tseq + 1
+                 tseq: m.tseq + 1,
+                 foreign: MapSet.delete(m.foreign, op)
              }}
         end
     end
@@ -117,7 +135,7 @@ defmodule Telelem.Test.Admission.Model do
   def step(m, {:reconcile, op, actual}) do
     case m.grants[op] do
       nil ->
-        {{:error, :unknown_grant}, m}
+        {missing(m, op), m}
 
       g ->
         case g do
@@ -145,18 +163,32 @@ defmodule Telelem.Test.Admission.Model do
     {{:killed, live?}, %{m | grants: grants, gens: Map.put(m.gens, ix, elem(me, 1) + 1)}}
   end
 
-  def step(m, :crash_authority), do: {:crashed, %{m | inc: m.inc + 1}}
+  def step(m, :crash_authority) do
+    grants =
+      Map.new(m.grants, fn
+        {op, %{st: :reserved} = g} -> {op, %{g | st: :released}}
+        other -> other
+      end)
+
+    {:crashed, %{m | inc: m.inc + 1, grants: grants}}
+  end
+
+  def step(m, :replace_instance) do
+    foreign = MapSet.union(m.foreign, MapSet.new(Map.keys(m.grants)))
+    {:replaced, %{m | inc: 1, grants: %{}, foreign: foreign, life: m.life + 1}}
+  end
 
   def step(m, {:advance, ms}) do
     now = m.now + ms
-    {due, rest} = Enum.split_with(m.timers, fn {d, _, _, _} -> d <= now end)
+    {due, rest} = Enum.split_with(m.timers, fn {d, _, _, _, _} -> d <= now end)
     due = Enum.sort(due)
 
     {results, m} =
-      Enum.map_reduce(due, %{m | now: now, timers: rest}, fn {_, _, op, inc}, m ->
+      Enum.map_reduce(due, %{m | now: now, timers: rest}, fn {_, _, op, inc, life}, m ->
         g = m.grants[op]
 
         cond do
+          life != m.life -> {:undelivered, m}
           inc != m.inc -> {{:error, :stale_incarnation}, m}
           g.st == :reserved -> {:ok, put_in(m.grants[op].st, :released)}
           true -> {:duplicate, m}
@@ -166,10 +198,17 @@ defmodule Telelem.Test.Admission.Model do
     {{:timers, results}, m}
   end
 
+  # The driver still holds the old life's token for a forgotten op.
+  defp missing(m, op) do
+    if MapSet.member?(m.foreign, op),
+      do: {:error, :foreign_instance},
+      else: {:error, :unknown_grant}
+  end
+
   defp tokened(m, op, rule) do
     case m.grants[op] do
       nil ->
-        {{:error, :unknown_grant}, m}
+        {missing(m, op), m}
 
       %{inc: inc} when inc != m.inc ->
         {{:error, :stale_incarnation}, m}
@@ -207,6 +246,8 @@ defmodule Telelem.Test.Admission.Model do
       encumbered_units: exposure,
       spent_units: spent,
       available_units: m.units - reserved - exposure - spent,
+      prior_instances: m.life,
+      prior_exposure: if(m.life == 0, do: :no_prior_instance_in_spool, else: :unknown),
       states: Map.new(m.grants, fn {op, g} -> {op, g.st} end)
     }
   end

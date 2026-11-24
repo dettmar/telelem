@@ -27,17 +27,30 @@ defmodule Telelem.Instance do
 
   Two instances in one BEAM share nothing: each has its own authority pid,
   ledger, limits, clock, transport and spool directory. Nothing is read from
-  application env.
+  application env. Each supervisor start mints a boot-unique `instance_id`
+  (128 random bits), which every grant token embeds. A token or handle from
+  another instance, or from a previous life of this one, cannot act here.
+
+  **M1 coverage.** The ledger is volatile, in memory for one instance life.
+  If the parent restarts the instance (for example after `max_restarts`),
+  the new life starts empty, and `snapshot/1`'s `coverage` reports the prior
+  exposure as `:unknown`, never zero. Limits are local and soft: there is no
+  durable billing or global hard limit.
   """
   use Supervisor
 
   alias Telelem.Admission.Authority
   alias Telelem.Instance.Directory
 
-  @enforce_keys [:sup, :table, :tag]
-  defstruct [:sup, :table, :tag]
+  @enforce_keys [:sup, :table, :tag, :instance_id]
+  defstruct [:sup, :table, :tag, :instance_id]
 
-  @type t :: %__MODULE__{sup: pid(), table: :ets.tid(), tag: reference()}
+  @type t :: %__MODULE__{
+          sup: pid(),
+          table: :ets.tid(),
+          tag: reference(),
+          instance_id: binary()
+        }
 
   def child_spec(opts) do
     %{
@@ -55,6 +68,9 @@ defmodule Telelem.Instance do
 
     meta = %{
       id: Keyword.fetch!(opts, :id),
+      # Boot-unique: a parent restart of this supervisor mints a new one, so
+      # tokens from a previous life are foreign here (see Admission.Ledger).
+      instance_id: Telelem.Admission.Ledger.new_instance_id(),
       tag: make_ref(),
       scope: Keyword.get(opts, :scope, %{}),
       limits: %{slots: Map.fetch!(limits, :slots), units: Map.fetch!(limits, :units)},
@@ -86,7 +102,8 @@ defmodule Telelem.Instance do
   @spec handle(pid()) :: t()
   def handle(sup) when is_pid(sup) do
     table = GenServer.call(child!(sup, :authority), :table)
-    %__MODULE__{sup: sup, table: table, tag: Directory.meta(table).tag}
+    meta = Directory.meta(table)
+    %__MODULE__{sup: sup, table: table, tag: meta.tag, instance_id: meta.instance_id}
   end
 
   @spec meta(t()) :: map()
@@ -139,14 +156,28 @@ defmodule Telelem.Instance do
   @spec workers_sup(t()) :: pid()
   def workers_sup(%__MODULE__{sup: sup}), do: child!(sup, :workers)
 
-  # Direct grant API (the owner is any pid the authority can monitor).
-  def reserve(inst, op_id, owner, units),
-    do: Authority.reserve(authority(inst), op_id, owner, units)
+  @doc "Opaque boot-unique id of this instance life (embedded in every grant token)."
+  @spec instance_id(t()) :: binary()
+  def instance_id(%__MODULE__{instance_id: iid}), do: iid
 
-  def authorize(inst, gid), do: Authority.authorize(authority(inst), gid)
-  def cancel(inst, gid), do: Authority.cancel(authority(inst), gid)
-  def settle(inst, gid, actual), do: Authority.settle(authority(inst), gid, actual)
-  def reconcile(inst, gid, actual), do: Authority.reconcile(authority(inst), gid, actual)
+  # Direct grant API (the owner is any pid the authority can monitor). A
+  # handle whose instance has stopped or been replaced, or whose authority is
+  # restarting, returns {:error, :instance_unavailable}. It never reaches
+  # another instance.
+  def reserve(inst, op_id, owner, units),
+    do: via(inst, &Authority.reserve(&1, op_id, owner, units))
+
+  def authorize(inst, gid), do: via(inst, &Authority.authorize(&1, gid))
+  def cancel(inst, gid), do: via(inst, &Authority.cancel(&1, gid))
+  def settle(inst, gid, actual), do: via(inst, &Authority.settle(&1, gid, actual))
+  def reconcile(inst, gid, actual), do: via(inst, &Authority.reconcile(&1, gid, actual))
+
+  defp via(%__MODULE__{table: t}, fun) do
+    case Directory.authority(t) do
+      {pid, _} -> fun.(pid)
+      nil -> {:error, :instance_unavailable}
+    end
+  end
 
   defp child!(sup, id) do
     case List.keyfind(Supervisor.which_children(sup), id, 0) do

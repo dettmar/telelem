@@ -34,21 +34,52 @@ defmodule Telelem.Admission.Ledger do
     settlement reports more than the reservation, this goes negative
     (truthful overspend).
 
-  ## Fencing
+  ## Identity and fencing
 
-  Grant ids are `{incarnation, seq}`. Calls that carry a token (authorize,
-  cancel, settle, expire) are rejected with `:stale_incarnation` unless the
-  token's incarnation is the ledger's current one. `owner_down/2` and
-  `reconcile/3` come from the authority itself, so they accept any
-  incarnation. `seq` survives `next_incarnation/1`, so ids are never reused.
+  Grant ids are opaque `{instance_id, incarnation, seq}` tokens.
+
+    * `instance_id` is a boot-unique nonce (128 random bits from `:crypto`),
+      minted each time an instance supervisor starts, including a restart by
+      its parent. Two instances in one VM, or one instance in two OS sessions,
+      never share it on purpose. Any token whose `instance_id` differs is
+      rejected with `:foreign_instance`, whatever the call: a token from a
+      previous life of the instance, or from another instance, cannot act here.
+    * `incarnation` is the authority epoch inside one instance life. A token
+      call (authorize, cancel, settle, expire) is rejected with
+      `:stale_incarnation` unless the token is from the current incarnation.
+      `owner_down/2` and `reconcile/3` accept any incarnation of this
+      instance. `seq` survives `next_incarnation/1`, so no id is reused.
+
+  `next_incarnation/1` fences the previous incarnation:
+
+    * every `:reserved` grant is **retired** (`:released`, slot and units
+      refunded). It was never authorized, so nothing can be billed, and its
+      stale token could never authorize, cancel or expire it again
+    * every `:dispatched` grant is **held**. It keeps its slot and its
+      encumbrance until the authority sees its owner's monitored death
+      (→ `:unresolved`), and then until a `reconcile/3`
+
+  Retrying `reserve/4` for an op whose grant was fenced returns
+  `{:error, :stale_incarnation}`, never `:duplicate`. `:duplicate` means the
+  returned token is a live, usable grant in the current incarnation.
+
+  ## Coverage (M1: deliberately volatile)
+
+  The ledger lives only in memory and covers **one instance life**. It
+  survives authority restarts, because the instance supervisor owns the
+  directory, but not an instance restart. There is no WAL, no durable
+  billing record and no global hard limit. A fresh ledger with zero exposure
+  says nothing about spend in a previous life: see `coverage` in
+  `Telelem.Admission.Authority.snapshot/1`.
 
   All transitions return `{:ok, grant_id, ledger}`, `{:duplicate, grant_id, ledger}`
   (no change), or `{:error, reason, ledger}` (no change). A duplicate or late
   event therefore cannot apply a transition twice.
   """
 
-  @enforce_keys [:limits]
+  @enforce_keys [:limits, :instance_id]
   defstruct limits: nil,
+            instance_id: nil,
             incarnation: 0,
             seq: 0,
             grants: %{},
@@ -58,7 +89,8 @@ defmodule Telelem.Admission.Ledger do
             encumbered_units: 0,
             spent_units: 0
 
-  @type grant_id :: {non_neg_integer(), pos_integer()}
+  @type instance_id :: binary()
+  @type grant_id :: {instance_id(), non_neg_integer(), pos_integer()}
   @type state :: :reserved | :dispatched | :unresolved | :released | :settled
   @type grant :: %{
           id: grant_id(),
@@ -71,27 +103,63 @@ defmodule Telelem.Admission.Ledger do
   @type limits :: %{slots: non_neg_integer(), units: non_neg_integer()}
   @type t :: %__MODULE__{}
   @type result :: {:ok | :duplicate, grant_id(), t()} | {:error, term(), t()}
+  @type fence :: %{released: [grant_id()], held: [grant_id()]}
 
   @live [:reserved, :dispatched]
 
-  @spec new(limits()) :: t()
-  def new(%{slots: slots, units: units} = limits)
-      when is_integer(slots) and slots >= 0 and is_integer(units) and units >= 0 do
-    %__MODULE__{limits: Map.take(limits, [:slots, :units])}
+  @doc "A fresh boot-unique instance id (128 bits from a strong RNG)."
+  @spec new_instance_id() :: instance_id()
+  def new_instance_id, do: :crypto.strong_rand_bytes(16)
+
+  @spec new(limits(), instance_id()) :: t()
+  def new(%{slots: slots, units: units} = limits, instance_id)
+      when is_integer(slots) and slots >= 0 and is_integer(units) and units >= 0 and
+             is_binary(instance_id) and byte_size(instance_id) >= 16 do
+    %__MODULE__{limits: Map.take(limits, [:slots, :units]), instance_id: instance_id}
   end
 
-  @doc "Advance to a new incarnation. Every older token becomes stale."
-  @spec next_incarnation(t()) :: t()
-  def next_incarnation(%__MODULE__{} = l), do: %{l | incarnation: l.incarnation + 1}
+  @doc """
+  Advance to a new incarnation and fence the previous one: retire every
+  never-dispatched grant and hold every dispatched one (see moduledoc).
+  """
+  @spec next_incarnation(t()) :: {t(), fence()}
+  def next_incarnation(%__MODULE__{} = l) do
+    l = %{l | incarnation: l.incarnation + 1}
+    gs = l.grants |> Map.values() |> Enum.sort_by(& &1.id)
 
-  @doc "All-or-none reservation of one slot plus `units`, idempotent by `op_id`."
+    l =
+      gs
+      |> Enum.filter(&(&1.state == :reserved))
+      |> Enum.reduce(l, fn g, l -> move(l, g, :released) end)
+
+    {l,
+     %{
+       released: for(g <- gs, g.state == :reserved, do: g.id),
+       held: for(g <- gs, g.state == :dispatched, do: g.id)
+     }}
+  end
+
+  @doc """
+  All-or-none reservation of one slot plus `units`, idempotent by `op_id`.
+
+  For an op id that is already known:
+
+    * a different owner or units: `{:error, :op_conflict}`
+    * the grant is from an earlier incarnation (fenced): `{:error, :stale_incarnation}`
+    * the grant is live in this incarnation: `{:duplicate, grant_id}` (usable token)
+    * otherwise: `{:error, {:op_closed, state}}`
+  """
   @spec reserve(t(), term(), term(), term()) :: result()
   def reserve(%__MODULE__{} = l, op_id, owner, units) do
     case Map.fetch(l.ops, op_id) do
-      {:ok, gid} ->
-        case Map.fetch!(l.grants, gid) do
-          %{owner: ^owner, units: ^units} -> {:duplicate, gid, l}
-          _ -> {:error, :op_conflict, l}
+      {:ok, {_, inc, _} = gid} ->
+        g = Map.fetch!(l.grants, gid)
+
+        cond do
+          g.owner != owner or g.units != units -> {:error, :op_conflict, l}
+          inc != l.incarnation -> {:error, :stale_incarnation, l}
+          live?(g) -> {:duplicate, gid, l}
+          true -> {:error, {:op_closed, g.state}, l}
         end
 
       :error ->
@@ -107,7 +175,7 @@ defmodule Telelem.Admission.Ledger do
 
           true ->
             seq = l.seq + 1
-            gid = {l.incarnation, seq}
+            gid = {l.instance_id, l.incarnation, seq}
 
             grant = %{
               id: gid,
@@ -168,14 +236,15 @@ defmodule Telelem.Admission.Ledger do
 
   @doc """
   Reconcile an `:unresolved` grant from an out-of-band usage source.
-  Accepts any incarnation, because a fenced grant can only be resolved this way.
+  Accepts any incarnation of this instance, because a fenced grant can only
+  be resolved this way. A token from another instance is `:foreign_instance`.
   """
   @spec reconcile(t(), term(), term()) :: result()
   def reconcile(l, gid, actual) do
     with_known(l, gid, fn g -> settle_grant(l, g, actual, [:unresolved]) end)
   end
 
-  @doc "The authority's monitor saw the owner die. Accepts any incarnation."
+  @doc "The authority's monitor saw the owner die. Accepts any incarnation of this instance."
   @spec owner_down(t(), term()) :: result()
   def owner_down(l, gid) do
     with_known(l, gid, fn
@@ -204,6 +273,7 @@ defmodule Telelem.Admission.Ledger do
   @spec snapshot(t()) :: map()
   def snapshot(l) do
     %{
+      instance_id: l.instance_id,
       incarnation: l.incarnation,
       limits: l.limits,
       active: l.active,
@@ -234,13 +304,31 @@ defmodule Telelem.Admission.Ledger do
 
   # -- internals -------------------------------------------------------------
 
-  defp with_current(l, {inc, seq} = gid, fun) when is_integer(inc) and is_integer(seq) do
-    if inc != l.incarnation, do: {:error, :stale_incarnation, l}, else: with_known(l, gid, fun)
+  defp with_current(l, gid, fun) do
+    case token(l, gid) do
+      {:ok, inc} when inc != l.incarnation -> {:error, :stale_incarnation, l}
+      {:ok, _} -> known(l, gid, fun)
+      {:error, reason} -> {:error, reason, l}
+    end
   end
 
-  defp with_current(l, _gid, _fun), do: {:error, :invalid_token, l}
-
+  # Any incarnation of this instance; never another instance.
   defp with_known(l, gid, fun) do
+    case token(l, gid) do
+      {:ok, _} -> known(l, gid, fun)
+      {:error, reason} -> {:error, reason, l}
+    end
+  end
+
+  defp token(%{instance_id: iid}, {iid, inc, seq}) when is_integer(inc) and is_integer(seq),
+    do: {:ok, inc}
+
+  defp token(_l, {iid, inc, seq}) when is_binary(iid) and is_integer(inc) and is_integer(seq),
+    do: {:error, :foreign_instance}
+
+  defp token(_l, _gid), do: {:error, :invalid_token}
+
+  defp known(l, gid, fun) do
     case Map.fetch(l.grants, gid) do
       :error ->
         {:error, :unknown_grant, l}

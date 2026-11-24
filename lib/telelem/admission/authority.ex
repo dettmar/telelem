@@ -15,22 +15,46 @@ defmodule Telelem.Admission.Authority do
 
   ## Incarnations and fencing
 
-  On `init/1` the authority loads the last committed ledger from the
-  directory, increments the incarnation, and re-monitors every owner that
-  still holds a slot. Tokens (`{incarnation, seq}`) from earlier incarnations
-  get `{:error, :stale_incarnation}` and change nothing, including late timers
-  that reach the new pid. A fenced grant leaves the live set only when its
-  owner's monitor fires; fenced unresolved spend is resolved only by
-  `reconcile/3`.
+  On `init/1` the authority loads the last committed ledger of **this
+  instance life** from the directory and calls `Ledger.next_incarnation/1`.
+  That retires every never-dispatched grant at once (bounded recovery: by
+  the time `:authority_up` is observed, a fenced reservation holds nothing,
+  even if its owner is alive). It then re-monitors the owners of held
+  `:dispatched` grants. Those keep their slot and encumbrance until the
+  owner's `:DOWN` (→ `:unresolved`), then until `reconcile/3`. A live direct
+  owner of fenced dispatched work therefore holds its slot for as long as it
+  lives. Instance workers are already gone (`:rest_for_one`), so their
+  `:DOWN` arrives immediately.
 
-  Known M1 limit: the directory is in memory, owned by the instance supervisor.
-  Stopping the instance discards the ledger (durable authority is TEL-040).
+  Tokens are `{instance_id, incarnation, seq}`. A token from an earlier
+  incarnation gets `{:error, :stale_incarnation}`, and one from another
+  instance, or from an earlier life of this one, gets
+  `{:error, :foreign_instance}`. Neither changes anything, including late
+  timers that reach the new pid.
+
+  ## Coverage (M1: deliberately volatile, local and soft)
+
+  The ledger is in memory, owned by the instance supervisor. An instance
+  restart, for example by its parent after restart intensity is exceeded,
+  starts a **new** instance id with an empty ledger. Exposure from the
+  previous life is *unknown*, not zero. There is no WAL, no durable billing
+  and no global hard limit in M1 (durable authority is TEL-040).
+  `snapshot/1` reports this as `coverage`:
+
+      %{instance_id: hex, ledger: :volatile, covers: :this_instance_life,
+        prior_instances: n,          # other instance ids seen in this spool dir
+        prior_exposure: :unknown | :no_prior_instance_in_spool}
+
+  `prior_exposure` is never `:none`. A spool with no earlier instance only
+  shows that this spool directory saw none.
 
   ## Observations
 
   Every process in the directory's subscriber list receives
   `{:telelem_admission, tag, event}`, where `event` is one of:
 
+    * `{:fenced, incarnation, %{released: [grant_id], held: [grant_id]}}`
+      (sent just before `:authority_up`)
     * `{:authority_up, pid, incarnation}`
     * `{:owner_down, owner_pid, [{grant_id, :ok | :duplicate | {:error, term}}]}`
     * `{:timer, grant_id, :ok | :duplicate | {:error, term}}`
@@ -77,11 +101,11 @@ defmodule Telelem.Admission.Authority do
     table = Keyword.fetch!(opts, :table)
     meta = Directory.meta(table)
 
-    ledger =
-      (Directory.ledger(table) || Ledger.new(meta.limits))
+    {ledger, fence} =
+      (Directory.ledger(table) || Ledger.new(meta.limits, meta.instance_id))
       |> Ledger.next_incarnation()
 
-    # Commit the new incarnation before anything can observe it.
+    # Commit the new incarnation (and the fence) before anything can observe it.
     Directory.put_ledger(table, ledger)
 
     state = %{
@@ -92,7 +116,8 @@ defmodule Telelem.Admission.Authority do
       spool_dir: meta.spool_dir,
       ledger: ledger,
       monitors: %{},
-      stale_rejections: 0
+      stale_rejections: 0,
+      coverage: nil
     }
 
     # Re-monitor fenced live owners. A dead owner's :DOWN is queued now, so it
@@ -103,10 +128,17 @@ defmodule Telelem.Admission.Authority do
       end)
 
     File.mkdir_p!(state.spool_dir)
+    iid = Base.encode16(ledger.instance_id, case: :lower)
+    state = %{state | coverage: coverage(state.spool_dir, iid)}
 
-    spool(state, "authority.log", "incarnation=#{ledger.incarnation} pid=#{inspect(self())}\n")
+    spool(
+      state,
+      "authority.log",
+      "instance=#{iid} incarnation=#{ledger.incarnation} pid=#{inspect(self())}\n"
+    )
 
     Directory.put_authority(table, self(), ledger.incarnation)
+    notify(state, {:fenced, ledger.incarnation, fence})
     notify(state, {:authority_up, self(), ledger.incarnation})
     {:ok, state}
   end
@@ -139,7 +171,11 @@ defmodule Telelem.Admission.Authority do
     snap =
       s.ledger
       |> Ledger.snapshot()
-      |> Map.merge(%{stale_rejections: s.stale_rejections, authority: self()})
+      |> Map.merge(%{
+        stale_rejections: s.stale_rejections,
+        authority: self(),
+        coverage: s.coverage
+      })
 
     {:reply, snap, s}
   end
@@ -255,6 +291,29 @@ defmodule Telelem.Admission.Authority do
       "receipts.log",
       "grant=#{inspect(g.id)} op=#{inspect(g.op_id)} units=#{g.units} actual=#{g.actual}\n"
     )
+  end
+
+  # What this ledger can and cannot vouch for (see moduledoc).
+  defp coverage(spool_dir, iid) do
+    prior =
+      case File.read(Path.join(spool_dir, "authority.log")) do
+        {:ok, log} ->
+          Regex.scan(~r/^instance=([0-9a-f]+) /m, log, capture: :all_but_first)
+          |> List.flatten()
+          |> Enum.uniq()
+          |> Enum.reject(&(&1 == iid))
+
+        {:error, _} ->
+          []
+      end
+
+    %{
+      instance_id: iid,
+      ledger: :volatile,
+      covers: :this_instance_life,
+      prior_instances: length(prior),
+      prior_exposure: if(prior == [], do: :no_prior_instance_in_spool, else: :unknown)
+    }
   end
 
   defp spool(s, file, line), do: File.write!(Path.join(s.spool_dir, file), line, [:append])
