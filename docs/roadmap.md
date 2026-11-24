@@ -2,7 +2,7 @@
 
 Proposed work, not shipped behavior. The first release candidate is single-node, one native wire protocol, one streaming and one unary endpoint, and two deployments of the same protocol. Two lanes prove deployment fallback, not resilience to losing an entire provider.
 
-**Delivery design:** M1 is approved. The [agent working agreement](../AGENTS.md) defines focused subagent assignments, effort selection, minimal context and independent verification.
+**Delivery status:** M1 passed its engineering gate; the [reader decision and replay instructions](m1-results.md) identify the verified implementation. The [agent working agreement](../AGENTS.md) defines focused subagent assignments, effort selection, minimal context and independent verification.
 
 ## M1 — Can we trust a broken stream?
 

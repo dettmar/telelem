@@ -1,6 +1,6 @@
 # M1 · What the stream experiment establishes
 
-**Candidate decision: keep the credit-driven reader.** Each attempt owns its upstream TLS socket for the socket’s lifetime. The downstream writer returns byte credit only after a successful write. Deployment fallback therefore needs no transfer of a live socket to a new process. This is an HTTP/1.1 experiment against local scripted deployments.
+**M1 decision: keep the credit-driven reader.** Each attempt owns its upstream TLS socket for the socket’s lifetime. The downstream writer returns byte credit only after a successful write. Deployment fallback therefore needs no transfer of a live socket to a new process. The independently verified implementation is `3988f31c74eb6393d935450677e346b0dfc25cd9`; the experiment covers chunked HTTP/1.1 against local scripted deployments with `openai` Python `3.52.0` and SDK retries disabled.
 
 ### Replay the experiment
 
