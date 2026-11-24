@@ -1,0 +1,115 @@
+#!/bin/bash
+# Run one route-store writer while it holds an exclusive lock on its store directory.
+# This is the M2a TEL-015 local prerequisite. It is a standalone guard and is not wired
+# into any launcher yet.
+#
+#   scripts/with-route-store-lock STORE_DIR -- COMMAND [ARG...]
+#
+# Use the same wrapper for explicit provisioning and for gateway startup, so at most
+# one of them can run against a store at a time:
+#   scripts/with-route-store-lock /srv/telelem/store -- <provision command>
+#   scripts/with-route-store-lock /srv/telelem/store -- <startup command>
+#
+# How it works: open STORE_DIR itself (not a lock file inside it), take a non-blocking
+# exclusive flock(2) on that open file description with the installed util-linux flock,
+# check that the path still names the locked inode, then `exec` COMMAND. There is no fork.
+# COMMAND keeps the wrapper's PID and inherits the locked descriptor (bash does not set
+# close-on-exec on it). The kernel releases the lock when the last descriptor that refers
+# to that open file description is closed. Normally that happens when COMMAND exits, by
+# any route, including SIGKILL.
+#
+# The writer contract is in integration/m2a/store-lock/README.md. In short: do not
+# daemonize or detach, and do not close or unlock fd $TELELEM_ROUTE_STORE_LOCK_FD.
+# Children that inherit the descriptor keep the store locked until they exit too.
+#
+# Exit status: COMMAND's own status once it has been exec'd (126/127 if exec fails).
+# Before that, the wrapper uses its own codes and prints a "with-route-store-lock:" line
+# on stderr:
+#   64  usage error
+#   69  trusted flock or /proc unavailable, or flock failed for another reason
+#   70  STORE_DIR no longer names the inode that was locked (path replaced)
+#   75  busy: another wrapped writer holds the lock (COMMAND was not run)
+#   78  STORE_DIR fails a precondition (see README)
+set -euo pipefail
+
+readonly ME=with-route-store-lock
+die() {
+  local code=$1
+  shift
+  printf '%s: %s\n' "$ME" "$*" >&2
+  exit "$code"
+}
+
+# Use fixed system paths for this script's own tools. Restore the caller's PATH just
+# before exec, so the wrapper resolves COMMAND exactly as the caller would.
+# Every stat(1) call below runs with a per-command LC_ALL=C, and file types are decided
+# from numeric mode bits (%f), never from translated text such as %F. The caller's
+# locale variables are left untouched for COMMAND.
+if [[ -v PATH ]]; then had_path=1 orig_path=$PATH; else had_path=0 orig_path=; fi
+PATH=/usr/bin:/bin
+
+(($# >= 3)) && [[ $2 == -- ]] || die 64 "usage: $ME STORE_DIR -- COMMAND [ARG...]"
+store=$1
+shift 2
+
+# --- trusted flock: root-owned, not group/other-writable, never looked up via PATH ----
+flock_bin=
+for c in /usr/bin/flock /bin/flock; do
+  if [[ -f $c && -x $c ]]; then
+    read -r fu fm < <(LC_ALL=C stat -L -c '%u %a' -- "$c")
+    if [[ $fu == 0 ]] && (((8#$fm & 8#022) == 0)); then
+      flock_bin=$c
+      break
+    fi
+  fi
+done
+[[ -n $flock_bin ]] || die 69 "no trusted flock (root-owned, mode not group/other-writable) in /usr/bin or /bin"
+[[ -d /proc/$$/fd ]] || die 69 "/proc is not mounted; cannot verify the locked descriptor"
+
+# --- STORE_DIR preconditions ---------------------------------------------------------
+[[ $store == /* ]] || die 78 "STORE_DIR must be an absolute path: $store"
+[[ $store != / ]] || die 78 "STORE_DIR must not be /"
+[[ -e $store || -L $store ]] || die 78 "STORE_DIR does not exist: $store"
+[[ ! -L $store ]] || die 78 "STORE_DIR is a symlink: $store"
+[[ -d $store ]] || die 78 "STORE_DIR is not a directory: $store"
+canon=$(realpath -e -- "$store") || die 78 "cannot resolve STORE_DIR: $store"
+[[ $canon == "$store" ]] || die 78 "STORE_DIR is not canonical (resolves to $canon): $store"
+
+read -r s_uid s_mode s_dev s_ino s_raw < <(LC_ALL=C stat -c '%u %a %d %i %f' -- "$store")
+[[ $s_raw =~ ^[0-9a-f]+$ ]] && (((16#$s_raw & 8#170000) == 8#040000)) ||
+  die 78 "STORE_DIR is not a directory (stat mode 0x$s_raw): $store"
+[[ $s_uid == "$EUID" ]] || die 78 "STORE_DIR is owned by uid $s_uid, not the writer's uid $EUID: $store"
+(((8#$s_mode & 8#022) == 0)) || die 78 "STORE_DIR is group- or other-writable (mode $s_mode): $store"
+fstype=$(LC_ALL=C stat -f -c '%T' -- "$store")
+case $fstype in
+  ext2/ext3 | xfs | btrfs | zfs | tmpfs) ;;
+  *) die 78 "STORE_DIR is on filesystem type '$fstype'; only local ext4/xfs/btrfs/zfs/tmpfs are accepted: $store" ;;
+esac
+
+# --- open the directory itself and lock it without waiting ---------------------------
+if ! { exec {lock_fd}<"$store"; } 2>/dev/null; then
+  die 78 "cannot open STORE_DIR for reading: $store"
+fi
+rc=0
+"$flock_bin" --nonblock --exclusive --conflict-exit-code 75 "$lock_fd" || rc=$?
+case $rc in
+  0) ;;
+  75) die 75 "busy: another writer holds the lock on $store; command not run" ;;
+  *) die 69 "flock failed (status $rc) on $store" ;;
+esac
+
+# --- the locked descriptor, the path and the earlier check must be the same inode ----
+# Compare device, inode and the raw st_mode (%f, hex), which also pins the file type to
+# the directory checked above. No locale-dependent text is compared.
+held=$(LC_ALL=C stat -L -c '%d %i %f' -- "/proc/$$/fd/$lock_fd") || die 70 "cannot stat the locked descriptor"
+now=$(LC_ALL=C stat -c '%d %i %f' -- "$store" 2>/dev/null) || now=missing
+[[ $held == "$s_dev $s_ino $s_raw" && $now == "$held" ]] ||
+  die 70 "STORE_DIR changed while locking (checked $s_dev $s_ino, locked $held, path now $now): $store"
+canon=$(realpath -e -- "$store" 2>/dev/null) || canon=
+[[ $canon == "$store" ]] || die 70 "STORE_DIR stopped being canonical while locking: $store"
+
+# --- hand over: same PID, lock descriptor inherited ----------------------------------
+export TELELEM_ROUTE_STORE_LOCK_FD=$lock_fd
+export TELELEM_ROUTE_STORE_LOCK_DIR=$store
+if ((had_path)); then PATH=$orig_path; else unset PATH; fi
+exec -- "$@"

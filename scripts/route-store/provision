@@ -1,0 +1,3 @@
+#!/bin/bash
+# Explicit, create-only route-store provisioning. See scripts/route-store/launch.
+exec "$(dirname "${BASH_SOURCE[0]}")/launch" provision "$@"

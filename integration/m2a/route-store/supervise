@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Process supervisor owned by integration/m2a/route-store/run (tests only).
+
+  python3 -I supervise CTL STATUS [KEEP_FD ...] -- CMD [ARG ...]
+
+Starts CMD as this process's own child. CMD inherits stdin, stdout and stderr, plus
+only the listed KEEP_FDs. Every other inherited descriptor is closed first, here and
+in CMD. Right after the spawn, while the child cannot have been reaped (only this
+process can reap it, and it does so only after the pidfd reports the exit), it opens a
+pidfd on the child. Every signal goes through that pidfd, so a signal can reach only
+this child, never a process that later gets the same PID. The suite never signals
+this supervisor or the child by PID.
+
+CTL is a FIFO that the suite holds open for writing. It sends one request per line:
+"TERM" or "KILL". The answer on STATUS is "sent SIG" (the kernel accepted the signal
+for this child, though the child may already have exited) or "gone SIG" (no child is
+running to receive it: it has exited, or it was never started). Any other line gets
+"refused LINE". EOF on CTL means the suite closed it or died. The supervisor then
+SIGKILLs the child through the pidfd, reaps it, reports it and quits. SIGTERM or
+SIGHUP to the supervisor does the same.
+
+The suite must hold CTL open for writing BEFORE the supervisor opens it. The
+supervisor checks that before it starts CMD: right after opening CTL it reads it
+(non-blocking) until it would block. A read that returns EOF means no writer is
+left, so CMD is never started. A read that would block means a writer exists, and
+from then on Linux reports POLLHUP to this reader once the last writer closes (a
+non-blocking FIFO reader opened with no writer gets no POLLHUP until a writer opens;
+without this check a suite that died before the open would leave CMD running with
+nobody to release it). Requests read by this check are kept and handled, in order,
+before any later one.
+
+STATUS is a FIFO that the suite holds open for reading. The supervisor writes
+"started PID", then any answers, then exactly one "exit RC" as its last line. RC is
+the exit code, or 128+N for signal N. Without "started" no child ran: if CMD cannot
+be executed, the only line is "exit 127"; if CTL had no writer left, each request
+read before the EOF is answered ("gone SIG" or "refused LINE") and the last line is
+"exit 125".
+"""
+import os
+import select
+import signal
+import subprocess
+import sys
+
+
+class Stop(Exception):
+    pass
+
+
+def stop(_sig, _frame):
+    raise Stop()
+
+
+def main():
+    args = sys.argv[1:]
+    if "--" not in args:
+        sys.exit("usage: supervise CTL STATUS [KEEP_FD ...] -- CMD [ARG ...]")
+    i = args.index("--")
+    head, cmd = args[:i], args[i + 1:]
+    if len(head) < 2 or not cmd:
+        sys.exit("usage: supervise CTL STATUS [KEEP_FD ...] -- CMD [ARG ...]")
+    ctl_path, st_path = head[0], head[1]
+    try:
+        keep = sorted({int(x) for x in head[2:]})
+    except ValueError:
+        sys.exit("supervise: KEEP_FD must be numbers")
+    if any(fd < 3 for fd in keep):
+        sys.exit("supervise: KEEP_FD must be >= 3")
+
+    # A SIGCHLD ignored by an ancestor would make the kernel auto-reap the child,
+    # which would free its PID before the pidfd is open.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    # Close every other inherited descriptor, including other supervisors' control
+    # FIFOs and the suite's own FIFOs. EOF on CTL then means that the suite let go.
+    for name in os.listdir("/proc/self/fd"):
+        fd = int(name)
+        if fd > 2 and fd not in keep:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    st = os.open(st_path, os.O_WRONLY | os.O_NONBLOCK)  # ENXIO unless the suite reads
+    os.set_blocking(st, True)
+    ctl = os.open(ctl_path, os.O_RDONLY | os.O_NONBLOCK)
+
+    def say(line):
+        try:
+            os.write(st, (line + "\n").encode())
+        except OSError:
+            pass  # suite gone: still reap the child below
+
+    pidfd = None  # set only once the child exists
+
+    def send(name):
+        if pidfd is None:
+            return False  # no child was started: nothing to signal
+        try:
+            signal.pidfd_send_signal(pidfd, getattr(signal, "SIG" + name))
+            return True
+        except ProcessLookupError:
+            return False
+
+    buf = b""
+
+    def handle():  # answer every complete request line in buf, in order
+        nonlocal buf
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            req = line.decode("ascii", "replace").strip()
+            if req in ("TERM", "KILL"):
+                say(("sent " if send(req) else "gone ") + req)
+            else:
+                say("refused " + req)
+
+    # Writer check, before any child exists (see the docstring). Keep what it reads.
+    writer = True
+    while True:
+        try:
+            data = os.read(ctl, 512)
+        except BlockingIOError:
+            break  # empty, and a writer is still open
+        if not data:
+            writer = False  # EOF: no writer left, and buf holds everything it wrote
+            break
+        buf += data
+    if not writer:
+        handle()
+        say("exit 125")
+        return
+
+    try:
+        child = subprocess.Popen(cmd, close_fds=True, pass_fds=keep)
+    except OSError as e:
+        print("supervise: cannot run %r: %s" % (cmd[0], e), file=sys.stderr)
+        say("exit 127")
+        return
+    pidfd = os.pidfd_open(child.pid)  # child unreaped: this PID can only be the child
+
+    poll = select.poll()
+    poll.register(pidfd, select.POLLIN)
+    poll.register(ctl, select.POLLIN)
+    try:
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGHUP, stop)
+        say("started %d" % child.pid)
+        handle()  # requests read by the writer check
+        while True:
+            ready = dict(poll.poll())
+            if pidfd in ready:
+                break
+            if ctl not in ready:
+                continue
+            try:
+                data = os.read(ctl, 512)
+            except BlockingIOError:
+                continue
+            if not data:  # EOF: no writer left
+                poll.unregister(ctl)
+                send("KILL")
+                continue
+            buf += data
+            handle()
+    except Stop:
+        send("KILL")
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    _, status = os.waitpid(child.pid, 0)
+    child.returncode = rc = os.waitstatus_to_exitcode(status)
+    say("exit %d" % (128 - rc if rc < 0 else rc))
+
+
+if __name__ == "__main__":
+    main()
