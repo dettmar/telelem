@@ -59,6 +59,44 @@ defmodule Telelem.Ops.RouteRevisionIntegrationTest do
     assert %{"field" => "preferred", "reason" => "unknown_deployment"} = JSON.decode!(out)
   end
 
+  test "a tampered stored A1 revision is a store-integrity fault, not a preferred error", %{
+    ctx: ctx,
+    rev1: rev1
+  } do
+    {:ok, store} = MemoryStore.start_link()
+    # Changed control, stale digest: A1 reports :digest_mismatch.
+    :ok = MemoryStore.seed(store, "local", %{rev1 | deadline_ms: 1})
+    ctx = %{ctx | store: {MemoryStore, store}}
+    assert_integrity(ctx)
+
+    # Digest consistent but preferred outside deployments (A1:
+    # :preferred_not_in_deployments); the test, not ops, computes the digest.
+    {:ok, store} = MemoryStore.start_link()
+    bad = %{rev1 | preferred: "z"}
+    digest = :crypto.hash(:sha256, Revision.digest_input(bad)) |> Base.encode16(case: :lower)
+    :ok = MemoryStore.seed(store, "local", %{bad | digest: digest})
+    assert_integrity(%{ctx | store: {MemoryStore, store}})
+  end
+
+  defp assert_integrity(ctx) do
+    assert {:error, :store_integrity} = Route.read(@op, ctx, "chat")
+    assert {:error, :store_integrity} = Route.plan(@op, ctx, "chat", 1, "b")
+
+    for {verb, req} <- [
+          {"read", ~s({"route_id":"chat"})},
+          {"plan", ~s({"route_id":"chat","expected_rev":1,"preferred":"b"})}
+        ] do
+      assert {70, out} = CLI.run([verb, req], @op, ctx)
+
+      assert JSON.decode!(out) == %{
+               "ok" => false,
+               "op" => verb,
+               "error" => "internal",
+               "reason" => "store_integrity"
+             }
+    end
+  end
+
   test "same preferred advances rev via A1", %{ctx: ctx} do
     {:ok, %{plan_digest: d}} = Route.plan(@op, ctx, "chat", 1, "a")
 

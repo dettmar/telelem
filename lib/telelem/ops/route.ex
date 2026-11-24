@@ -23,11 +23,38 @@ defmodule Telelem.Ops.Route do
   the store for an atomic compare-and-write conditioned on the read `rev`
   **and** revision digest. A concurrent writer between the read and the write
   therefore produces `{:conflict, _}` and no write.
+
+  ## Store failures and integrity
+
+  Store calls that exit, raise or throw never escape these handlers, and their
+  reasons are never returned:
+
+    * a failed `fetch/3` gives `{:error, :store_unavailable}`. Nothing was
+      written by this call (apply fetches before it writes).
+    * a failed or malformed `compare_and_write/6` reply gives
+      `{:error, {:apply_outcome_unknown, %{cause: cause, expected_rev: e,
+      plan_digest: d}}}` with `cause` `:store_unavailable` (call exited,
+      raised or threw, e.g. a timeout) or `:store_integrity` (reply not
+      well formed, or inconsistent with the request). The write may or may
+      not have committed. Ops does not retry, and must not report this as a
+      failure: the caller reads back and compares `last_plan_digest` with `d`
+      (§4). A match confirms the plan is applied; a mismatch does not prove it
+      never landed, since a later write may have superseded it.
+    * a fetched record that is malformed (wrong shape or types, another
+      route's ID, bad `last_plan_digest`) or that the injected `Revisions`
+      module refuses as a base revision (for example a digest mismatch) gives
+      `{:error, :store_integrity}`. `read/3` probes the stored revision the
+      same way, so it never returns a revision that plan would refuse.
+
+  Only `{:error, :unknown_deployment}` from `Revisions.with_preferred/2` is
+  attributed to the caller's `preferred`; any other refusal concerns the
+  stored revision (the requested `preferred` is already a valid ID).
   """
 
   alias Telelem.Ops.{Context, PlanDigest}
 
   @fixed_fields [:route_id, :deployments, :fallback_on_refusal, :deadline_ms, :max_attempts]
+  @revision_fields [:rev, :preferred, :digest | @fixed_fields]
 
   @type principal :: %{
           required(:tenant_id) => String.t(),
@@ -40,7 +67,7 @@ defmodule Telelem.Ops.Route do
   @type denied :: {:denied, :unauthenticated | :mode_mismatch | :missing_permission}
   @type invalid ::
           {:invalid, :route_id | :expected_rev | :preferred | :plan_digest}
-          | {:invalid, {:revision, term()}}
+          | {:invalid, {:revision, :unknown_deployment}}
   @type conflict ::
           {:conflict,
            %{
@@ -49,7 +76,18 @@ defmodule Telelem.Ops.Route do
              current_rev: pos_integer() | nil,
              last_plan_digest: String.t() | nil
            }}
-  @type fault :: {:error, {:revision_invariant, atom()}}
+  @type fault ::
+          {:error, {:revision_invariant, atom()}}
+          | {:error, :store_unavailable}
+          | {:error, :store_integrity}
+  @type outcome_unknown ::
+          {:error,
+           {:apply_outcome_unknown,
+            %{
+              cause: :store_unavailable | :store_integrity,
+              expected_rev: pos_integer(),
+              plan_digest: String.t()
+            }}}
 
   @spec plan(principal(), Context.t(), String.t(), pos_integer(), String.t()) ::
           {:ok, %{expected_rev: pos_integer(), plan_digest: String.t(), proposed: map()}}
@@ -76,6 +114,7 @@ defmodule Telelem.Ops.Route do
           | conflict()
           | :not_found
           | fault()
+          | outcome_unknown()
   def apply(principal, %Context{} = ctx, route_id, expected_rev, preferred, plan_digest) do
     with {:ok, tenant} <- authorize(principal, ctx, :route_write),
          :ok <- validate_edit(route_id, expected_rev, preferred),
@@ -89,28 +128,59 @@ defmodule Telelem.Ops.Route do
       {mod, arg} = ctx.store
       expected = %{rev: record.revision.rev, digest: record.revision.digest}
 
-      case mod.compare_and_write(arg, tenant, route_id, expected, proposed, recomputed) do
-        {:ok, written} ->
-          {:ok, %{effective_revision: written.revision, plan_digest: written.last_plan_digest}}
-
-        {:conflict, :not_found} ->
-          conflict(:stale_revision, expected_rev, nil)
-
-        {:conflict, current} ->
-          conflict(:stale_revision, expected_rev, current)
-      end
+      store_call(fn ->
+        mod.compare_and_write(arg, tenant, route_id, expected, proposed, recomputed)
+      end)
+      |> written(route_id, expected, proposed, recomputed, expected_rev)
     end
   end
+
+  # Interpret a compare-and-write reply. Anything but a well-formed success
+  # for exactly this proposal, or a well-formed conflict, is outcome-unknown.
+  defp written({:returned, {:ok, record}}, route_id, _expected, proposed, digest, e) do
+    if record?(record, route_id) and same_revision?(record.revision, proposed) and
+         record.last_plan_digest == digest,
+       do: {:ok, %{effective_revision: record.revision, plan_digest: record.last_plan_digest}},
+       else: outcome_unknown(:store_integrity, e, digest)
+  end
+
+  defp written({:returned, {:conflict, :not_found}}, _route_id, _expected, _proposed, _d, e),
+    do: conflict(:stale_revision, e, nil)
+
+  defp written({:returned, {:conflict, record}}, route_id, expected, _proposed, digest, e) do
+    if record?(record, route_id) and
+         not (record.revision.rev == expected.rev and record.revision.digest == expected.digest),
+       do: conflict(:stale_revision, e, record),
+       else: outcome_unknown(:store_integrity, e, digest)
+  end
+
+  defp written({:returned, _malformed}, _route_id, _expected, _proposed, digest, e),
+    do: outcome_unknown(:store_integrity, e, digest)
+
+  defp written(:failed, _route_id, _expected, _proposed, digest, e),
+    do: outcome_unknown(:store_unavailable, e, digest)
+
+  # Field-wise, so a store may return an equal plain map instead of a struct.
+  defp same_revision?(written, proposed),
+    do: Enum.all?(@revision_fields, &(Map.get(written, &1) == Map.get(proposed, &1)))
+
+  defp outcome_unknown(cause, expected_rev, plan_digest),
+    do:
+      {:error,
+       {:apply_outcome_unknown,
+        %{cause: cause, expected_rev: expected_rev, plan_digest: plan_digest}}}
 
   @spec read(principal(), Context.t(), String.t()) ::
           {:ok, %{effective_revision: map(), last_plan_digest: String.t() | nil}}
           | denied()
           | invalid()
           | :not_found
+          | fault()
   def read(principal, %Context{} = ctx, route_id) do
     with {:ok, tenant} <- authorize(principal, ctx, :route_read),
          :ok <- validate_id(route_id, :route_id),
-         {:ok, record} <- fetch(ctx, tenant, route_id) do
+         {:ok, record} <- fetch(ctx, tenant, route_id),
+         :ok <- probe(ctx, record.revision) do
       {:ok, %{effective_revision: record.revision, last_plan_digest: record.last_plan_digest}}
     end
   end
@@ -184,9 +254,69 @@ defmodule Telelem.Ops.Route do
   ## Store and revision boundary
 
   defp fetch(%Context{store: {mod, arg}}, tenant, route_id) do
-    case mod.fetch(arg, tenant, route_id) do
-      {:ok, %{revision: %{rev: _, digest: _}} = record} -> {:ok, record}
-      :not_found -> :not_found
+    case store_call(fn -> mod.fetch(arg, tenant, route_id) end) do
+      {:returned, :not_found} ->
+        :not_found
+
+      {:returned, {:ok, record}} ->
+        if record?(record, route_id), do: {:ok, record}, else: integrity()
+
+      {:returned, _malformed} ->
+        integrity()
+
+      :failed ->
+        {:error, :store_unavailable}
+    end
+  end
+
+  # Store adapters may exit (GenServer timeout, noproc), raise (driver errors)
+  # or throw. None of that, nor its reason, crosses the handler boundary.
+  defp store_call(fun) do
+    {:returned, fun.()}
+  catch
+    _kind, _reason -> :failed
+  end
+
+  defp integrity, do: {:error, :store_integrity}
+
+  # Structural check of a store record. Semantic (§1) validity, including the
+  # revision digest, is left to the injected `Revisions` module.
+  defp record?(%{revision: revision, last_plan_digest: last}, route_id),
+    do: revision?(revision, route_id) and (is_nil(last) or hex_digest?(last))
+
+  defp record?(_, _), do: false
+
+  defp revision?(
+         %{
+           route_id: route_id,
+           rev: rev,
+           deployments: deployments,
+           preferred: preferred,
+           fallback_on_refusal: fallback,
+           deadline_ms: deadline_ms,
+           max_attempts: max_attempts,
+           digest: digest
+         },
+         route_id
+       ) do
+    pos_int?(rev) and deployments != [] and ids?(deployments) and id?(preferred) and
+      is_boolean(fallback) and pos_int?(deadline_ms) and max_attempts in [1, 2] and
+      hex_digest?(digest)
+  end
+
+  defp revision?(_, _), do: false
+
+  defp pos_int?(n), do: is_integer(n) and n > 0
+
+  defp ids?([]), do: true
+  defp ids?([id | rest]), do: id?(id) and ids?(rest)
+  defp ids?(_), do: false
+
+  # Ask the revision module whether it accepts the stored revision as a base.
+  defp probe(%Context{revisions: revisions}, current) do
+    case revisions.with_preferred(current, current.preferred) do
+      {:ok, _} -> :ok
+      _ -> integrity()
     end
   end
 
@@ -204,7 +334,8 @@ defmodule Telelem.Ops.Route do
     # (orchestrator decision, day zero).
     case revisions.with_preferred(current, preferred) do
       {:ok, proposed} -> check_invariants(current, proposed, preferred)
-      {:error, reason} -> {:invalid, {:revision, reason}}
+      {:error, :unknown_deployment} -> {:invalid, {:revision, :unknown_deployment}}
+      _refused_base -> integrity()
     end
   end
 

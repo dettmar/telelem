@@ -7,9 +7,11 @@ defmodule Telelem.Ops.MemoryStore do
   tenant's route. State is in memory only; durability ("`up` twice preserves
   state") is not provided here.
 
-  A caller that exits on a `GenServer.call/3` timeout cannot tell whether its
-  write landed. It must `fetch/3` and compare `last_plan_digest` with its own
-  plan digest rather than retry blindly; a retry of a landed plan conflicts.
+  Calls use the default `GenServer.call/3` timeout (5 s). A caller whose
+  compare-and-write times out cannot tell whether its write landed;
+  `Telelem.Ops.Route.apply/6` reports that as `:apply_outcome_unknown`. The
+  caller must `fetch/3` and compare `last_plan_digest` with its own plan
+  digest rather than retry blindly; a retry of a landed plan conflicts.
   """
 
   use GenServer

@@ -24,9 +24,19 @@ defmodule Telelem.OpsTest.FakeRevisions do
 
   @impl true
   def with_preferred(current, preferred) do
-    if preferred in current.deployments,
-      do: {:ok, rehash(%{current | preferred: preferred, rev: current.rev + 1})},
-      else: {:error, :unknown_deployment}
+    cond do
+      rehash(current).digest != current.digest ->
+        {:error, :digest_mismatch}
+
+      current.preferred not in current.deployments ->
+        {:error, :preferred_not_in_deployments}
+
+      preferred in current.deployments ->
+        {:ok, rehash(%{current | preferred: preferred, rev: current.rev + 1})}
+
+      true ->
+        {:error, :unknown_deployment}
+    end
   end
 
   def rehash(rev) do
@@ -71,6 +81,28 @@ defmodule Telelem.OpsTest.GatedStore do
   @impl true
   def compare_and_write({server, _test_pid, _ref}, tenant, route, expected, new, digest) do
     Telelem.Ops.MemoryStore.compare_and_write(server, tenant, route, expected, new, digest)
+  end
+end
+
+defmodule Telelem.OpsTest.ScriptedStore do
+  @moduledoc """
+  Wraps `Telelem.Ops.MemoryStore`. The arg is `%{server: pid}` plus optional
+  `:fetch` / `:cas` functions that receive a thunk for the real call and
+  decide what the caller sees (call it and lose the reply, skip it and exit,
+  return garbage, ...). Deterministic: no timers.
+  """
+  @behaviour Telelem.Ops.RevisionStore
+  alias Telelem.Ops.MemoryStore
+
+  @impl true
+  def fetch(%{server: s} = a, tenant, route),
+    do: Map.get(a, :fetch, & &1.()).(fn -> MemoryStore.fetch(s, tenant, route) end)
+
+  @impl true
+  def compare_and_write(%{server: s} = a, tenant, route, expected, new, digest) do
+    Map.get(a, :cas, & &1.()).(fn ->
+      MemoryStore.compare_and_write(s, tenant, route, expected, new, digest)
+    end)
   end
 end
 
@@ -598,4 +630,252 @@ defmodule Telelem.Ops.CLITest do
   end
 
   defp decode({status, out}), do: {status, JSON.decode!(out)}
+end
+
+defmodule Telelem.Ops.StoreFaultTest do
+  @moduledoc """
+  Store call failures and store-integrity faults. Lost replies and broken
+  stores are simulated with `ScriptedStore`; nothing sleeps.
+  """
+  use ExUnit.Case, async: true
+
+  alias Telelem.Ops.{CLI, Context, MemoryStore, Route}
+  alias Telelem.OpsTest.{FakeRevisions, ScriptedStore}
+  import Telelem.OpsTest.Fixtures
+
+  @secret "s3cr3t-reason-do-not-echo"
+  @lost_reply {:timeout, {GenServer, :call, [:store, @secret, 5000]}}
+
+  setup do
+    store = seeded_store()
+    %{store: store, ctx: ctx(store)}
+  end
+
+  defp scripted(store, script),
+    do: %Context{
+      mode: :sandbox,
+      store: {ScriptedStore, Map.put(script, :server, store)},
+      revisions: FakeRevisions
+    }
+
+  defp cli(verb, req, ctx) do
+    {status, out} = CLI.run([verb, JSON.encode!(req)], operator(), ctx)
+    refute out =~ @secret
+    refute out =~ "timeout"
+    {status, JSON.decode!(out)}
+  end
+
+  defp apply_req(d), do: %{route_id: "chat", expected_rev: 1, preferred: "b", plan_digest: d}
+
+  defp corrupt!(store, fun) do
+    # Overwrite the stored record behind the store's API (test-only).
+    :sys.replace_state(store, fn state -> Map.update!(state, {"local", "chat"}, fun) end)
+  end
+
+  describe "compare-and-write with no reply" do
+    test "committed write, lost reply: outcome unknown, read-back confirms, re-apply conflicts",
+         c do
+      {:ok, %{plan_digest: d}} = Route.plan(operator(), c.ctx, "chat", 1, "b")
+      lossy = scripted(c.store, %{cas: fn real -> real.() && exit(@lost_reply) end})
+
+      assert {:error,
+              {:apply_outcome_unknown,
+               %{cause: :store_unavailable, expected_rev: 1, plan_digest: ^d}}} =
+               Route.apply(operator(), lossy, "chat", 1, "b", d)
+
+      # Read back (§4): last_plan_digest matches, so the plan is applied.
+      assert {:ok, %{effective_revision: %{rev: 2, preferred: "b"}, last_plan_digest: ^d}} =
+               Route.read(operator(), c.ctx, "chat")
+
+      # A blind reissue cannot double-apply; it conflicts against its own write.
+      assert {:conflict, %{reason: :stale_revision, current_rev: 2, last_plan_digest: ^d}} =
+               Route.apply(operator(), c.ctx, "chat", 1, "b", d)
+    end
+
+    test "same over the CLI: exit 5, bounded body, then read-back", c do
+      {0, %{"plan_digest" => d}} =
+        cli("plan", %{route_id: "chat", expected_rev: 1, preferred: "b"}, c.ctx)
+
+      lossy = scripted(c.store, %{cas: fn real -> real.() && exit(@lost_reply) end})
+
+      assert {5, body} = cli("apply", apply_req(d), lossy)
+
+      assert body == %{
+               "ok" => false,
+               "op" => "apply",
+               "error" => "apply_outcome_unknown",
+               "cause" => "store_unavailable",
+               "expected_rev" => 1,
+               "plan_digest" => d,
+               "resolve" => "read_and_compare_last_plan_digest"
+             }
+
+      assert {0, %{"last_plan_digest" => ^d, "effective_revision" => %{"rev" => 2}}} =
+               cli("read", %{route_id: "chat"}, c.ctx)
+    end
+
+    test "exit, raise or throw before the write commits: still unknown, never failed", c do
+      {:ok, %{plan_digest: d}} = Route.plan(operator(), c.ctx, "chat", 1, "b")
+
+      for cas <- [
+            fn _ -> exit({:noproc, @secret}) end,
+            fn _ -> raise RuntimeError, @secret end,
+            fn _ -> throw(@secret) end
+          ] do
+        assert {:error, {:apply_outcome_unknown, %{cause: :store_unavailable, plan_digest: ^d}}} =
+                 Route.apply(operator(), scripted(c.store, %{cas: cas}), "chat", 1, "b", d)
+      end
+
+      # Here it did not land; read-back shows a mismatch and rev 1.
+      assert {:ok, %{effective_revision: %{rev: 1}, last_plan_digest: nil}} =
+               Route.read(operator(), c.ctx, "chat")
+
+      # A fresh, explicit apply from the operator then succeeds.
+      assert {:ok, %{effective_revision: %{rev: 2}}} =
+               Route.apply(operator(), c.ctx, "chat", 1, "b", d)
+    end
+
+    test "a real GenServer exit (store gone) during compare-and-write is unknown", c do
+      {:ok, %{plan_digest: d}} = Route.plan(operator(), c.ctx, "chat", 1, "b")
+      stop = scripted(c.store, %{cas: fn real -> GenServer.stop(c.store) && real.() end})
+
+      assert {5, %{"error" => "apply_outcome_unknown", "cause" => "store_unavailable"}} =
+               cli("apply", apply_req(d), stop)
+    end
+
+    test "malformed or inconsistent replies are unknown with cause store_integrity", c do
+      {:ok, %{plan_digest: d}} = Route.plan(operator(), c.ctx, "chat", 1, "b")
+      {:ok, %{revision: rev1} = rec1} = MemoryStore.fetch(c.store, "local", "chat")
+
+      replies = [
+        :ok,
+        {:ok, @secret},
+        {:ok, %{revision: %{rev: 2}, last_plan_digest: d}},
+        # Committed something other than this proposal.
+        {:ok, %{rec1 | last_plan_digest: d}},
+        {:conflict, @secret},
+        # A "conflict" that reports exactly the expected revision.
+        {:conflict, rec1},
+        {:conflict, %{rec1 | revision: %{rev1 | route_id: "other"}}}
+      ]
+
+      for reply <- replies do
+        ctx = scripted(c.store, %{cas: fn _ -> reply end})
+
+        assert {:error,
+                {:apply_outcome_unknown,
+                 %{cause: :store_integrity, expected_rev: 1, plan_digest: ^d}}} =
+                 Route.apply(operator(), ctx, "chat", 1, "b", d),
+               inspect(reply)
+
+        assert {5, %{"cause" => "store_integrity"}} = cli("apply", apply_req(d), ctx)
+      end
+    end
+  end
+
+  describe "fetch failures" do
+    test "exit, raise or throw while fetching is a bounded store_unavailable", c do
+      for fetch <- [
+            fn _ -> exit(@lost_reply) end,
+            fn _ -> raise ArgumentError, @secret end,
+            fn _ -> throw(@secret) end
+          ] do
+        ctx = scripted(c.store, %{fetch: fetch, cas: fn _ -> flunk("must not write") end})
+        assert {:error, :store_unavailable} = Route.read(operator(), ctx, "chat")
+        assert {:error, :store_unavailable} = Route.plan(operator(), ctx, "chat", 1, "b")
+
+        assert {:error, :store_unavailable} =
+                 Route.apply(operator(), ctx, "chat", 1, "b", String.duplicate("0", 64))
+
+        for {verb, req} <- [
+              {"read", %{route_id: "chat"}},
+              {"plan", %{route_id: "chat", expected_rev: 1, preferred: "b"}},
+              {"apply", apply_req(String.duplicate("0", 64))}
+            ] do
+          assert {69, body} = cli(verb, req, ctx)
+
+          assert body == %{
+                   "ok" => false,
+                   "op" => verb,
+                   "error" => "unavailable",
+                   "reason" => "store_unavailable"
+                 }
+        end
+      end
+    end
+
+    test "a stopped MemoryStore (real noproc exit) is store_unavailable", c do
+      :ok = GenServer.stop(c.store)
+      assert {:error, :store_unavailable} = Route.read(operator(), c.ctx, "chat")
+      assert {69, _} = cli("plan", %{route_id: "chat", expected_rev: 1, preferred: "b"}, c.ctx)
+    end
+  end
+
+  describe "store integrity" do
+    defp assert_integrity(ctx) do
+      assert {:error, :store_integrity} = Route.read(operator(), ctx, "chat")
+      assert {:error, :store_integrity} = Route.plan(operator(), ctx, "chat", 1, "b")
+
+      assert {:error, :store_integrity} =
+               Route.apply(operator(), ctx, "chat", 1, "b", String.duplicate("0", 64))
+
+      for {verb, req} <- [
+            {"read", %{route_id: "chat"}},
+            {"plan", %{route_id: "chat", expected_rev: 1, preferred: "b"}},
+            {"apply", apply_req(String.duplicate("0", 64))}
+          ] do
+        {status, out} = CLI.run([verb, JSON.encode!(req)], operator(), ctx)
+        assert status == 70
+        refute out =~ @secret
+
+        assert JSON.decode!(out) == %{
+                 "ok" => false,
+                 "op" => verb,
+                 "error" => "internal",
+                 "reason" => "store_integrity"
+               }
+      end
+    end
+
+    test "a stored revision whose digest no longer matches (tampered field)", c do
+      corrupt!(c.store, fn r -> put_in(r.revision.deadline_ms, 1) end)
+      assert_integrity(c.ctx)
+      assert_integrity(c.ctx)
+    end
+
+    test "stored preferred outside deployments is not a caller preferred error", c do
+      corrupt!(c.store, fn r ->
+        %{r | revision: FakeRevisions.rehash(%{r.revision | preferred: "z"})}
+      end)
+
+      assert_integrity(c.ctx)
+    end
+
+    test "malformed stored records or fetch results", c do
+      {:ok, good} = MemoryStore.fetch(c.store, "local", "chat")
+      rev = good.revision
+
+      results = [
+        :error,
+        {:ok, @secret},
+        {:ok, %{revision: rev}},
+        {:ok, %{good | last_plan_digest: @secret}},
+        {:ok, %{good | revision: %{rev | rev: "1"}}},
+        {:ok, %{good | revision: %{rev | route_id: "other"}}},
+        {:ok, %{good | revision: %{rev | deployments: ["a" | "b"]}}},
+        {:ok, %{good | revision: %{rev | preferred: @secret <> " "}}},
+        {:ok, %{good | revision: %{rev | max_attempts: 3}}},
+        {:ok, %{good | revision: %{rev | digest: String.upcase(rev.digest)}}},
+        {:ok, %{good | revision: Map.delete(rev, :fallback_on_refusal)}}
+      ]
+
+      for result <- results do
+        ctx = scripted(c.store, %{fetch: fn _ -> result end, cas: fn _ -> flunk("no write") end})
+        assert_integrity(ctx)
+      end
+
+      # The real store was never touched.
+      assert {:ok, ^good} = MemoryStore.fetch(c.store, "local", "chat")
+    end
+  end
 end

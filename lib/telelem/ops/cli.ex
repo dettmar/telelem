@@ -7,12 +7,26 @@ defmodule Telelem.Ops.CLI do
       run(["apply", ~s({"route_id":"chat","expected_rev":1,"preferred":"b","plan_digest":"…"})], principal, ctx)
       run(["read",  ~s({"route_id":"chat"})], principal, ctx)
 
-  Returns `{exit_status, json}`. The principal is supplied by the caller's
+  Returns `{exit_status, json}`: `json` is always exactly one compact JSON
+  object (the would-be stdout), with `"ok"` true or false and, when false, a
+  fixed `"error"` string. The principal is supplied by the caller's
   authenticated context; request JSON carrying any field other than the ones
   listed per verb (for example `tenant_id`) is rejected as invalid.
 
-  Exit status: 0 ok, 1 conflict, 2 invalid request or usage, 3 denied,
-  4 not found, 70 internal fault.
+  | Exit | `error` | Meaning |
+  | --- | --- | --- |
+  | 0 | — | ok |
+  | 1 | `conflict` | stale revision or plan digest mismatch; nothing written |
+  | 2 | `invalid` / `usage` | bad request; `field` names the request field |
+  | 3 | `denied` | principal lacks authority |
+  | 4 | `not_found` | no such route for this tenant |
+  | 5 | `apply_outcome_unknown` | apply only: the compare-and-write was sent but no well-formed reply came back (`cause`: `store_unavailable` or `store_integrity`). The write **may have committed**. Do not reissue blindly: `read` and compare `last_plan_digest` with the returned `plan_digest` (§4). |
+  | 69 | `unavailable` | `reason: store_unavailable`; the store could not be read, nothing written by this call; safe to retry |
+  | 70 | `internal` | `reason: store_integrity` (stored record or store reply malformed or corrupt) or `revision_invariant`; nothing written by this call |
+
+  Failure bodies carry only fixed tokens, the caller's own request values and,
+  for conflicts, the current `rev` and `last_plan_digest`. They never carry
+  store error reasons or stored data from a record that failed checks.
 
   Not wired into a main CLI, escript or Mix task in this slice.
   """
@@ -93,17 +107,30 @@ defmodule Telelem.Ops.CLI do
 
   defp render(:not_found, op), do: emit(4, %{ok: false, op: op, error: "not_found"})
 
+  defp render({:error, {:apply_outcome_unknown, %{cause: cause} = u}}, "apply"),
+    do:
+      emit(5, %{
+        ok: false,
+        op: "apply",
+        error: "apply_outcome_unknown",
+        cause: cause,
+        expected_rev: u.expected_rev,
+        plan_digest: u.plan_digest,
+        resolve: "read_and_compare_last_plan_digest"
+      })
+
+  defp render({:error, :store_unavailable}, op),
+    do: emit(69, %{ok: false, op: op, error: "unavailable", reason: "store_unavailable"})
+
+  defp render({:error, :store_integrity}, op),
+    do: emit(70, %{ok: false, op: op, error: "internal", reason: "store_integrity"})
+
   defp render({:error, {:revision_invariant, field}}, op),
     do:
       emit(70, %{ok: false, op: op, error: "internal", reason: "revision_invariant", field: field})
 
-  defp invalid({:revision, reason}) when is_atom(reason),
-    do: %{field: "preferred", reason: reason}
-
-  defp invalid({:revision, {:invalid, f}}) when is_atom(f),
-    do: %{field: "preferred", reason: "invalid_#{f}"}
-
-  defp invalid({:revision, _}), do: %{field: "preferred", reason: "rejected"}
+  defp invalid({:revision, :unknown_deployment}),
+    do: %{field: "preferred", reason: "unknown_deployment"}
 
   defp invalid({kind, field}) when kind in [:unknown_field, :missing_field],
     do: %{field: field, reason: kind}
