@@ -52,7 +52,11 @@ apply_route(principal, route_id, expected_rev, preferred: Id, plan_digest)
 read_route(principal, route_id) -> {effective_revision, last_plan_digest}
 ```
 
-Example: prefer `b` against revision `1`; plan the proposal, apply with the same inputs and digest, read back revision `2`. An old revision conflicts. All entry points call the same handlers. Compute the plan digest over a version-prefixed ordered compact JSON array containing tenant, route, expected revision, new preferred ID and proposed revision digest; recompute it at apply and make the compare-and-write atomic. The one editable field is `preferred`; other controls remain fixed in this slice. CLI/JSON first. MCP and the single-field UI wait for day two and may not be dropped to hit the timebox.
+Example: prefer `b` against revision `1`; plan the proposal, apply with the same inputs and digest, read back revision `2`. An old revision conflicts. All entry points call the same handlers. Authenticate the principal outside the handler; require `route_read` to read, and `route_write` to plan or apply. Never accept tenant or permissions from the operation body.
+
+Hash the compact UTF-8 JSON array `["telelem.ops.route_plan/1",tenant_id,route_id,expected_rev,preferred,proposed_revision_digest]` using SHA-256, rendered in lowercase hex. Recompute it on apply and compare-and-write atomically against both the observed revision number and its digest. Apply is not an idempotency API: after a lost reply, read back and compare `last_plan_digest`. A match confirms the current applied plan; a mismatch cannot establish that the write never landed because a later write may have superseded it.
+
+The one editable field is `preferred`; other controls remain fixed in this slice. CLI/JSON first. MCP and the single-field UI wait for day two and may not be dropped to hit the timebox.
 
 ## First assignments and ownership
 
