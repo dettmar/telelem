@@ -4,18 +4,29 @@
 # real lock wrapper inside the runner container, the real Telelem.Ops.FileStore, on
 # disposable host directories.
 #
-#   integration/m2a/route-store/run        # exit 0 PASS · 1 FAIL · 2 prerequisite missing
+#   integration/m2a/route-store/run                     # exit 0 PASS · 1 FAIL · 2 prerequisite missing
+#   integration/m2a/route-store/run --cleanup-selftest  # only case 0 (stubbed docker; no daemon needed)
 #
 # Every store is a fresh `mktemp -d` directory (mode 700) that is removed on exit.
 # Readiness and acknowledgements are JSON lines read from the writer's stdout through
 # FIFOs; every wait is a bounded `read -t` and a timeout counts as FAIL. Process exit
 # is observed by a bounded poll of /proc (0.2 s slices, same bound); no step relies on
-# a sleep for ordering. Host signals go only to processes this run started (PID + kernel
-# start time: the docker clients and the case-3 holder), never to a BEAM. A BEAM is
-# stopped or killed only through docker, addressed by the full container ID of this
-# run's container after verify_writer tied it to this run, role, BEAM PID and store
-# lock; a failed check aborts the run before the action. Cleanup removes only
-# containers this run named (exact name, suite nonce, label), by full ID.
+# a sleep for ordering.
+#
+# Host signals go only to processes this run started (the docker clients and the case-3
+# holder), each through sig_ours: a pidfd opened on the PID, then the kernel start time
+# recorded at spawn is rechecked, then the signal goes to the pidfd. No signal is ever
+# sent by host PID to a BEAM. A BEAM is stopped or killed only through docker, by the
+# full container ID, after verify_writer tied that ID to this run, role, store, BEAM PID
+# and store lock; a failed check aborts the run before the action.
+#
+# Cleanup removes a container only by full ID and only after owned_cid accepted it: a
+# name this run registered, exactly one container with it, the inspected Id and Name,
+# the registered role label and exactly one bind mount at /sbx/store whose source is
+# the store this run registered for that name (inside this run's mktemp dir). Once an
+# ID is accepted for a name it is pinned: later lookups of that name (including cleanup)
+# must give the same ID. Anything else is left alone, reported, and fails the run.
+# Case 0 tests those rejections against a stubbed docker that only records rm calls.
 # Nothing here uses a network (all containers run --network none), touches host
 # settings or writes outside the temp directory.
 set -uo pipefail
@@ -27,14 +38,24 @@ WRAP="$ROOT/scripts/with-route-store-lock"
 IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
 T=60 # bound (s) for one readiness/ack/exit wait; generous for a cold container boot
 
+SELFTEST_ONLY=0
+case ${1-} in
+  '') ;;
+  --cleanup-selftest) SELFTEST_ONLY=1 ;;
+  *) echo "usage: $0 [--cleanup-selftest]" >&2; exit 2 ;;
+esac
 prereq() { echo "prerequisite missing: $*" >&2; exit 2; }
 [[ $(uname -s) == Linux ]] || prereq "Linux"
-for x in "$RS/provision" "$RS/start" "$RS/launch" "$WRAP"; do [[ -x $x ]] || prereq "executable $x"; done
-command -v docker >/dev/null 2>&1 || prereq "docker CLI"
-docker info >/dev/null 2>&1 || prereq "a reachable docker daemon for the invoking user"
-docker image inspect "$IMAGE" >/dev/null 2>&1 || prereq "runner image $IMAGE (scripts/setup)"
-command -v python3 >/dev/null 2>&1 || prereq "python3 (JSON parsing of writer events)"
 [[ -r /proc/self/fdinfo/0 ]] || prereq "/proc"
+command -v python3 >/dev/null 2>&1 || prereq "python3 (JSON parsing, pidfd signals)"
+python3 -I -c 'import os, signal; os.pidfd_open; signal.pidfd_send_signal' 2>/dev/null ||
+  prereq "python3 >= 3.9 with os.pidfd_open (kernel >= 5.3)"
+if ((!SELFTEST_ONLY)); then
+  for x in "$RS/provision" "$RS/start" "$RS/launch" "$WRAP"; do [[ -x $x ]] || prereq "executable $x"; done
+  command -v docker >/dev/null 2>&1 || prereq "docker CLI"
+  docker info >/dev/null 2>&1 || prereq "a reachable docker daemon for the invoking user"
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || prereq "runner image $IMAGE (scripts/setup)"
+fi
 
 BASE=$(mktemp -d "${TMPDIR:-/tmp}/telelem-route-store.XXXXXX") || exit 2
 BASE=$(realpath -e "$BASE")
@@ -46,9 +67,8 @@ esac
 NONCE=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 PREFIX="telelem-rs-test-$NONCE"
 
-# --- ownership and cleanup ---------------------------------------------------------------
+# --- process identity and signals ---------------------------------------------------------
 declare -A OWNED=() # pid -> kernel start time when registered
-NAMES=()            # container names this run passed to the launcher
 proc_start() {
   local st f
   { st=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
@@ -65,42 +85,120 @@ proc_state() { # pid -> one-letter state (R, S, Z, ...), or nothing if gone
 track() { local t; t=$(proc_start "$1") && OWNED[$1]=$t; }
 untrack() { unset 'OWNED[$1]'; }
 ours_alive() { local t; t=$(proc_start "$1") && [[ $t == "${OWNED[$1]-x}" ]]; }
+# sig_ours SIG PID (SIG: KILL, TERM or 0): signal PID only if it is still the process
+# this run registered. pidfd_open pins whatever process has PID now; if /proc/PID then
+# still shows the recorded start time, that pinned process is ours (one that held PID
+# before and after the open), and the signal goes to the pidfd, never to a PID that was
+# recycled in between. Returns 1, sending nothing, if PID is unregistered, gone or
+# not ours.
+SIG_PY='import os, signal, sys
+name, pid, want = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+sig = 0 if name == "0" else int(getattr(signal, "SIG" + name))
+try:
+    fd = os.pidfd_open(pid)
+except OSError:
+    sys.exit(1)
+try:
+    with open("/proc/%d/stat" % pid) as f:
+        st = f.read()
+    if st[st.rindex(")") + 2:].split()[19] != want:
+        sys.exit(1)
+    signal.pidfd_send_signal(fd, sig)
+except (OSError, ValueError, IndexError):
+    sys.exit(1)'
+sig_ours() {
+  [[ $1 == KILL || $1 == TERM || $1 == 0 ]] || return 1
+  [[ -n ${OWNED[$2]-} ]] || return 1
+  python3 -I -c "$SIG_PY" "$1" "$2" "${OWNED[$2]}" 2>/dev/null
+}
+
+# --- container ownership and cleanup -------------------------------------------------------
+NAMES=()             # container names this run passed to the launcher (or to docker run)
+declare -A ROLE=()   # name -> telelem.route-store label value it was created with
+declare -A MOUNT=()  # name -> host store this run bind-mounted at /sbx/store for it
+declare -A CIDOF=()  # name -> full ID pinned at the first accepted check
+REJECTED=0           # containers cleanup refused to remove
 HEX64='^[0-9a-f]{64}$'
-# owned_cid NAME [ROLE] -> CID: the full (64-hex, immutable) ID of the single container
-# that has a name this run registered, exactly that name, and the launcher's label
-# (value ROLE if given). Sets WHY and returns 1 otherwise. Docker addresses a full ID
-# to exactly one container, never to a later one, so the actions below use only CID.
+OWNER_PY='import json, sys
+cid, name, role, store = sys.argv[1:5]
+def no(why):
+    print(why)
+    sys.exit(1)
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    no("inspect output is not JSON")
+if not (isinstance(d, list) and len(d) == 1 and isinstance(d[0], dict)):
+    no("inspect did not return exactly one container")
+c = d[0]
+if c.get("Id") != cid:
+    no("inspect Id is %r" % c.get("Id"))
+if c.get("Name") != "/" + name:
+    no("inspect Name is %r, not %r" % (c.get("Name"), "/" + name))
+labels = (c.get("Config") or {}).get("Labels") or {}
+if labels.get("telelem.route-store") != role:
+    no("label telelem.route-store is %r, not %r" % (labels.get("telelem.route-store"), role))
+ms = [m for m in (c.get("Mounts") or []) if isinstance(m, dict) and m.get("Destination") == "/sbx/store"]
+if len(ms) != 1:
+    no("%d mounts at /sbx/store, want exactly 1" % len(ms))
+if ms[0].get("Type") != "bind" or ms[0].get("Source") != store:
+    no("/sbx/store is %s %r, not a bind of %r" % (ms[0].get("Type"), ms[0].get("Source"), store))'
+# owned_cid NAME -> CID: the full (64-hex, immutable) ID of this run's container NAME.
+# Accepted only if NAME was registered with a role and a store inside this run's mktemp
+# dir, exactly one container has that exact name, its ID equals the one pinned for NAME
+# (if any), and `docker inspect ID` shows that Id and Name, the registered role label and
+# exactly one bind mount at /sbx/store from the registered store. The first accepted ID
+# is pinned in CIDOF. Otherwise sets WHY (GONE=1 if no container has the name) and
+# returns 1. Docker addresses a full ID to exactly one container, never to a later one,
+# so every action below uses only CID. Never call it in $(...): CIDOF must persist.
 owned_cid() {
-  local ids nm
-  CID= WHY=
-  [[ " ${NAMES[*]} " == *" $1 "* ]] || { WHY="name '$1' was not registered by this run"; return 1; }
-  ids=$(docker ps -a --no-trunc --filter "name=^${1}\$" --filter "label=telelem.route-store${2:+=$2}" \
-    --format '{{.ID}}' 2>/dev/null) || { WHY="docker ps failed for '$1'"; return 1; }
-  [[ $ids =~ $HEX64 ]] || { WHY="want one full container ID for '$1', got '${ids//$'\n'/,}'"; return 1; }
-  nm=$(docker inspect -f '{{.Name}}' "$ids" 2>/dev/null)
-  [[ $nm == "/$1" ]] || { WHY="container $ids is named '$nm', not '/$1'"; return 1; }
+  local name=$1 ids js why
+  CID= WHY= GONE=0
+  [[ -n ${ROLE[$name]-} ]] || { WHY="name '$name' was not registered by this run"; return 1; }
+  [[ ${MOUNT[$name]-} == "$BASE"/?* ]] || { WHY="'$name' store '${MOUNT[$name]-}' is not inside $BASE"; return 1; }
+  ids=$(docker ps -a --no-trunc --filter "name=^${name}\$" --format '{{.ID}}' 2>/dev/null) ||
+    { WHY="docker ps failed for '$name'"; return 1; }
+  [[ -n $ids ]] || { GONE=1; WHY="no container named '$name'"; return 1; }
+  [[ $ids =~ $HEX64 ]] || { WHY="want one full container ID for '$name', got '${ids//$'\n'/,}'"; return 1; }
+  [[ -z ${CIDOF[$name]-} || ${CIDOF[$name]} == "$ids" ]] ||
+    { WHY="'$name' now resolves to $ids, not the pinned ${CIDOF[$name]}"; return 1; }
+  if ! js=$(docker inspect --type container "$ids" 2>/dev/null); then
+    # Removed (--rm) between ps and inspect: gone, not a rejection.
+    [[ -z $(docker ps -a --no-trunc --filter "id=$ids" --format '{{.ID}}' 2>/dev/null) ]] && GONE=1
+    WHY="docker inspect $ids failed"
+    return 1
+  fi
+  why=$(python3 -I -c "$OWNER_PY" "$ids" "$name" "${ROLE[$name]}" "${MOUNT[$name]}" <<<"$js") ||
+    { WHY="$ids: ${why:-ownership check failed}"; return 1; }
   CID=$ids
+  CIDOF[$name]=$ids
 }
-rm_owned() { # NAME: force-remove this run's container by its full ID; quiet if none
-  owned_cid "$1" && docker rm -f "$CID" >/dev/null 2>&1
+rm_owned() { # NAME: force-remove this run's container by full ID; else leave it alone
+  if owned_cid "$1"; then
+    docker rm -f "$CID" >/dev/null 2>&1 || true
+  elif ((!GONE)); then
+    echo "cleanup: left '$1' alone: $WHY" >&2
+    REJECTED=$((REJECTED + 1))
+  fi
 }
-rm_named() { # remove this run's containers: exact name, launcher's label, full ID only
-  local n
+reap_containers() { # every registered name, twice: a create already in flight at the
+  local n          # daemon can land after the first pass. Narrowed, not closed (README).
+  for n in "${NAMES[@]}"; do rm_owned "$n"; done
   for n in "${NAMES[@]}"; do rm_owned "$n"; done
 }
 cleanup() {
-  local p killed=()
+  local rc=$? p killed=()
   trap - EXIT INT TERM HUP
-  # Clients first, so none of them goes on to create or start a container; then the
-  # named containers (twice: a create already in flight at the daemon can land after
-  # the first pass). Narrowed, not closed: see README.
-  for p in "${!OWNED[@]}"; do
-    ours_alive "$p" && kill -KILL "$p" 2>/dev/null && killed+=("$p")
-  done
+  # Clients first, so none of them goes on to create or start a container.
+  for p in "${!OWNED[@]}"; do sig_ours KILL "$p" && killed+=("$p"); done
   for p in "${killed[@]}"; do { wait "$p"; } 2>/dev/null; done
-  rm_named
-  rm_named
+  reap_containers
   rm -rf -- "$BASE"
+  if ((REJECTED)); then
+    echo "cleanup left $REJECTED container lookup(s) alone that failed the ownership check" >&2
+    ((rc)) || rc=1
+  fi
+  exit "$rc"
 }
 trap cleanup EXIT
 # Signal traps only record the signal. The run exits at its next checkpoint (every
@@ -125,7 +223,14 @@ new_store() { # -> STORE: fresh, empty, mode 700
   STORE="$BASE/s$N"
   mkdir -m 700 "$STORE"
 }
-cname() { CNAME="$PREFIX-$1"; NAMES+=("$CNAME"); } # never in $(...): NAMES must persist
+# cname SUFFIX ROLE STORE -> CNAME: register a container name with the label value and
+# the store it will be created with. Never in $(...): the registrations must persist.
+cname() {
+  CNAME="$PREFIX-$1"
+  NAMES+=("$CNAME")
+  ROLE[$CNAME]=$2
+  MOUNT[$CNAME]=$3
+}
 # Store tree: names, inodes, sizes, mtimes, modes and content hashes.
 snapshot() {
   (cd "$1" && find . -mindepth 1 -printf '%P|%i|%s|%T@|%m|' -exec sh -c 'sha256sum <"$1" 2>/dev/null | cut -c1-64 || echo dir' _ {} \; | sort)
@@ -139,16 +244,15 @@ print("null" if v is None else v)' "$1" "$2" 2>/dev/null || echo "<unparsable>"
 PROV_ARGS=(--tenant local --route chat --deployments a,b --preferred a
   --fallback-on-refusal true --deadline-ms 5000 --max-attempts 2)
 
-# run_cmd NAME provision|start ARGS... : foreground, synchronous, bounded. Sets RC, OUT
-# (stdout) and ERR (stderr). A run that exceeds the bound is a FAIL; its client and its
-# container (exact name, label, full ID) are killed.
+# run_cmd NAME provision|start STORE ARGS... : foreground, synchronous, bounded. Sets RC,
+# OUT (stdout) and ERR (stderr). A run that exceeds the bound is a FAIL; its client
+# (sig_ours) and its container (owned_cid, full ID) are killed.
 run_cmd() {
-  local n mode pid
-  cname "$1"
+  local n mode=$2 store=$3 pid
+  cname "$1" "$mode" "$store"
   n=$CNAME
-  mode=$2
-  shift 2
-  "$RS/$mode" --container-name "$n" "$@" >"$BASE/out" 2>"$BASE/err" </dev/null &
+  shift 3
+  "$RS/$mode" --container-name "$n" --store "$store" "$@" >"$BASE/out" 2>"$BASE/err" </dev/null &
   pid=$!
   track "$pid"
   if ! bounded_wait "$pid"; then
@@ -165,7 +269,12 @@ bounded_wait() {
   local pid=$1 deadline=$((SECONDS + T))
   # Block on a FIFO read that only times out; recheck between slices (no busy loop).
   while ours_alive "$pid" && [[ $(proc_state "$pid") != Z ]]; do
-    ((SECONDS < deadline)) || { kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; WAIT_RC=124; return 1; }
+    if ((SECONDS >= deadline)); then
+      sig_ours KILL "$pid"
+      { wait "$pid"; } 2>/dev/null
+      WAIT_RC=124
+      return 1
+    fi
     read -r -t 0.2 -u "$TICK" _ || true
     check_sig
   done
@@ -175,13 +284,17 @@ bounded_wait() {
 }
 mkfifo "$BASE/tick"
 exec {TICK}<>"$BASE/tick" # never written: `read -t` on it is a bounded pause
+# client_sig SIG: signal the current writer's docker client (never the BEAM), or abort.
+client_sig() {
+  sig_ours "$1" "$WPID" || abort "writer client $WPID is no longer the process this run started; no SIG$1 sent"
+}
 
 # Long-running writer. start_writer NAME STORE [plain]: sets WPID (docker client),
 # WIN/WOUT (fds for the writer's stdin/stdout), WNAME. Default: under harness control
 # (stdin attached). `plain`: the product form, no stdin attached, stopped only by
 # SIGTERM.
 start_writer() {
-  cname "$1"
+  cname "$1" start "$2"
   WNAME=$CNAME
   local d="$BASE/w-$1" ctl=(--harness-control)
   [[ ${3-} == plain ]] && ctl=()
@@ -202,7 +315,7 @@ event() { # wait (bounded) for the next stdout line of the writer -> LINE
 }
 send() { printf '%s\n' "$1" >&"$WIN"; }
 
-# Kernel view of the running writer: the container's PID 1 on the host.
+# Kernel view of the running writer: the container's PID 1 on the host (by full ID).
 beam_pid() { docker inspect -f '{{.State.Pid}}' "$1" 2>/dev/null; }
 store_key() { # /proc/locks style key for the store inode: MAJ:MIN:INO
   local ma mi ino
@@ -229,7 +342,8 @@ holders_of() { # store -> PIDs (any process visible to us) with an fd on the sto
 # verify_writer NAME STORE ROLE: before any action on a running writer, tie this run's
 # container to its BEAM. Sets CID (full container ID), VPID (BEAM host PID, read only,
 # never signalled) and VSTART (its kernel start time), or WHY and returns 1. Checks:
-#   - CID: owned_cid (registered exact name, label telelem.route-store=ROLE, full ID);
+#   - CID: owned_cid (registered exact name, role and store, pinned full ID, inspected
+#     Id/Name/label and the single /sbx/store bind), registered as ROLE on STORE;
 #   - docker inspect CID: same Id and name, that label, running, State.Pid > 0, and
 #     STORE (inside this run's mktemp dir) bind-mounted at /sbx/store;
 #   - kernel, for State.Pid: exe beam.smp; PID 1 of its own PID namespace (NSpid);
@@ -239,7 +353,9 @@ holders_of() { # store -> PIDs (any process visible to us) with an fd on the sto
 verify_writer() {
   local name=$1 store=$2 role=$3 got id nm lb run pid src st exe ns fds
   VPID= VSTART=
-  owned_cid "$name" "$role" || return 1
+  owned_cid "$name" || return 1
+  [[ ${ROLE[$name]} == "$role" && ${MOUNT[$name]} == "$store" ]] ||
+    { WHY="'$name' was registered as ${ROLE[$name]} on ${MOUNT[$name]}, not $role on $store"; return 1; }
   got=$(docker inspect -f '{{.Id}}|{{.Name}}|{{index .Config.Labels "telelem.route-store"}}|{{.State.Running}}|{{.State.Pid}}|{{range .Mounts}}{{if eq .Destination "/sbx/store"}}{{.Source}};{{end}}{{end}}' "$CID" 2>/dev/null) ||
     { WHY="docker inspect $CID failed"; return 1; }
   IFS='|' read -r id nm lb run pid src <<<"$got"
@@ -269,34 +385,139 @@ still_same() {
   [[ $got == "$CID|true|$VPID" && $(proc_start "$VPID") == "$VSTART" ]] ||
     { WHY="$CID now '$got', pid $VPID start '$(proc_start "$VPID")' (was $VSTART)"; return 1; }
 }
-# abort REASON: a verification before a docker action failed. Count it, take no action
-# on the writer, and stop the run (cleanup then removes only this run's containers).
-abort() { bad "$1"; echo "aborting before any action on the writer; passed $PASS, failed $FAIL"; exit 1; }
+# abort REASON: a check before a signal or docker action failed. Count it, take no
+# action, and stop the run (cleanup then removes only containers owned_cid accepts).
+abort() { bad "$1"; echo "aborting before the action; passed $PASS, failed $FAIL"; exit 1; }
+
+# --- case 0: cleanup ownership self-test ---------------------------------------------------
+# Runs the real owned_cid / rm_owned / reap_containers and sig_ours in a subshell where
+# `docker` is a shell function answering from fixed tables and only RECORDING `rm`.
+# No daemon, container or delivered signal is involved (sig_ours is exercised with the
+# null signal 0, which only checks existence). Prints ok/FAIL lines; returns the
+# number of failed checks (capped at 100).
+cleanup_selftest() (
+  trap - EXIT INT TERM HUP
+  local log="$BASE/selftest-rm" err="$BASE/selftest-err" S="$BASE/selftest-store" fails=0 n i me
+  : >"$log"
+  NAMES=() ROLE=() MOUNT=() CIDOF=() OWNED=() REJECTED=0
+  declare -A PS=() INSPECT=()
+  ck() { if [[ $2 == "$3" ]]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s (got %s, want %s)\n' "$1" "'$2'" "'$3'"; fails=$((fails + 1)); fi; }
+  removed() { grep -qx -- "$1" "$log"; }
+  docker() { # stub: ps by exact-name filter, inspect by ID, rm only recorded
+    local a n=
+    case ${1-} in
+      ps)
+        for a; do [[ $a == name=* ]] && { n=${a#name=^}; n=${n%\$}; }; done
+        [[ -n $n ]] || return 0
+        for a in ${PS[$n]-}; do removed "$a" || printf '%s\n' "$a"; done ;;
+      inspect)
+        a=${!#}
+        [[ -n ${INSPECT[$a]-} ]] && ! removed "$a" || return 1
+        printf '%s\n' "${INSPECT[$a]}" ;;
+      rm) printf '%s\n' "${!#}" >>"$log" ;;
+      *) echo "stub: unexpected docker $*" >&2; return 1 ;;
+    esac
+  }
+  js() { # ID NAME LABEL(- = no labels) TYPE DEST SOURCE
+    local lb="{\"telelem.route-store\":\"$3\"}"
+    [[ $3 == - ]] && lb=null
+    printf '[{"Id":"%s","Name":"/%s","Config":{"Labels":%s},"Mounts":[{"Type":"%s","Destination":"%s","Source":"%s"}]}]' \
+      "$1" "$2" "$lb" "$4" "$5" "$6"
+  }
+  # scen KEY STORE PS-IDS INSPECT-ID NAME LABEL TYPE DEST SOURCE: register KEY as a start
+  # container on STORE, docker ps for it lists PS-IDS, inspect of PS-IDS[0] answers with
+  # the given fields (INSPECT-ID is the Id inside that answer).
+  scen() {
+    cname "st-$1" start "$2"
+    PS[$CNAME]=$3
+    [[ -n $3 ]] && INSPECT[${3%% *}]=$(js "$4" "$5" "$6" "$7" "$8" "$9")
+  }
+  for i in {1..15}; do printf -v "h$i" '%064x' "$i"; done
+  P="$PREFIX-st"
+  scen ok "$S" "$h1" "$h1" "$P-ok" start bind /sbx/store "$S"
+  scen mount "$S" "$h2" "$h2" "$P-mount" start bind /sbx/store /srv/foreign
+  scen dest "$S" "$h3" "$h3" "$P-dest" start bind /data "$S"
+  scen type "$S" "$h4" "$h4" "$P-type" start volume /sbx/store "$S"
+  scen role "$S" "$h5" "$h5" "$P-role" provision bind /sbx/store "$S"
+  scen nolabel "$S" "$h6" "$h6" "$P-nolabel" - bind /sbx/store "$S"
+  scen name "$S" "$h7" "$h7" "$P-name-x" start bind /sbx/store "$S"
+  scen idmix "$S" "$h8" "$h9" "$P-idmix" start bind /sbx/store "$S"
+  scen two "$S" "$h10 $h11" "$h10" "$P-two" start bind /sbx/store "$S"
+  INSPECT[$h11]=$(js "$h11" "$P-two" start bind /sbx/store "$S")
+  scen short "$S" "${h12:0:12}" "$h12" "$P-short" start bind /sbx/store "$S"
+  scen outside /srv/x "$h13" "$h13" "$P-outside" start bind /sbx/store /srv/x
+  scen pinned-swap "$S" "$h14" "$h14" "$P-pinned-swap" start bind /sbx/store "$S"
+  CIDOF[$CNAME]=$h1 # verified earlier as a different (now gone) container
+  scen pinned "$S" "$h15" "$h15" "$P-pinned" start bind /sbx/store "$S"
+  CIDOF[$CNAME]=$h15
+  scen gone "$S" "" "" "" "" "" "" ""
+  PS[$P-unregistered]=$h2 # a perfect-looking container whose name this run never registered
+
+  reap_containers 2>"$err"
+  rm_owned "$P-unregistered" 2>>"$err"
+  ck "cleanup: docker rm called for exactly the accepted IDs (ok, pinned), once each" \
+    "$(sort "$log" | tr '\n' ' ')" "$(printf '%s\n' "$h1" "$h15" | sort | tr '\n' ' ')"
+  for n in mount dest type role nolabel name idmix two short outside pinned-swap unregistered; do
+    ck "cleanup: '$n' left alone and reported" "$(grep -c "^cleanup: left '$P-$n' alone: " "$err")" \
+      "$([[ $n == unregistered ]] && echo 1 || echo 2)"
+  done
+  ck "cleanup: a name with no container is neither removed nor reported" "$(grep -c "'$P-gone'" "$err")" 0
+  ck "cleanup: rejections counted (11 names x 2 passes + 1 unregistered)" "$REJECTED" 23
+  ck "cleanup: pin carried: 'pinned-swap' still pinned to the gone ID, not to its successor" "${CIDOF[$P-pinned-swap]}" "$h1"
+  ck "cleanup: a rejected candidate is never pinned" "${CIDOF[$P-mount]-unset}" unset
+
+  # Signal gate, with the null signal only.
+  OWNED=()
+  me=$BASHPID # this subshell; captured here, since $BASHPID inside $(...) is the child
+  sig_ours 0 "$me"
+  ck "sig_ours: unregistered PID gets nothing" "$?" 1
+  OWNED[$me]=1
+  sig_ours 0 "$me"
+  ck "sig_ours: registered PID with a different start time gets nothing" "$?" 1
+  OWNED[$me]=$(proc_start "$me")
+  sig_ours 0 "$me"
+  ck "sig_ours: control: the registered process (same start time) is reachable" "$?" 0
+  OWNED[999999999]=1
+  sig_ours 0 999999999
+  ck "sig_ours: registered but gone PID gets nothing" "$?" 1
+  ((fails > 100)) && fails=100
+  exit "$fails"
+)
 
 # =========================================================================================
+echo "# 0. cleanup ownership and signal gate (stubbed docker: no daemon, containers or signals)"
+cleanup_selftest
+expect "case 0: every check above held" "$?" 0
+if ((SELFTEST_ONLY)); then
+  echo
+  echo "passed $PASS, failed $FAIL"
+  ((FAIL == 0)) || exit 1
+  exit 0
+fi
+
 echo "# 1. startup never seeds: missing provision"
 new_store
 before=$(snapshot "$STORE")
-run_cmd miss-start start --store "$STORE" --tenant local --route chat
+run_cmd miss-start start "$STORE" --tenant local --route chat
 expect "start on an empty store refuses not_provisioned (exit 3)" "$RC $(jget "$OUT" 'd["reason"]')" "3 not_provisioned"
 expect "empty store left empty" "$(snapshot "$STORE")" "$before"
-run_cmd miss-start2 start --store "$STORE" --tenant local --route chat
+run_cmd miss-start2 start "$STORE" --tenant local --route chat
 expect "a second start still refuses and still seeds nothing" "$RC $(snapshot "$STORE")" "3 $before"
 
 echo "# 2. interrupted provision is never promoted, removed or reseeded"
 new_store
 SRC_STORE=$STORE
-run_cmd int-src provision --store "$SRC_STORE" "${PROV_ARGS[@]}"
+run_cmd int-src provision "$SRC_STORE" "${PROV_ARGS[@]}"
 expect "control: provision of a fresh store succeeds" "$RC" 0
 new_store
 # A rev-1 record that was staged and synced but never renamed: exactly the bytes the
 # real provision writes, under the staging name only.
 cp -- "$SRC_STORE/route.rec" "$STORE/route.rec.tmp" && chmod 600 "$STORE/route.rec.tmp"
 before=$(snapshot "$STORE")
-run_cmd int-start start --store "$STORE" --tenant local --route chat
+run_cmd int-start start "$STORE" --tenant local --route chat
 expect "start refuses interrupted_provision (exit 3)" "$RC $(jget "$OUT" 'd["reason"]')" "3 interrupted_provision"
 expect "temp untouched, no route.rec created" "$(snapshot "$STORE")" "$before"
-run_cmd int-prov provision --store "$STORE" "${PROV_ARGS[@]}"
+run_cmd int-prov provision "$STORE" "${PROV_ARGS[@]}"
 expect "provision refuses interrupted_provision (exit 3)" "$RC $(jget "$OUT" 'd["reason"]')" "3 interrupted_provision"
 expect "temp still untouched after provision attempt" "$(snapshot "$STORE")" "$before"
 
@@ -312,32 +533,33 @@ track "$HPID"
 read -r -t "$T" -u "$HR" hl || { check_sig; hl=timeout; }
 expect "host holder acquired the lock" "$hl" ready
 before=$(snapshot "$STORE")
-run_cmd busy-prov provision --store "$STORE" "${PROV_ARGS[@]}"
+run_cmd busy-prov provision "$STORE" "${PROV_ARGS[@]}"
 expect "provision while held: busy 75 from the wrapper inside the container" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
 expect "provision while held: no writer event, nothing written" "${OUT:-none} $(snapshot "$STORE")" "none $before"
-run_cmd busy-start start --store "$STORE" --tenant local --route chat
+run_cmd busy-start start "$STORE" --tenant local --route chat
 expect "start while held: busy 75, store unchanged" "$RC $(snapshot "$STORE")" "75 $before"
 echo go >&"$HW"
 bounded_wait "$HPID"
 untrack "$HPID"
 exec {HR}>&- {HW}>&-
-run_cmd busy-after provision --store "$STORE" "${PROV_ARGS[@]}"
+run_cmd busy-after provision "$STORE" "${PROV_ARGS[@]}"
 expect "control: provision acquires once the holder exits" "$RC $(jget "$OUT" 'd["record"]["rev"]')" "0 1"
 
 echo "# 4. lifecycle: provision, start, contention, acknowledged change, normal stop"
 new_store
 LS=$STORE
-run_cmd life-prov provision --store "$LS" "${PROV_ARGS[@]}"
+run_cmd life-prov provision "$LS" "${PROV_ARGS[@]}"
 expect "provision exit 0, rev 1, no last_plan_digest" "$RC $(jget "$OUT" 'd["record"]["rev"]') $(jget "$OUT" 'd["record"]["last_plan_digest"]')" "0 1 null"
 D1=$(jget "$OUT" 'd["record"]["digest"]')
 rec1=$(snapshot "$LS")
-run_cmd life-prov2 provision --store "$LS" "${PROV_ARGS[@]}"
+run_cmd life-prov2 provision "$LS" "${PROV_ARGS[@]}"
 expect "second provision refuses already_provisioned, record unchanged" "$RC $(jget "$OUT" 'd["reason"]') $(snapshot "$LS")" "3 already_provisioned $rec1"
 
 start_writer w1 "$LS"
 event
 expect "start #1 ready: rev 1, provisioned digest" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["digest"]')" "ready 1 $D1"
-BP=$(beam_pid "$WNAME")
+owned_cid "$WNAME" || abort "pin the start #1 container: $WHY"
+BP=$(beam_pid "$CID")
 expect "writer is beam.smp as the container's PID 1" "$(basename "$(readlink "/proc/$BP/exe" 2>/dev/null)") $(jget "$LINE" 'd["os_pid"]')" "beam.smp 1"
 fds=$(fd_on_store "$BP" "$LS")
 fd=${fds%% *}
@@ -347,9 +569,9 @@ expect "exclusive flock attached to that fd (kernel fdinfo)" \
 expect "no other process holds the store open" "$(holders_of "$LS")" "$BP"
 
 before=$(snapshot "$LS")
-run_cmd life-busy-prov provision --store "$LS" "${PROV_ARGS[@]}"
+run_cmd life-busy-prov provision "$LS" "${PROV_ARGS[@]}"
 expect "provision against the running store: busy 75" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
-run_cmd life-busy-start start --store "$LS" --tenant local --route chat
+run_cmd life-busy-start start "$LS" --tenant local --route chat
 expect "second start against the running store: busy 75" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
 expect "store unchanged by both contenders (before any mutation)" "$(snapshot "$LS")" "$before"
 
@@ -362,10 +584,10 @@ expect "ack carries last_plan_digest == plan digest" "$(jget "$LINE" 'd["record"
 expect "on disk: route.rec names rev 2 with the acked digests, no temp left" \
   "$(grep -c "\"chat\",2,\[\"a\",\"b\"\],\"b\",true,5000,2,\"$D2\"\],\"$P2\"\]" "$LS/route.rec") $(ls "$LS")" "1 route.rec"
 before=$(snapshot "$LS")
-run_cmd life-busy-prov2 provision --store "$LS" "${PROV_ARGS[@]}"
+run_cmd life-busy-prov2 provision "$LS" "${PROV_ARGS[@]}"
 expect "provision after the change: still busy 75, store unchanged" "$RC $(snapshot "$LS")" "75 $before"
 
-kill -TERM "$WPID" # the launcher's docker client forwards it to the BEAM (--sig-proxy)
+client_sig TERM # to the launcher's docker client, which forwards it to the BEAM (--sig-proxy)
 event
 expect "SIGTERM to the start command: orderly stop event" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["reason"]')" "stopped sigterm"
 bounded_wait "$WPID"
@@ -422,42 +644,57 @@ echo "# 6. lock lifetime when the docker client (not the BEAM) is SIGKILLed"
 start_writer w4 "$LS" plain
 event
 expect "plain start ready at rev 3" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]')" "ready 3"
-BP=$(beam_pid "$WNAME") # read only
-kill -KILL "$WPID" # the docker client this run started (OWNED), not the BEAM
+verify_writer "$WNAME" "$LS" start || abort "verify the plain writer before killing its client: $WHY"
+BP=$VPID C4=$CID # read only; C4 is pinned to the name from here on
+client_sig KILL # the docker client this run started, not the BEAM
 bounded_wait "$WPID"
 end_writer
 expect "client dead; the container still runs and its BEAM still holds the store" \
-  "$(docker inspect -f '{{.State.Running}}' "$WNAME" 2>/dev/null) $(holders_of "$LS")" "true $BP"
+  "$(docker inspect -f '{{.State.Running}}' "$C4" 2>/dev/null) $(holders_of "$LS")" "true $BP"
 before=$(snapshot "$LS")
-run_cmd orphan-busy start --store "$LS" --tenant local --route chat
+run_cmd orphan-busy start "$LS" --tenant local --route chat
 expect "a new start is refused busy (75) while the orphaned writer holds the lock" "$RC" 75
-run_cmd orphan-busy-prov provision --store "$LS" "${PROV_ARGS[@]}"
+run_cmd orphan-busy-prov provision "$LS" "${PROV_ARGS[@]}"
 expect "so is provision (75); store unchanged" "$RC $(snapshot "$LS")" "75 $before"
 verify_writer "$WNAME" "$LS" start || abort "verify the orphaned writer before docker stop: $WHY"
-[[ $VPID == "$BP" ]] || abort "orphaned writer pid $VPID is not the one that was ready ($BP)"
+[[ $VPID == "$BP" && $CID == "$C4" ]] || abort "orphaned writer $CID/pid $VPID is not the one verified at ready ($C4/$BP)"
 still_same || abort "orphaned writer changed before docker stop: $WHY"
-expect "recovery: docker stop of exactly that container by full ID (SIGTERM -> orderly stop)" \
+expect "recovery: docker stop of exactly that container by full ID returns" \
   "$(timeout -k 5 "$T" docker stop -t 30 "$CID" 2>&1)" "$CID"
-# 6b. Harness form: losing the harness closes the writer's stdin; it stops in order.
+# No client is attached any more, so whether that stop was orderly (`stopped` event,
+# exit 0) is not observed; what is observed is that the lock is released and the store
+# reopens unchanged.
+# 6b. Harness form: losing the harness closes the writer's stdin.
 start_writer w5 "$LS"
 event
-expect "after the orphan stopped: start acquires, still rev 3 / $P3" \
+expect "after docker stop: the lock is released and start reopens rev 3 / $P3" \
   "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" "ready 3 $P3"
 verify_writer "$WNAME" "$LS" start || abort "verify the harness writer before killing its client: $WHY"
-kill -KILL "$WPID" # the docker client this run started (OWNED), not the BEAM
+client_sig KILL # the docker client this run started, not the BEAM
 bounded_wait "$WPID"
 end_writer
 w=$(timeout -k 5 "$T" docker wait "$CID" 2>&1)
-# `docker wait` prints the exit code, or the --rm removal already happened.
-case $w in 0 | *"No such container"*) w=stopped ;; esac
-expect "harness client SIGKILLed: the writer sees stdin EOF and stops (0 or already removed)" "$w" stopped
+# `docker wait` prints the exit code if it saw the exit, or the --rm removal already
+# happened; the latter says nothing about how the writer exited.
+case $w in 0 | *"No such container"*) w=exited ;; esac
+expect "harness client SIGKILLed: the container exits by itself (exit 0 seen, or already removed)" "$w" exited
 expect "nothing holds the store; record still rev 3" "$(holders_of "$LS") $(snapshot "$LS")" " $before"
+start_writer w6 "$LS"
+event
+expect "after the harness-form exit: start reopens rev 3 / $P3" \
+  "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" "ready 3 $P3"
+send "stop"
+event
+ev=$(jget "$LINE" 'd["event"]')
+bounded_wait "$WPID"
+expect "harness stop: stopped event, exit 0, record unchanged" "$ev $WAIT_RC $(snapshot "$LS")" "stopped 0 $before"
+end_writer
 
 echo "# 7. the writer refuses to touch a store it has not locked"
 new_store
 cp -- "$LS/route.rec" "$STORE/route.rec.tmp" && chmod 600 "$STORE/route.rec.tmp"
 before=$(snapshot "$STORE")
-cname nolock
+cname nolock test "$STORE"
 n=$CNAME
 out=$(timeout -k 5 "$T" docker run --rm --name "$n" --label telelem.route-store=test --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
