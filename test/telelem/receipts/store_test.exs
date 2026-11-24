@@ -446,11 +446,128 @@ defmodule Telelem.Receipts.StoreTest do
         Store.stats(store)
       end
 
-      assert %{retained: 1_024, receipts: 1_024, evicted: 76, overflow: 0, loss?: true} =
+      # Ordinary retention is counted but is not loss.
+      assert %{retained: 1_024, receipts: 1_024, evicted: 76, overflow: 0, loss?: false} =
                Store.stats(store)
 
       assert {:error, :not_found} = lookup(store, "e76")
       assert {:ok, %Receipt{}} = lookup(store, "e77")
+    end
+
+    # Regression (cold review of ca5427c): eviction used to set shared,
+    # never-cleared hashed loss slots, so with default limits sustained
+    # lossless traffic eventually left no new receipt complete.
+    test "sustained lossless traffic at default limits keeps fresh receipts complete" do
+      {store, p} = start()
+      lifecycle = [ingress: [], dispatch: [exposure: :possible], commit: [], terminal: []]
+
+      for n <- 1..6_000 do
+        Enum.reduce(lifecycle, open(p, "s#{n}"), fn {kind, o}, w -> ok(w, kind, o) end)
+        # Sweep each request so pending never overflows; isolates retention.
+        Store.stats(store)
+
+        if rem(n, 1_000) == 0 do
+          # 1,024 retained / 4 records: the newest 256 are fully retained.
+          for i <- (n - 255)..n do
+            assert {:ok, %Receipt{completeness: :complete, gaps: [], exposure: :possible}} =
+                     lookup(store, "s#{i}")
+          end
+
+          assert {:error, :not_found} = lookup(store, "s#{n - 256}")
+        end
+      end
+
+      assert %{
+               retained: 1_024,
+               receipts: 256,
+               evicted: 22_976,
+               overflow: 0,
+               store_down: 0,
+               rejected: 0,
+               loss?: false
+             } = Store.stats(store)
+    end
+
+    test "eviction marks only its own receipt, even when every loss slot collides" do
+      # One shared loss slot: any hashed mark would hit every receipt.
+      {store, p} = start(max_retained: 4, loss_slots: 1)
+      _ = open(p, "old") |> ok(:ingress) |> ok(:terminal)
+      Store.stats(store)
+      _ = open(p, "new") |> ok(:ingress) |> ok(:dispatch) |> ok(:terminal)
+
+      assert %{evicted: 1, loss?: false} = Store.stats(store)
+      assert {:ok, %{gaps: [:missing_sequence, :no_ingress, :evicted]}} = lookup(store, "old")
+      assert {:ok, %{completeness: :complete, gaps: []}} = lookup(store, "new")
+    end
+
+    test "actual overflow still marks a colliding receipt (shared-slot limitation)" do
+      {store, p} = start(max_pending: 1, loss_slots: 1)
+      w = open(p, "victim") |> ok(:ingress)
+      Store.stats(store)
+      :ok = :sys.suspend(store)
+      fill(p, "f")
+
+      assert {{:dropped, :overflow}, _} =
+               Writer.record(open(p, "dropped"), ev("dropped", :ingress))
+
+      :ok = :sys.resume(store)
+      Store.stats(store)
+      _ = ok(w, :terminal)
+
+      assert %{overflow: 1, loss?: true} = Store.stats(store)
+      # Conservative false positive: never more complete, possibly less.
+      assert {:ok, %{completeness: :incomplete, gaps: [:loss]}} = lookup(store, "victim")
+    end
+
+    test "partial eviction, then a late record from the same live writer" do
+      {store, p} = start(max_retained: 4)
+      # Publication order: part.ingress, other.ingress, other.dispatch,
+      # part.dispatch, other.terminal; the fifth evicts part's ingress, and the
+      # late terminal later evicts other's ingress (not part's dispatch).
+      w = open(p, "part") |> ok(:ingress)
+      Store.stats(store)
+      o = open(p, "other") |> ok(:ingress) |> ok(:dispatch)
+      Store.stats(store)
+      w = ok(w, :dispatch)
+      Store.stats(store)
+      _ = ok(o, :terminal)
+
+      assert %{evicted: 1} = Store.stats(store)
+
+      assert {:ok, %{gaps: [:missing_sequence, :no_ingress, :no_terminal, :evicted]}} =
+               lookup(store, "part")
+
+      _ = ok(w, :terminal)
+
+      assert {:ok, r} = lookup(store, "part")
+      assert r.gaps == [:missing_sequence, :no_ingress, :evicted]
+      assert r.completeness == :incomplete
+      assert r.observed_outcome == :done
+      assert r.exposure == :unknown
+      assert Enum.map(r.events, & &1.kind) == [:dispatch, :terminal]
+      refute Producer.lost?(p, {"local", "part"})
+    end
+
+    test "full eviction is not found; a late record from the same live writer is not complete" do
+      {store, p} = start(max_retained: 4)
+      w = open(p, "full") |> ok(:ingress) |> ok(:dispatch)
+      Store.stats(store)
+      _ = open(p, "other") |> ok(:ingress) |> ok(:dispatch) |> ok(:commit) |> ok(:terminal)
+
+      assert %{evicted: 2, retained: 4, loss?: false} = Store.stats(store)
+      assert {:error, :not_found} = lookup(store, "full")
+
+      _ = ok(w, :terminal)
+
+      assert {:ok, r} = lookup(store, "full")
+      assert r.gaps == [:missing_sequence, :no_ingress]
+      assert r.completeness == :incomplete
+      assert r.observed_outcome == :done
+      assert r.exposure == :unknown
+      assert [%{kind: :terminal}] = r.events
+      # The late record evicted other's oldest record: entry-local, no loss.
+      assert {:ok, %{gaps: [:missing_sequence, :no_ingress, :evicted]}} = lookup(store, "other")
+      assert %{loss?: false} = Store.stats(store)
     end
 
     test "evicting part of a receipt makes it incomplete and keeps its terminal" do
@@ -461,7 +578,7 @@ defmodule Telelem.Receipts.StoreTest do
 
       assert %{retained: 4, evicted: 1} = Store.stats(store)
       assert {:ok, old} = lookup(store, "old")
-      assert old.gaps == [:missing_sequence, :no_ingress, :loss, :evicted]
+      assert old.gaps == [:missing_sequence, :no_ingress, :evicted]
       assert old.completeness == :incomplete
       assert old.observed_outcome == :failed
       assert old.exposure == :unknown

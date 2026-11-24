@@ -24,9 +24,10 @@ defmodule Telelem.Receipts.Receipt do
     * `:reported_drop` – a retained record declares an earlier failed
       publication by its writer
     * `:writer_conflict` – records from more than one writer process
-    * `:loss` – the receipt's loss flag is set (drop, rejection or eviction
-      that may belong to it; collisions only add false `:loss`)
-    * `:evicted` – one of the receipt's own records was evicted
+    * `:loss` – the receipt's loss flag is set (a drop or rejection that may
+      belong to it; collisions only add false `:loss`)
+    * `:evicted` – one of the receipt's own records was evicted by ordinary
+      retention (entry-local; a fully evicted receipt is not found)
 
   Derived fields:
 

@@ -15,7 +15,15 @@ defmodule Telelem.Receipts.Store do
 
     * `max_pending: 256` – pending slots (hard bound on unswept records)
     * `max_retained: 1024` – retained records; the oldest published record is
-      evicted first and counted as loss for its receipt
+      evicted first. Eviction is counted (`evicted`) and recorded only on the
+      receipt's own entry: a partly evicted receipt reports `:evicted` (plus
+      the resulting sequence gaps), a fully evicted one is not found. It never
+      sets a shared loss slot, so routine retention cannot make other
+      receipts incomplete. If the same live writer publishes again after its
+      receipt was fully evicted, the new entry starts above sequence one and
+      reads `:missing_sequence`/`:no_ingress`. Request-ID reuse by another
+      writer after full eviction is forbidden by the contract and is not
+      detected (the earlier owner is forgotten with the entry).
     * `max_event_bytes: 512` – canonical encoding per event
     * `loss_slots: 1024` – fixed number of per-receipt loss flags
     * `sweep_ms: 10` – pending sweep interval
@@ -282,8 +290,8 @@ defmodule Telelem.Receipts.Store do
     entry = Map.fetch!(s.by_key, key)
     records = Map.delete(entry.records, stamp)
 
+    # Counted, but no shared loss slot (see moduledoc): entry-local only.
     Producer.count(p, :evicted)
-    Producer.mark_lost(p, key)
 
     by_key =
       if records == %{},

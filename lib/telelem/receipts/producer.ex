@@ -37,11 +37,17 @@ defmodule Telelem.Receipts.Producer do
     * `store_down` – records refused because the store table was gone
     * `rejected` – invalid events (never published), and malformed pending
       rows discarded by the store
-    * `evicted` – retained records removed by the retention limit
+    * `evicted` – retained records removed by the ordinary retention limit
+      (a counter only; see below)
     * loss slots – `loss_slots` flags indexed by `phash2({tenant, request})`,
       set **synchronously, before** the failing `record` returns, for every
-      drop, rejection or eviction. Slots are never cleared, so collisions can
-      only make a receipt look less complete, never more.
+      drop (overflow, store down) or rejection. Slots are never cleared, so
+      collisions can only make a receipt look less complete, never more.
+
+  Ordinary retention eviction does **not** set a loss slot: scheduled
+  eviction is routine, and marking shared never-cleared slots for it would
+  eventually mark every future receipt incomplete. The store records it on
+  the receipt's own entry instead (`Telelem.Receipts.Store`).
   """
 
   @enforce_keys [:table, :ref, :max_pending, :max_event_bytes, :loss_slots]
@@ -125,7 +131,8 @@ defmodule Telelem.Receipts.Producer do
 
   @doc """
   Loss counters from the shared array; does not contact the store.
-  `loss?` is true once any record was dropped, rejected or evicted.
+  `loss?` is true once any record was dropped or rejected; ordinary
+  retention eviction (`evicted`) is not loss and does not set it.
   """
   @spec stats(t()) :: %{
           overflow: non_neg_integer(),
@@ -142,6 +149,6 @@ defmodule Telelem.Receipts.Producer do
       evicted: :atomics.get(ref, @evicted)
     }
 
-    Map.put(s, :loss?, s.overflow + s.store_down + s.rejected + s.evicted > 0)
+    Map.put(s, :loss?, s.overflow + s.store_down + s.rejected > 0)
   end
 end
