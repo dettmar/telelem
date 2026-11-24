@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# TEL-005 M1 transport experiment, end to end, from a clean checkout:
+#
+#   scripts/setup                              # once, online (runner image + deps)
+#   (cd fixtures/wire && uv sync --locked)     # once, online (fixture + pinned SDK venv)
+#   integration/m1/run [extra mix test args]   # offline from here on
+#
+# Starts on the HOST, loopback only:
+#   * the independent TEL-004 wire fixture (two TLS lanes a,b, own counters, own CA),
+#   * integration/m1/sdk_agent.py (the real OpenAI SDK, max_retries=0, dummy key),
+# then runs test/telelem/wire_m1_test.exs in the pinned runner with
+# TELELEM_NETWORK=host. The gateway (Bandit downstream, Mint upstream) runs inside
+# that test. Evidence JSON lands in integration/m1/_run/<stamp>/evidence/.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_HOST="$ROOT/integration/m1/_run/$STAMP"
+RUN_WORK="/work/integration/m1/_run/$STAMP"   # same directory as seen by the runner
+mkdir -p "$RUN_HOST/evidence" "$RUN_HOST/fixture"
+chmod 700 "$RUN_HOST"
+
+FIX="$ROOT/fixtures/wire"
+command -v uv >/dev/null || { echo "integration/m1/run: uv not found (needed for the host fixture/SDK)" >&2; exit 2; }
+
+pids=()
+cleanup() {
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Never let ambient provider settings reach the host processes.
+for v in $(compgen -e | grep -E '^(OPENAI_|ANTHROPIC_|AZURE_OPENAI)' || true); do unset "$v"; done
+
+(cd "$FIX" && exec uv run --locked --offline telelem-wire serve --lanes a,b \
+   --state-dir "$RUN_HOST/fixture" --ready-file "$RUN_HOST/fixture.json" --max-hold 30) \
+   >"$RUN_HOST/fixture.stdout" 2>"$RUN_HOST/fixture.stderr" &
+pids+=($!)
+
+uv run --project "$FIX" --locked --offline python "$ROOT/integration/m1/sdk_agent.py" \
+   --ready-file "$RUN_HOST/sdk.json" >"$RUN_HOST/sdk.stdout" 2>"$RUN_HOST/sdk.stderr" &
+pids+=($!)
+
+for f in fixture.json sdk.json; do
+  for _ in $(seq 1 200); do [[ -s "$RUN_HOST/$f" ]] && break; sleep 0.05; done
+  [[ -s "$RUN_HOST/$f" ]] || { echo "integration/m1/run: $f not ready" >&2; cat "$RUN_HOST"/*.stderr >&2; exit 1; }
+done
+
+read_json() { python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2], {}, {"d": d}))' "$@"; }
+CONTROL="$(read_json "$RUN_HOST/fixture.json" 'd["control_url"]')"
+SDK="$(read_json "$RUN_HOST/sdk.json" 'd["url"]')"
+echo "==> fixture control $CONTROL  sdk agent $SDK  run dir integration/m1/_run/$STAMP"
+
+export TELELEM_NETWORK=host
+export TELELEM_TEST_M1_FIXTURE_CONTROL="$CONTROL"
+export TELELEM_TEST_M1_FIXTURE_CA="$RUN_WORK/fixture/ca.pem"
+export TELELEM_TEST_M1_SDK_AGENT="$SDK"
+export TELELEM_TEST_M1_RUN_WORK="$RUN_WORK"
+export TELELEM_TEST_M1_RUN_HOST="$RUN_HOST"
+
+set +e
+"$ROOT/scripts/mix" test test/telelem/wire_m1_test.exs --seed 0 "$@" 2>&1 | tee "$RUN_HOST/mix-test.log"
+status=${PIPESTATUS[0]}
+set -e
+echo "==> evidence: integration/m1/_run/$STAMP/evidence/  (exit $status)"
+exit "$status"
