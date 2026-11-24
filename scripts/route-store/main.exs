@@ -197,7 +197,11 @@ defmodule RouteStore.Main do
          expected = %{rev: current.rev, digest: current.digest},
          {:ok, rec} <-
            FileStore.compare_and_write(@name, s.tenant, s.route, expected, proposed, plan) do
-      emit(%{event: "applied", plan_digest: plan, record: record_json(rec.revision, rec.last_plan_digest)})
+      emit(%{
+        event: "applied",
+        plan_digest: plan,
+        record: record_json(rec.revision, rec.last_plan_digest)
+      })
     else
       other -> emit(%{event: "apply_refused", reason: inspect(other)})
     end
@@ -230,8 +234,11 @@ defmodule RouteStore.Main do
     ]
 
     case Enum.find(checks, fn {ok, _} -> not ok end) do
-      nil -> :ok
-      {_, why} -> fail(2, "store directory #{inspect(dir)} fails the trusted-directory contract: #{why}")
+      nil ->
+        :ok
+
+      {_, why} ->
+        fail(2, "store directory #{inspect(dir)} fails the trusted-directory contract: #{why}")
     end
   end
 
@@ -250,7 +257,11 @@ defmodule RouteStore.Main do
          true <- flock_attached?(info, now) do
       :ok
     else
-      _ -> fail(4, "this process does not hold the store lock on #{inspect(dir)}; run it through scripts/route-store")
+      _ ->
+        fail(
+          4,
+          "this process does not hold the store lock on #{inspect(dir)}; run it through scripts/route-store"
+        )
     end
   end
 
