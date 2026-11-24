@@ -7,46 +7,75 @@ defmodule Telelem.Handoff do
   ## Roles
 
     * **requester**: the process that owns the downstream response (for
-      example a Bandit handler). It is monitored, never linked. It must not be
-      the process that `start_link/1`s the coordinator; start the coordinator
-      under a supervisor or with `start/1`.
-    * **attempts**: a fixed set of attempt ids given at start. Each attempt
-      process calls `attach/2` *before* it dispatches upstream, `ready/2` once
-      it holds semantic content, then `transfer/2` / `finish/2` if released,
-      and always `cleaned/3` after its transport is closed.
-    * **authority**: an optional admission/spend authority PID. It is monitored
-      and receives events through `:on_event` (by default
-      `{:telelem_handoff, handoff_pid, event}` sent to that PID). Pass a PID,
-      not a name, so events can't reach a restarted incarnation.
+      example a Bandit handler). It is monitored.
+    * **attempts**: a fixed set of attempt ids given at start. An attempt
+      process calls `attach/2`, then `begin_dispatch/2` *before* any upstream
+      bytes can leave, `ready/2` once it holds semantic content, then
+      `transfer/2` / `finish/2` if released, and always `cleaned/3` after its
+      transport is closed.
+    * **authority**: the instance's foundational admission authority PID
+      (`Telelem.Instance.authority/1`). It is monitored. Its death fences the
+      instance (`:rest_for_one` takes the workers down with it), so the
+      handoff treats it as fatal to the request (see below). It receives no
+      messages from the handoff.
+    * **observer**: an optional best-effort audit PID that receives events
+      (`{:telelem_handoff, handoff_pid, event}`, or through `:on_event`).
+      It is monitored. Losing it never affects the request; later events are
+      only listed as `unreported`.
+
+  ## Supported topology
+
+  The coordinator traps exits and monitors everyone else, so it has no links
+  except to its parent (`start_link/1`). The parent should be a supervisor.
+  `init/1` refuses a requester, authority or observer that is linked to the
+  coordinator (`{:linked, role}`), and `attach/2` refuses the parent
+  (`{:error, :linked_to_handoff}`). If the parent exits anyway, `terminate/2`
+  still sends the requester a truthful outcome
+  (`{:failed | :incomplete, {:handoff_down, reason}}`) and cancels every
+  unclosed attempt. Cleanup acknowledgements can't be collected after that,
+  so no `{:closed, _}` follows.
 
   ## Semantics
 
     * **Election.** The first `ready/2` processed while the selection is open
       gets `:release`. Every other attempt is cancelled at that moment. The
-      selection **never reopens**: if the winner then fails, dies, or a
-      downstream write fails, the handoff ends `{:failed, _}` (nothing
-      committed) or `{:incomplete, _}` (after commit). No other attempt is
-      ever released.
+      selection **never reopens**: if the winner then fails, dies, a
+      downstream write fails, or the authority dies, the handoff ends
+      `{:failed, _}` (nothing committed) or `{:incomplete, _}` (after commit).
+      No other attempt is ever released.
     * **Commit** is the first `transfer/2` or `finish/2` that the coordinator
       accepts. The coordinator marks the handoff committed *before* it forwards
       the bytes. Whether the downstream write then succeeds has no effect on
       selection. Data goes winner → coordinator → requester, so the requester
       sees every accepted chunk before any later outcome message.
-    * **Authority loss.** Before commit, the handoff fails closed
-      (`{:failed, {:authority_down, r}}`). After commit, the stream continues.
-      Later events are not delivered and are listed in the report as
-      `unreported`.
+    * **Authority death** (observed `:DOWN`) while the stream is open ends it:
+      `{:failed, {:authority_down, r}}` before commit,
+      `{:incomplete, {:authority_down, r}}` after commit. The winner is
+      cancelled; later `transfer/2`/`finish/2` get `{:error, :cancelled}`.
+      No completion is synthesized. An outcome already reached (for example
+      `{:done, _}`) is never changed afterwards.
     * **Cleanup.** Each expected attempt is closed exactly once, by whichever
       happens first: an explicit `cleaned/3` acknowledgement, the attempt's
       `:DOWN`, a forced kill after `:cleanup_timeout` from its cancel or
       finish, or `:never_registered` (it never attached; later attaches are
       refused so it must not dispatch). Stale timers and duplicate
       acknowledgements are ignored (`{:error, :duplicate}`).
-    * **Charges are not local cleanup.** An attempt that reached `ready` or
-      exited without acknowledging is `:possible` (possibly billed). Neither
-      its death nor the coordinator's decisions can change that. It is `:none`
-      only if it acknowledged `:none` without reaching `ready`, or if it never
-      registered. Settling a possible charge is the authority's job.
+
+  ## Charges: a local, conservative hint
+
+  The handoff never refunds anything. The **admission authority's ledger is
+  the source of truth for spend**: a grant it recorded as dispatched stays
+  encumbered (`:dispatched`/`:unresolved`) whatever the handoff reports. The
+  handoff's per-attempt `charge` is only an upper-bound hint for the requester
+  and observer:
+
+    * `:possible` if the attempt crossed the **may-have-dispatched boundary**
+      (`begin_dispatch/2` returned `:ok`), reached `ready/2`, claimed
+      `:possible`, exited without acknowledging, or was force-killed.
+    * `:none` only if the coordinator never granted that boundary and the
+      attempt acknowledged `:none`, or it never registered. The protocol makes
+      this a proof of no dispatch: a cooperating attempt sends nothing upstream
+      without `begin_dispatch/2 == :ok`.
 
   ## Messages to the requester (`{:telelem_handoff, handoff_pid, msg}`)
 
@@ -65,15 +94,14 @@ defmodule Telelem.Handoff do
   An attempt should also monitor the coordinator; `attach/2` returns that
   monitor ref.
 
-  ## Events to the authority (`:on_event`)
+  ## Observer events
 
       {:elected, id} | {:committed, id} | {:outcome, outcome}
       {:attempt_closed, id, %{cleanup: cleanup, charge: :none | :possible}}
       {:closed, report}
       {:terminated, reason, unclosed_ids}    # coordinator stopped abnormally
 
-  Events are at-most-once. A restarted authority must rebuild exposure from
-  its own ledger, and it should monitor the coordinator itself.
+  Events are at-most-once and carry no authority.
 
   ## Limits
 
@@ -102,11 +130,12 @@ defmodule Telelem.Handoff do
 
   Options:
 
-    * `:requester` (required). Downstream owner PID. Monitored, not linked.
+    * `:requester` (required). Downstream owner PID.
     * `:attempts` (required). Non-empty list of unique attempt ids.
-    * `:authority`. Authority PID to monitor, or `nil`.
-    * `:on_event`. A 1-arity function called in the coordinator for each event.
-      Keep it non-blocking. Default: send to `:authority`.
+    * `:authority`. Foundational admission authority PID, or `nil`.
+    * `:observer`. Best-effort audit PID that receives events, or `nil`.
+    * `:on_event`. A 1-arity function called in the coordinator for each event,
+      instead of sending to `:observer`. Keep it non-blocking.
     * `:trace`. A PID that receives `{:telelem_handoff_trace, pid, event}` for
       each internal transition, including when a `:DOWN` is noticed. Use it
       for tests and evidence.
@@ -130,9 +159,11 @@ defmodule Telelem.Handoff do
   # ── Attempt API (call from the attempt process itself) ───────────────────
 
   @doc """
-  Registers the calling process as attempt `id` and monitors it. Call this
-  before dispatching upstream. Returns `{:ok, monitor_ref_on_handoff}`. On
-  `{:cancel, reason}` or `{:error, _}` the attempt must not dispatch.
+  Registers the calling process as attempt `id` and monitors it. Returns
+  `{:ok, monitor_ref_on_handoff}`. On `{:cancel, reason}` or `{:error, _}`
+  the attempt must not dispatch. A repeated attach by an attempt that has
+  since been cancelled returns that cancellation, and any attach after the
+  outcome returns `{:cancel, :ended}`.
   """
   def attach(h, id) do
     mref = Process.monitor(h)
@@ -148,9 +179,17 @@ defmodule Telelem.Handoff do
   end
 
   @doc """
+  The may-have-dispatched boundary. Call it immediately before the first
+  upstream byte can leave (before the admission authorize/dispatch call).
+  `:ok` grants permission, and from then on the attempt is recorded as
+  `:possible`. On `{:cancel, reason}` or `{:error, _}` it must not dispatch.
+  """
+  def begin_dispatch(h, id), do: call(h, {:begin_dispatch, id})
+
+  @doc """
   The barrier. Reports that this attempt holds semantic content, and returns
   the decision: `:release` (you are the winner), `{:cancel, reason}` or
-  `{:error, _}`.
+  `{:error, _}`. Implies the dispatch boundary.
   """
   def ready(h, id), do: call(h, {:ready, id})
 
@@ -162,10 +201,10 @@ defmodule Telelem.Handoff do
 
   @doc """
   Explicit cleanup acknowledgement: the transport of `id` is closed. `charge`
-  is the attempt's own claim (`:none` if it never dispatched). Once an
-  attempt has reached `ready` it is recorded as `:possible` whatever it
-  claims. Another process may acknowledge an attempt that never attached, for
-  example the spawner when a spawn failed.
+  is the attempt's own claim. It can raise the recorded charge to `:possible`
+  but never lower it: `:none` is recorded only if the attempt never crossed
+  the dispatch boundary. Another process may acknowledge an attempt that
+  never attached, for example the spawner when a spawn failed.
   """
   def cleaned(h, id, charge) when charge in [:none, :possible],
     do: call(h, {:cleaned, id, charge})
@@ -184,7 +223,13 @@ defmodule Telelem.Handoff do
     requester = Keyword.fetch!(opts, :requester)
     ids = Keyword.fetch!(opts, :attempts)
     authority = Keyword.get(opts, :authority)
-    me = self()
+    observer = Keyword.get(opts, :observer)
+    {:links, links} = Process.info(self(), :links)
+
+    linked =
+      Enum.find([requester: requester, authority: authority, observer: observer], fn {_, p} ->
+        p in links
+      end)
 
     cond do
       not is_pid(requester) ->
@@ -196,18 +241,22 @@ defmodule Telelem.Handoff do
       not (is_nil(authority) or is_pid(authority)) ->
         {:stop, {:bad_option, :authority}}
 
-      requester in elem(Process.info(self(), :links), 1) ->
-        # start_link by the requester: its exit (as our parent) would stop us
-        # without running requester-death cleanup.
-        {:stop, :requester_must_not_be_parent}
+      not (is_nil(observer) or is_pid(observer)) ->
+        {:stop, {:bad_option, :observer}}
+
+      linked != nil ->
+        # A linked role's exit (as our parent) would stop us before its
+        # :DOWN could be handled.
+        {:stop, {:linked, elem(linked, 0)}}
 
       true ->
         Process.flag(:trap_exit, true)
+        me = self()
 
         on_event =
           case Keyword.fetch(opts, :on_event) do
             {:ok, fun} when is_function(fun, 1) -> fun
-            :error when is_pid(authority) -> fn ev -> send(authority, {@tag, me, ev}) end
+            :error when is_pid(observer) -> fn ev -> send(observer, {@tag, me, ev}) end
             :error -> fn _ -> :ok end
           end
 
@@ -222,6 +271,7 @@ defmodule Telelem.Handoff do
         blank = %{
           pid: nil,
           mon: nil,
+          dispatched: false,
           ready: false,
           cancelled: nil,
           cleanup: nil,
@@ -232,11 +282,14 @@ defmodule Telelem.Handoff do
 
         {:ok,
          %{
+           parent: List.first(links),
            requester: requester,
            requester_mon: Process.monitor(requester),
-           authority: authority,
            authority_mon: authority && Process.monitor(authority),
            authority_state: if(authority, do: :up, else: :none),
+           observer_mon: observer && Process.monitor(observer),
+           observer_state:
+             if(observer || Keyword.has_key?(opts, :on_event), do: :up, else: :none),
            on_event: on_event,
            trace: Keyword.get(opts, :trace),
            cleanup_timeout: Keyword.get(opts, :cleanup_timeout, 5_000),
@@ -257,8 +310,17 @@ defmodule Telelem.Handoff do
       :error ->
         {:reply, {:error, :unknown_attempt}, s}
 
+      _ when pid == s.parent ->
+        {:reply, {:error, :linked_to_handoff}, s}
+
       {:ok, %{cleanup: c}} when c != nil ->
         {:reply, {:cancel, :closed}, s}
+
+      {:ok, %{pid: ^pid, cancelled: reason}} when reason != nil ->
+        {:reply, {:cancel, reason}, s}
+
+      {:ok, %{pid: ^pid}} when s.outcome != nil ->
+        {:reply, {:cancel, :ended}, s}
 
       {:ok, %{pid: ^pid}} ->
         {:reply, :ok, s}
@@ -274,6 +336,27 @@ defmodule Telelem.Handoff do
     end
   end
 
+  def handle_call({:begin_dispatch, id}, {pid, _}, s) do
+    case owned(s, id, pid) do
+      {:error, _} = e ->
+        {:reply, e, s}
+
+      {:ok, %{cleanup: c}} when c != nil ->
+        {:reply, {:cancel, :closed}, s}
+
+      {:ok, %{cancelled: reason}} when reason != nil ->
+        {:reply, {:cancel, reason}, s}
+
+      {:ok, _} when s.outcome != nil ->
+        # Even the winner of a finished stream gets no new dispatch permission.
+        {:reply, {:cancel, :ended}, s}
+
+      {:ok, a} ->
+        s = put(s, id, %{a | dispatched: true})
+        {:reply, :ok, trace(s, {:dispatch_boundary, id})}
+    end
+  end
+
   def handle_call({:ready, id}, {pid, _}, s) do
     case owned(s, id, pid) do
       {:error, _} = e ->
@@ -283,12 +366,13 @@ defmodule Telelem.Handoff do
         {:reply, {:cancel, :closed}, s}
 
       {:ok, a} ->
-        s = put(s, id, %{a | ready: true})
+        s = put(s, id, %{a | ready: true, dispatched: true})
 
         cond do
           a.cancelled != nil -> {:reply, {:cancel, a.cancelled}, s}
+          s.outcome != nil -> {:reply, {:cancel, :ended}, s}
           s.winner == id -> {:reply, :release, s}
-          s.phase == :open and s.outcome == nil -> {:reply, :release, elect(s, id)}
+          s.phase == :open -> {:reply, :release, elect(s, id)}
           true -> {:reply, {:cancel, {:lost_to, s.winner}}, s}
         end
     end
@@ -350,9 +434,10 @@ defmodule Telelem.Handoff do
        winner: s.winner,
        outcome: s.outcome,
        authority: s.authority_state,
+       observer: s.observer_state,
        attempts:
          Map.new(s.attempts, fn {id, a} ->
-           {id, Map.take(a, [:pid, :ready, :cancelled, :cleanup, :charge])}
+           {id, Map.take(a, [:pid, :dispatched, :ready, :cancelled, :cleanup, :charge])}
          end)
      }, s}
   end
@@ -364,11 +449,14 @@ defmodule Telelem.Handoff do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{authority_mon: ref} = s) do
+    # The instance is fenced: end an open stream, never extend or reselect.
+    # set_outcome/2 is a no-op if an outcome was already reached.
     s = trace(%{s | authority_state: :lost}, {:authority_down, s.phase, reason})
+    finalize(set_outcome(s, ended(s, {:authority_down, reason})))
+  end
 
-    if s.phase == :committed,
-      do: finalize(s),
-      else: finalize(set_outcome(s, {:failed, {:authority_down, reason}}))
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{observer_mon: ref} = s) do
+    {:noreply, trace(%{s | observer_state: :lost}, {:observer_down, s.phase, reason})}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, s) do
@@ -409,6 +497,8 @@ defmodule Telelem.Handoff do
     end
   end
 
+  # Non-parent links (none are supported) are trapped and ignored; the
+  # parent's EXIT is handled by gen_server and lands in terminate/2.
   def handle_info(_other, s), do: {:noreply, s}
 
   @impl true
@@ -416,7 +506,12 @@ defmodule Telelem.Handoff do
     unclosed = for id <- s.order, s.attempts[id].cleanup == nil, do: id
 
     if s.outcome == nil or unclosed != [] do
-      for id <- unclosed, is_pid(s.attempts[id].pid) do
+      # Never leave the requester without an outcome. Acks can't be collected.
+      s = if s.outcome == nil, do: set_outcome(s, ended(s, {:handoff_down, reason})), else: s
+
+      # set_outcome/2 already cancelled the rest; this reaches a winner that
+      # finished but had not acknowledged cleanup yet.
+      for id <- unclosed, is_pid(s.attempts[id].pid), s.attempts[id].cancelled == nil do
         send(s.attempts[id].pid, {@tag, self(), {:cancel, {:handoff_down, reason}}})
       end
 
@@ -495,7 +590,7 @@ defmodule Telelem.Handoff do
     charge =
       cond do
         cleanup == :never_registered -> :none
-        cleanup == :ack and not a.ready -> claim
+        cleanup == :ack and not a.dispatched -> claim
         true -> :possible
       end
 
@@ -511,7 +606,9 @@ defmodule Telelem.Handoff do
   end
 
   defp check_no_winner(s) do
-    if s.phase == :open and all_closed?(s), do: set_outcome(s, {:failed, :no_winner}), else: s
+    if s.phase == :open and all_closed?(s),
+      do: set_outcome(s, {:failed, :no_winner}),
+      else: s
   end
 
   defp ended(%{phase: :committed}, reason), do: {:incomplete, reason}
@@ -543,6 +640,7 @@ defmodule Telelem.Handoff do
       winner: s.winner,
       committed: s.phase == :committed,
       authority: s.authority_state,
+      observer: s.observer_state,
       attempts:
         Map.new(s.attempts, fn {id, a} ->
           {id, %{cleanup: a.cleanup, charge: a.charge, ready: a.ready}}
@@ -574,7 +672,8 @@ defmodule Telelem.Handoff do
 
   defp put(s, id, a), do: %{s | attempts: Map.put(s.attempts, id, a)}
 
-  defp emit(%{authority_state: :lost} = s, ev), do: %{s | unreported: [ev | s.unreported]}
+  defp emit(%{observer_state: :none} = s, _ev), do: s
+  defp emit(%{observer_state: :lost} = s, ev), do: %{s | unreported: [ev | s.unreported]}
 
   defp emit(s, ev) do
     s.on_event.(ev)

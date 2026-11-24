@@ -46,6 +46,7 @@ defmodule Telelem.HandoffTest do
     end
   end
 
+  defp run(:dispatch, h, id), do: Handoff.begin_dispatch(h, id)
   defp run(:ready, h, id), do: Handoff.ready(h, id)
   defp run({:transfer, chunk}, h, _), do: Handoff.transfer(h, chunk)
   defp run({:finish, term}, h, _), do: Handoff.finish(h, term)
@@ -53,7 +54,8 @@ defmodule Telelem.HandoffTest do
   defp run({:clean_stay, charge}, h, id), do: Handoff.cleaned(h, id, charge)
   defp run({:clean_as, other, charge}, h, _), do: Handoff.cleaned(h, other, charge)
 
-  # Requester and authority fakes forward everything to the test.
+  # Requester, authority and observer fakes forward everything to the test.
+  # The authority receives nothing from the handoff; it is only monitored.
   defp forwarder(tag) do
     test = self()
 
@@ -78,7 +80,8 @@ defmodule Telelem.HandoffTest do
   defp start(ids, opts \\ []) do
     req = forwarder(:req)
     auth = forwarder(:auth)
-    base = [requester: req, attempts: ids, authority: auth, trace: self()]
+    obs = forwarder(:obs)
+    base = [requester: req, attempts: ids, authority: auth, observer: obs, trace: self()]
     id = Keyword.get(opts, :child_id, Handoff)
 
     h =
@@ -93,6 +96,7 @@ defmodule Telelem.HandoffTest do
       hmon: Process.monitor(h),
       req: req,
       auth: auth,
+      obs: obs,
       att: Map.new(ids, &{&1, attempt(h, &1)})
     }
   end
@@ -166,7 +170,7 @@ defmodule Telelem.HandoffTest do
                {:outcome, {:done, :stop}},
                {:attempt_closed, ^w, %{cleanup: :ack, charge: :possible}},
                {:closed, ^r}
-             ] = until_closed(:auth)
+             ] = until_closed(:obs)
     end
 
     # ── Kill requester before election ───────────────────────────────────
@@ -197,7 +201,7 @@ defmodule Telelem.HandoffTest do
                {:attempt_closed, ^w, %{cleanup: :ack, charge: :possible}},
                {:attempt_closed, ^l, %{cleanup: :ack, charge: :none}},
                {:closed, r}
-             ] = until_closed(:auth)
+             ] = until_closed(:obs)
 
       assert r.winner == nil and not r.committed
       assert r.possible_charges == [w]
@@ -240,7 +244,7 @@ defmodule Telelem.HandoffTest do
       assert r.attempts[l] == %{cleanup: :ack, charge: :possible, ready: true}
       assert r.possible_charges == [:a, :b]
 
-      ev = until_closed(:auth)
+      ev = until_closed(:obs)
       assert Enum.count(ev, &match?({:attempt_closed, ^w, _}, &1)) == 1
       assert Enum.count(ev, &match?({:attempt_closed, ^l, _}, &1)) == 1
       assert Enum.count(ev, &match?({:elected, _}, &1)) == 1
@@ -248,22 +252,80 @@ defmodule Telelem.HandoffTest do
 
     # ── Kill authority after commit ──────────────────────────────────────
 
-    test "authority killed after #{w} committed: stream completes, no replay, charges stay possible and unreported" do
+    test "authority killed after #{w} committed: stream ends incomplete, winner cancelled, no further transfer or reselection" do
       {w, l} = {@w, @l}
       c = start([:a, :b])
       to_barrier(c, [:a, :b])
 
       assert do!(c, w, :ready) == :release
-      assert do!(c, l, {:clean, :possible}) == :ok
-      assert do!(c, w, {:transfer, "c1"}) == :ok
-
-      # Everything up to commit has been delivered to the old authority.
-      assert_receive {:auth, {:elected, ^w}}, @t
-      assert_receive {:auth, {:attempt_closed, ^l, %{charge: :possible}}}, @t
-      assert_receive {:auth, {:committed, ^w}}, @t
+      assert_receive {:attempt, ^l, :msg, {:cancel, {:lost_to, ^w}}}, @t
+      # l stays parked at the barrier without acknowledging.
+      assert do!(c, w, {:transfer, "tool-fragment"}) == :ok
 
       kill_and_observe(c.auth)
       traced(c, {:authority_down, :committed, :killed})
+
+      reason = {:authority_down, :killed}
+      assert_receive {:attempt, ^w, :msg, {:cancel, ^reason}}, @t
+      assert do!(c, w, {:transfer, "after-fence"}) == {:error, :cancelled}
+      assert do!(c, w, {:finish, :synthetic}) == {:error, :cancelled}
+      assert do!(c, l, :ready) == {:cancel, {:lost_to, w}}
+      assert do!(c, w, {:clean, :none}) == :ok
+      assert do!(c, l, {:clean, :none}) == :ok
+      assert_stopped(c)
+
+      assert [{:elected, ^w}, {:data, "tool-fragment"}, {:incomplete, ^reason}, {:closed, r}] =
+               until_closed(:req)
+
+      # Local cleanup is complete...
+      assert Enum.all?(r.attempts, fn {_, a} -> a.cleanup == :ack end)
+      refute Process.alive?(c.att[w]) or Process.alive?(c.att[l])
+      # ...but nothing is exonerated: both crossed the dispatch boundary.
+      assert r.authority == :lost and r.observer == :up and r.unreported == []
+      assert r.possible_charges == [:a, :b]
+      refute_received {:attempt, _, :ready, :release}
+    end
+
+    test "authority killed after #{w} finished: the valid terminal is not rewritten" do
+      {w, l} = {@w, @l}
+      c = start([:a, :b])
+      to_barrier(c, [:a, :b])
+      assert do!(c, w, :ready) == :release
+      assert do!(c, l, {:clean, :none}) == :ok
+      assert do!(c, w, {:transfer, "c1"}) == :ok
+      assert do!(c, w, {:finish, :end}) == :ok
+
+      kill_and_observe(c.auth)
+      traced(c, {:authority_down, :committed, :killed})
+      assert Handoff.status(c.h).outcome == {:done, :end}
+      # No new permission after the terminal, even for the winner.
+      assert do!(c, w, :attach) == {:cancel, :ended}
+      assert do!(c, w, :dispatch) == {:cancel, :ended}
+      assert do!(c, w, :ready) == {:cancel, :ended}
+      assert do!(c, w, {:clean, :possible}) == :ok
+      assert_stopped(c)
+
+      assert [{:elected, ^w}, {:data, "c1"}, {:done, :end}, {:closed, r}] = until_closed(:req)
+      assert r.outcome == {:done, :end} and r.authority == :lost
+      # l never reached ready or the dispatch boundary.
+      assert r.possible_charges == [w]
+      refute_received {:attempt, ^w, :msg, {:cancel, _}}
+    end
+
+    test "best-effort observer killed after #{w} committed: stream completes, later events unreported" do
+      {w, l} = {@w, @l}
+      c = start([:a, :b])
+      to_barrier(c, [:a, :b])
+      assert do!(c, w, :ready) == :release
+      assert do!(c, l, {:clean, :possible}) == :ok
+      assert do!(c, w, {:transfer, "c1"}) == :ok
+
+      assert_receive {:obs, {:elected, ^w}}, @t
+      assert_receive {:obs, {:attempt_closed, ^l, %{charge: :possible}}}, @t
+      assert_receive {:obs, {:committed, ^w}}, @t
+
+      kill_and_observe(c.obs)
+      traced(c, {:observer_down, :committed, :killed})
 
       assert do!(c, w, {:transfer, "c2"}) == :ok
       assert do!(c, w, {:finish, :end}) == :ok
@@ -273,12 +335,7 @@ defmodule Telelem.HandoffTest do
       assert [{:elected, ^w}, {:data, "c1"}, {:data, "c2"}, {:done, :end}, {:closed, r}] =
                until_closed(:req)
 
-      # Local cleanup is complete...
-      assert Enum.all?(r.attempts, fn {_, a} -> a.cleanup == :ack end)
-      refute Process.alive?(c.att[w]) or Process.alive?(c.att[l])
-      # ...but nothing has been settled: both dispatches may still be billed, and the
-      # winner's close never reached an authority.
-      assert r.authority == :lost
+      assert r.authority == :up and r.observer == :lost
       assert r.possible_charges == [:a, :b]
 
       assert r.unreported == [
@@ -419,16 +476,135 @@ defmodule Telelem.HandoffTest do
     assert Handoff.status(c.h).attempts[:a].charge == :none
   end
 
-  test "requester may not start_link the coordinator" do
+  # ── Dispatch boundary and re-attach ─────────────────────────────────────
+
+  test "an attempt past the dispatch boundary is not exonerated by a :none ack" do
+    c = start([:a, :b])
+    to_barrier(c, [:a, :b])
+    # :a may have sent bytes upstream, then is cancelled before it was ready.
+    assert do!(c, :a, :dispatch) == :ok
+    traced(c, {:dispatch_boundary, :a})
+    assert do!(c, :b, :ready) == :release
+    assert_receive {:attempt, :a, :msg, {:cancel, {:lost_to, :b}}}, @t
+    assert do!(c, :a, {:clean, :none}) == :ok
+    assert Handoff.status(c.h).attempts[:a].charge == :possible
+    assert do!(c, :b, {:finish, :ok}) == :ok
+    assert do!(c, :b, {:clean, :possible}) == :ok
+    assert_stopped(c)
+    assert [{:elected, :b}, {:done, :ok}, {:closed, r}] = until_closed(:req)
+    assert r.possible_charges == [:a, :b]
+  end
+
+  test "a cancelled attempt is refused the dispatch boundary and its :none ack holds" do
+    c = start([:a, :b])
+    to_barrier(c, [:a, :b])
+    assert do!(c, :b, :ready) == :release
+    assert_receive {:attempt, :a, :msg, {:cancel, {:lost_to, :b}}}, @t
+    assert do!(c, :a, :dispatch) == {:cancel, {:lost_to, :b}}
+    assert do!(c, :a, {:clean, :none}) == :ok
+    assert Handoff.status(c.h).attempts[:a].charge == :none
+  end
+
+  test "duplicate attach after cancellation returns the cancellation, not permission" do
+    c = start([:a, :b])
+    to_barrier(c, [:a, :b])
+    assert do!(c, :b, :ready) == :release
+    assert_receive {:attempt, :a, :msg, {:cancel, {:lost_to, :b}}}, @t
+    assert do!(c, :a, :attach) == {:cancel, {:lost_to, :b}}
+    # The winner's own re-attach is still fine.
+    assert do!(c, :b, :attach) == :ok
+    send(c.req, {:do_cancel, c.h, :client_gone})
+    assert_receive {:req, :cancel_result, :ok}, @t
+    assert do!(c, :b, :attach) == {:cancel, :client_gone}
+  end
+
+  # ── Topology ─────────────────────────────────────────────────────────────
+
+  test "linked requester, authority or observer is rejected at start" do
     Process.flag(:trap_exit, true)
+    other = forwarder(:other)
 
-    assert {:error, :requester_must_not_be_parent} =
-             Handoff.start_link(requester: self(), attempts: [:a])
+    for role <- [:requester, :authority, :observer] do
+      opts = [requester: other, attempts: [:a]] |> Keyword.put(role, self())
+      assert {:error, {:linked, ^role}} = Handoff.start_link(opts)
+    end
 
+    # Unlinked start by the requester itself is fine.
     assert {:ok, h} = Handoff.start(requester: self(), attempts: [:a], register_timeout: 10)
     ref = Process.monitor(h)
     assert_receive {:telelem_handoff, ^h, {:failed, :no_winner}}, @t
     assert_receive {:DOWN, ^ref, _, _, :normal}, @t
+  end
+
+  test "the parent cannot attach as an attempt" do
+    test = self()
+    req = forwarder(:req)
+
+    parent =
+      spawn(fn ->
+        {:ok, h} = Handoff.start_link(requester: req, attempts: [:a], register_timeout: 10)
+        send(test, {:attach_result, h, Handoff.attach(h, :a)})
+        receive do: (:never -> :ok)
+      end)
+
+    on_exit(fn -> Process.exit(parent, :kill) end)
+    assert_receive {:attach_result, h, {:error, :linked_to_handoff}}, @t
+    ref = Process.monitor(h)
+    # It stays unregistered and is closed without dispatch permission.
+    assert_receive {:req, {:failed, :no_winner}}, @t
+    assert_receive {:req, {:closed, r}}, @t
+    assert r.attempts[:a].cleanup == :never_registered
+    assert_receive {:DOWN, ^ref, _, _, :normal}, @t
+  end
+
+  for {when_, chunks, expect} <- [
+        {"before commit", [], :failed},
+        {"after commit", ["frag"], :incomplete}
+      ] do
+    @chunks chunks
+    @expect expect
+    # gen_server logs the parent-exit stop; that is expected here.
+    @tag :capture_log
+    test "parent exits mid-stream #{when_}: requester still gets a truthful outcome, attempts are cancelled" do
+      test = self()
+      c = %{req: forwarder(:req), obs: forwarder(:obs)}
+
+      parent =
+        spawn(fn ->
+          {:ok, h} =
+            Handoff.start_link(requester: c.req, observer: c.obs, attempts: [:a, :b], trace: test)
+
+          send(test, {:h, h})
+          receive do: (:never -> :ok)
+        end)
+
+      assert_receive {:h, h}, @t
+      c = Map.merge(c, %{h: h, att: %{a: attempt(h, :a), b: attempt(h, :b)}})
+      to_barrier(c, [:a, :b])
+      assert do!(c, :a, :ready) == :release
+      for chunk <- @chunks, do: assert(do!(c, :a, {:transfer, chunk}) == :ok)
+      assert do!(c, :b, {:clean, :none}) == :ok
+
+      hmon = Process.monitor(h)
+      kill_and_observe(parent)
+      assert_receive {:DOWN, ^hmon, _, _, :killed}, @t
+
+      expect = {@expect, {:handoff_down, :killed}}
+      assert_receive {:attempt, :a, :msg, {:cancel, {:handoff_down, :killed}}}, @t
+      events = for(chunk <- @chunks, do: {:data, chunk})
+      assert until_req_outcome() == [{:elected, :a} | events] ++ [expect]
+      assert_receive {:obs, {:terminated, :killed, [:a]}}, @t
+      refute_received {:req, {:closed, _}}
+    end
+  end
+
+  defp until_req_outcome(acc \\ []) do
+    receive do
+      {:req, {k, _} = ev} when k in [:done, :incomplete, :failed] -> Enum.reverse([ev | acc])
+      {:req, ev} -> until_req_outcome([ev | acc])
+    after
+      @t -> flunk("no outcome after #{inspect(Enum.reverse(acc))}")
+    end
   end
 
   # ── Seeded schedules vs. an independent reference ──────────────────────
@@ -467,9 +643,11 @@ defmodule Telelem.HandoffTest do
       {id, {:transfer, make_ref()}},
       {id, {:finish, :t}},
       {id, {:clean, Enum.random([:none, :possible])}},
+      {id, :dispatch},
       {id, :kill},
       :kill_requester,
       :kill_authority,
+      :kill_observer,
       :requester_cancel
     ])
   end
@@ -478,12 +656,19 @@ defmodule Telelem.HandoffTest do
     c = start(@ids, child_id: {:h, i}, cleanup_timeout: 60_000, register_timeout: 60_000)
 
     m = %{
-      a: Map.new(@ids, &{&1, %{attached: false, ready: false, closed: nil, alive: true}}),
+      a:
+        Map.new(
+          @ids,
+          &{&1, %{attached: false, dispatched: false, ready: false, closed: nil, alive: true}}
+        ),
       releases: [],
       ok_data: [],
       ok_finish: 0,
       req_alive: true,
-      auth_alive: true
+      auth_alive: true,
+      obs_alive: true,
+      # Set once an authority death was observed while the handoff was live.
+      fenced: false
     }
 
     m = Enum.reduce(schedule, m, &step(c, &1, &2))
@@ -511,7 +696,7 @@ defmodule Telelem.HandoffTest do
 
       {cleanup, charge} =
         case a.closed do
-          {:ack, claim} -> {:ack, if(a.ready, do: :possible, else: claim)}
+          {:ack, claim} -> {:ack, if(a.dispatched, do: :possible, else: claim)}
           :killed -> {{:down, :killed}, :possible}
           nil -> {:never_registered, :none}
         end
@@ -523,19 +708,22 @@ defmodule Telelem.HandoffTest do
              "#{id}: #{inspect(r.attempts[id])} model #{inspect(a)}"
     end
 
-    # Requester observations (prefix up to its death) are well formed.
-    req = drain(:req)
+    # Stop every forwarder before draining: messages a process sent before
+    # its :DOWN are already in our mailbox, so nothing leaks into the next
+    # iteration.
+    req = stop_and_drain(c.req, :req)
     check_requester(req, Enum.reverse(m.ok_data))
 
-    # A live authority saw exactly one close per attempt.
-    if m.auth_alive do
-      auth = until_closed(:auth)
+    # A live observer saw exactly one close per attempt.
+    if m.obs_alive do
+      obs = until_closed(:obs)
 
       for id <- @ids,
-          do: assert(Enum.count(auth, &match?({:attempt_closed, ^id, _}, &1)) == 1)
-    else
-      drain(:auth)
+          do: assert(Enum.count(obs, &match?({:attempt_closed, ^id, _}, &1)) == 1)
     end
+
+    stop_and_drain(c.obs, :obs)
+    stop_and_drain(c.auth, :auth)
 
     flush_attempts()
   end
@@ -567,9 +755,19 @@ defmodule Telelem.HandoffTest do
     if m.auth_alive and alive?(c) do
       kill_and_observe(c.auth)
       assert_receive {:telelem_handoff_trace, h, {:authority_down, _, :killed}} when h == c.h, @t
+      %{m | auth_alive: false, fenced: true}
+    else
+      %{m | auth_alive: false}
+    end
+  end
+
+  defp step(c, :kill_observer, m) do
+    if m.obs_alive and alive?(c) do
+      kill_and_observe(c.obs)
+      assert_receive {:telelem_handoff_trace, h, {:observer_down, _, :killed}} when h == c.h, @t
     end
 
-    %{m | auth_alive: false}
+    %{m | obs_alive: false}
   end
 
   defp step(c, :requester_cancel, m) do
@@ -590,15 +788,23 @@ defmodule Telelem.HandoffTest do
     else
       res = do!(c, id, op)
 
+      # After an observed authority death nothing may be released, dispatched or transferred.
+      if m.fenced,
+        do: refute(res == :release or (res == :ok and op_is_progress(op)), inspect({id, op, res}))
+
       case {op, res} do
         {:attach, :ok} ->
           put_in(m.a[id].attached, true)
 
+        {:dispatch, :ok} ->
+          put_in(m.a[id].dispatched, true)
+
         {:ready, :release} ->
-          %{put_in(m.a[id].ready, true) | releases: [id | m.releases]}
+          m = put_in(m.a[id], %{a | ready: true, dispatched: true})
+          %{m | releases: [id | m.releases]}
 
         {:ready, {:cancel, reason}} when reason != :closed ->
-          put_in(m.a[id].ready, true)
+          put_in(m.a[id], %{a | ready: true, dispatched: true})
 
         {{:transfer, chunk}, :ok} ->
           %{m | ok_data: [chunk | m.ok_data]}
@@ -616,9 +822,19 @@ defmodule Telelem.HandoffTest do
     end
   end
 
+  defp op_is_progress(op),
+    do: op in [:attach, :dispatch] or match?({k, _} when k in [:transfer, :finish], op)
+
   # A coordinator that answers a call will also process later signals;
   # Process.alive?/1 can't tell that from one that is already stopping.
   defp alive?(c), do: is_map(Handoff.status(c.h))
+
+  defp stop_and_drain(pid, tag) do
+    mref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^mref, :process, ^pid, _}, @t
+    drain(tag)
+  end
 
   defp drain(tag, acc \\ []) do
     receive do
