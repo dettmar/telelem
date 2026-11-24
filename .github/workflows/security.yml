@@ -1,8 +1,11 @@
 # Security checks for this repository's own files and locked dependencies.
 #
 #   advisories   OSV-Scanner against every tracked mix.lock (Hex) and uv.lock
-#                (PyPI), with a coverage assertion so a skipped or unparsed
-#                lockfile cannot pass silently.
+#                (PyPI), each enumerated from the index, path-validated and
+#                passed explicitly, with a coverage assertion so a skipped or
+#                unparsed lockfile cannot pass silently. Scanner and git
+#                output stays in a runner-temp file; only validated fields
+#                reach the job log.
 #   secrets      gitleaks over the full git history (all fetched refs, every
 #                commit, merge commits diffed against their first parent),
 #                run against an isolated bare copy of the history, not the
@@ -14,9 +17,10 @@
 # no secrets, a read-only GITHUB_TOKEN, and does not persist credentials in the
 # checkout. Nothing is uploaded: no artifacts, no SARIF, no caches. Findings
 # are printed as identifiers only (advisory id / rule id, path, line, commit);
-# secret values are redacted by the scanner and never echoed. gitleaks' own
-# console output stays in a log file on the runner and is never printed; only
-# fixed, validated fields (exit code, counts, sanitized rule/path/line/commit)
+# secret values are redacted by the scanner and never echoed. osv-scanner's
+# and gitleaks' own console output stays in log files on the runner and is
+# never printed; only fixed, validated fields (exit code, counts, validated
+# lockfile path / advisory id / package, sanitized rule/path/line/commit)
 # reach the job log.
 #
 # Repo-local suppressions are deliberately NOT honoured (osv-scanner.toml,
@@ -117,55 +121,65 @@ jobs:
           # bracket ranges such as A-Z can match non-ASCII letters).
           export LC_ALL=C
           osv="$RUNNER_TEMP/tools/osv-scanner"
-          out="$RUNNER_TEMP/osv.json"
+          # Raw git, scanner and formatter output stays here (never printed or
+          # uploaded): parse errors quote lockfile content and paths verbatim.
+          work="$RUNNER_TEMP/osv"
+          mkdir -p "$work"
           # Empty config overrides any repo-local osv-scanner.toml ignore list.
-          empty_cfg="$RUNNER_TEMP/osv-empty.toml"
+          empty_cfg="$work/empty.toml"
           : > "$empty_cfg"
 
-          set +e
-          "$osv" scan source --recursive --all-packages --all-vulns \
-            --config="$empty_cfg" --format=json --output-file="$out" .
-          rc=$?
-          set -e
-          echo "osv-scanner exit code: $rc"
-
-          # 0 = no vulnerabilities, 1 = vulnerabilities found; anything else
-          # (128 no lockfiles, 127 error, network failure, ...) is a tool failure.
-          if [[ $rc -ne 0 && $rc -ne 1 ]]; then
-            echo "::error::osv-scanner failed (exit $rc); not treating as a pass"
+          # 1. Before anything reads a lockfile: enumerate the tracked ones
+          #    from the index (NUL-delimited, into a file, git's exit status
+          #    checked, its stderr kept on the runner), require well-formed,
+          #    NUL-terminated `git ls-files -s` records, and accept only safe
+          #    relative paths. The scanner's own directory walk is not used
+          #    (it honours .gitignore and logs every path it visits); the
+          #    validated paths are passed to it explicitly. No rejected name
+          #    or record is ever echoed.
+          lock_list="$work/lockfiles.nul"
+          if ! git ls-files -z -s -- ':(glob)**/mix.lock' ':(glob)**/uv.lock' \
+              > "$lock_list" 2> "$work/git-ls-files.log"; then
+            echo "::error::git ls-files failed; refusing to report a pass (raw output kept on the runner only)"
             exit 1
           fi
-          jq -e '.results | type == "array"' "$out" > /dev/null
-
-          # Coverage: every tracked lockfile must have been parsed with the same
-          # number of packages as an independent count of its entries. A corrupt
-          # or unsupported lockfile is otherwise skipped with exit 0, and the
-          # scanner's directory walk honours .gitignore, so a tracked but
-          # ignored lockfile would otherwise drop out silently.
-          #
-          # Enumerate tracked lockfiles from the index, NUL-delimited, into a
-          # file (so git's exit status is checked and no name is re-quoted or
-          # split), then require a non-empty, well-formed list that contains
-          # the known lockfiles.
-          lock_list="$RUNNER_TEMP/lockfiles.nul"
-          git ls-files -z -s -- ':(glob)**/mix.lock' ':(glob)**/uv.lock' > "$lock_list"
-          mapfile -d '' -t lock_entries < "$lock_list"
-          if [[ ${#lock_entries[@]} -eq 0 ]]; then
+          if [[ ! -s "$lock_list" ]]; then
             echo "::error::no tracked mix.lock / uv.lock found; refusing to report a pass"
             exit 1
           fi
+          if [[ "$(tail -c 1 "$lock_list" | od -An -tx1 | tr -d ' \n')" != 00 ]]; then
+            echo "::error::git ls-files output is not NUL-terminated; refusing to continue"
+            exit 1
+          fi
+          mapfile -d '' -t lock_entries < "$lock_list"
+          nuls=$(tr -cd '\000' < "$lock_list" | wc -c)
+          if [[ ${#lock_entries[@]} -ne $nuls ]]; then
+            echo "::error::git ls-files output did not split into one record per NUL; refusing to continue"
+            exit 1
+          fi
+          record_re=$'^([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])\t(.+)$'
+          path_re='^(\.?[A-Za-z0-9_][A-Za-z0-9._-]*/)*(mix|uv)\.lock$'
           lockfiles=()
           for entry in "${lock_entries[@]}"; do
-            meta=${entry%%$'\t'*}; f=${entry#*$'\t'}
-            read -r mode _ stage <<< "$meta"
-            if [[ ! "$f" =~ ^[A-Za-z0-9._/-]+$ || "$f" == *..* ]]; then
-              echo "::error::tracked lockfile with an unsupported path name (${#lockfiles[@]} accepted so far); refusing to continue"
+            if [[ ! "$entry" =~ $record_re ]]; then
+              echo "::error::malformed git ls-files record (${#lockfiles[@]} accepted so far); refusing to continue"
+              exit 1
+            fi
+            mode=${BASH_REMATCH[1]}; stage=${BASH_REMATCH[3]}; f=${BASH_REMATCH[4]}
+            if [[ ${#f} -gt 200 || ! "$f" =~ $path_re || "$f" == *..* ]]; then
+              echo "::error::tracked lockfile with an unsupported path name (${#lockfiles[@]} accepted so far; name not printed); refusing to continue"
               exit 1
             fi
             if [[ "$stage" != 0 || ( "$mode" != 100644 && "$mode" != 100755 ) || ! -f "$f" || -L "$f" ]]; then
               echo "::error file=$f::tracked lockfile is not a regular, merged file in the checkout (mode $mode, stage $stage)"
               exit 1
             fi
+            for seen in "${lockfiles[@]}"; do
+              if [[ "$seen" == "$f" ]]; then
+                echo "::error file=$f::lockfile listed twice by git ls-files; refusing to continue"
+                exit 1
+              fi
+            done
             lockfiles+=("$f")
           done
           echo "tracked lockfiles: ${#lockfiles[@]}"
@@ -177,38 +191,177 @@ jobs:
               exit 1
             fi
           done
+
+          # 2. Scan each validated lockfile on its own, so a parse or network
+          #    failure is attributed to a validated path without printing the
+          #    scanner's message. 0 = no vulnerabilities, 1 = vulnerabilities
+          #    found; anything else (127 parse/network error, 128 nothing
+          #    scanned, ...) is a tool failure, never a pass.
           fail=0
+          fmt_args=()
+          i=0
           for f in "${lockfiles[@]}"; do
+            i=$((i + 1))
+            # Independent count of the lockfile's entries, for coverage.
             case "$f" in
-              */mix.lock|mix.lock) want=$(grep -cE '^  "[^"]+": \{' "$f" || true) ;;
-              */uv.lock|uv.lock)   want=$(grep -cxF '[[package]]' "$f" || true) ;;
+              */mix.lock|mix.lock) want=$(grep -cE '^  "[^"]+": \{' -- "$f" 2> /dev/null || true) ;;
+              */uv.lock|uv.lock)   want=$(grep -cxF '[[package]]' -- "$f" 2> /dev/null || true) ;;
               *)                   want=0 ;;
             esac
-            got=$(jq --arg p "$PWD/$f" \
-              '[.results[] | select(.source.path == $p) | .packages | length] | add // 0' "$out")
-            echo "coverage: $f expected=$want scanned=$got"
-            if [[ "$want" -lt 1 || "$got" -ne "$want" ]]; then
-              echo "::error file=$f::lockfile not fully scanned (expected $want packages, scanner saw $got)"
+            [[ "$want" =~ ^[0-9]{1,9}$ ]] || want=0
+            out="$work/scan-$i.json"
+            set +e
+            "$osv" scan source --all-packages --all-vulns --config="$empty_cfg" \
+              --format=json --output-file="$out" --lockfile="$f" \
+              > "$work/scan-$i.log" 2>&1
+            rc=$?
+            set -e
+            echo "osv-scanner exit code: $rc ($f)"
+            if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+              echo "::error file=$f::osv-scanner could not scan this lockfile (exit $rc; raw output kept on the runner only). Check that it parses and that osv.dev is reachable: osv-scanner scan source --lockfile=$f"
               fail=1
+              continue
             fi
+            fmt_args+=("$f" "$want" "$out" "$rc")
           done
-
-          vulns=$(jq '[.results[].packages[] | (.vulnerabilities // []) | length] | add // 0' "$out")
-          echo "vulnerabilities reported: $vulns"
-          if [[ "$vulns" -gt 0 ]]; then
-            jq -r '.results[] | .source.path as $s | .packages[]
-                   | select((.vulnerabilities // []) | length > 0)
-                   | .package as $p | .vulnerabilities[]
-                   | "\(.id)\t\($p.ecosystem)\t\($p.name)@\($p.version)\t\($s)"' "$out" \
-              | sed "s|$PWD/||" | sort -u \
-              | while IFS=$'\t' read -r id eco pkg src; do
-                  echo "::error file=$src::$id affects $eco $pkg (https://osv.dev/$id)"
-                done
-            fail=1
-          elif [[ $rc -ne 0 ]]; then
-            echo "::error::osv-scanner exit $rc but no vulnerabilities in JSON; failing conservatively"
-            fail=1
+          if [[ ${#fmt_args[@]} -eq 0 ]]; then
+            echo "::error::no lockfile was scanned successfully; refusing to report a pass"
+            exit 1
           fi
+
+          # 3. Coverage and findings from the JSON reports. The formatter
+          #    re-validates its arguments, prints only fixed text plus
+          #    validated ASCII fields (lockfile path, counts, advisory id,
+          #    ecosystem, package name and version), and counts any finding
+          #    whose fields fail validation instead of printing it. Any shape
+          #    error yields one fixed line; its stderr (tracebacks) stays on
+          #    the runner, and its stdout is filtered to printable ASCII again.
+          set +e
+          python3 -I -S - "$PWD" "${fmt_args[@]}" > "$work/format.out" 2> "$work/format.log" <<'PY'
+          import json, re, sys
+
+          A = re.ASCII
+          PATH = re.compile(r'(?:\.?[A-Za-z0-9_][A-Za-z0-9._-]*/)*(?:mix|uv)\.lock', A)
+          COUNT = re.compile(r'[0-9]{1,9}', A)
+          VID = re.compile(r'[A-Z][A-Z0-9]{1,15}(?:-[A-Za-z0-9._]{1,40}){1,4}', A)
+          NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', A)
+          VERSION = re.compile(r'[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}', A)
+          LINE = re.compile(r'[\x20-\x7e]{1,600}', A)
+          ECOSYSTEM = {'mix.lock': 'Hex', 'uv.lock': 'PyPI'}
+
+
+          class Shape(Exception):
+              pass
+
+
+          def emit(line):
+              if not LINE.fullmatch(line):
+                  line = '::error::suppressed a status line that failed validation'
+              sys.stdout.write(line + '\n')
+
+
+          def obj(v):
+              if not isinstance(v, dict):
+                  raise Shape()
+              return v
+
+
+          def arr(v):
+              if not isinstance(v, list):
+                  raise Shape()
+              return v
+
+
+          def text(v, rx):
+              return isinstance(v, str) and rx.fullmatch(v) is not None
+
+
+          def main(argv):
+              if len(argv) < 5 or (len(argv) - 1) % 4:
+                  raise Shape()
+              root, rest = argv[0], argv[1:]
+              fail = False
+              findings = set()
+              total = 0
+              unprintable = 0
+              for i in range(0, len(rest), 4):
+                  f, want, report, rc = rest[i:i + 4]
+                  if not (text(f, PATH) and '..' not in f and len(f) <= 200
+                          and text(want, COUNT) and rc in ('0', '1')):
+                      raise Shape()
+                  eco = ECOSYSTEM[f.rsplit('/', 1)[-1]]
+                  with open(report, 'rb') as fh:
+                      data = json.loads(fh.read().decode('utf-8'))
+                  src_want = root + '/' + f
+                  got = 0
+                  here = 0
+                  foreign = 0
+                  for r in arr(obj(data).get('results')):
+                      r = obj(r)
+                      pkgs = arr(r.get('packages'))
+                      ours = obj(r.get('source')).get('path') == src_want
+                      if ours:
+                          got += len(pkgs)
+                      else:
+                          foreign += 1
+                      for p in pkgs:
+                          p = obj(p)
+                          pkg = obj(p.get('package'))
+                          vulns = p.get('vulnerabilities')
+                          for v in arr([] if vulns is None else vulns):
+                              v = obj(v)
+                              here += 1
+                              vid = v.get('id')
+                              name, ver = pkg.get('name'), pkg.get('version')
+                              if (ours and text(vid, VID) and pkg.get('ecosystem') == eco
+                                      and text(name, NAME) and text(ver, VERSION)):
+                                  findings.add((f, vid, eco, name, ver))
+                              else:
+                                  unprintable += 1
+                  total += here
+                  emit('coverage: %s expected=%s scanned=%d' % (f, want, got))
+                  if int(want) < 1 or got != int(want):
+                      emit('::error file=%s::lockfile not fully scanned (expected %s packages, scanner saw %d)' % (f, want, got))
+                      fail = True
+                  if foreign:
+                      emit('::error file=%s::osv-scanner reported %d result(s) for another source; failing' % (f, foreign))
+                      fail = True
+                  if rc == '1' and here == 0:
+                      emit('::error file=%s::osv-scanner exit 1 but no vulnerabilities in its JSON; failing conservatively' % f)
+                      fail = True
+              emit('vulnerabilities reported: %d' % total)
+              for f, vid, eco, name, ver in sorted(findings):
+                  emit('::error file=%s::%s affects %s %s@%s (https://osv.dev/vulnerability/%s)' % (f, vid, eco, name, ver, vid))
+              if unprintable:
+                  emit('::error::%d finding(s) had fields that failed validation and are not printed (raw JSON kept on the runner only)' % unprintable)
+              if total:
+                  emit('::error::%d vulnerability finding(s) in locked dependencies: upgrade the affected packages and re-lock, or record a reviewed exception in .github/workflows/security.yml' % total)
+                  fail = True
+              return 1 if fail else 0
+
+
+          try:
+              code = main(sys.argv[1:])
+          except BaseException:
+              try:
+                  emit('::error::osv-scanner JSON report missing or not in the expected shape; failing (raw output kept on the runner only)')
+              except BaseException:
+                  pass
+              code = 2
+          try:
+              sys.stdout.flush()
+          except BaseException:
+              code = 2
+          sys.exit(code)
+          PY
+          prc=$?
+          set -e
+          grep -E '^[ -~]{1,600}$' "$work/format.out" || true
+          case "$prc" in
+            0) ;;
+            1) fail=1 ;;
+            *) echo "::error::advisory formatter failed (exit $prc; raw output kept on the runner only)"; fail=1 ;;
+          esac
           exit $fail
 
   secrets:
