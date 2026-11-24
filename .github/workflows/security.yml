@@ -1,0 +1,286 @@
+# Security checks for this repository's own files and locked dependencies.
+#
+#   advisories   OSV-Scanner against every tracked mix.lock (Hex) and uv.lock
+#                (PyPI), with a coverage assertion so a skipped or unparsed
+#                lockfile cannot pass silently.
+#   secrets      gitleaks over the full git history (all fetched refs).
+#   workflows    zizmor static audit of .github/workflows (offline).
+#
+# Fork-safe: runs on `pull_request` only (never `pull_request_target`), uses
+# no secrets, a read-only GITHUB_TOKEN, and does not persist credentials in the
+# checkout. Nothing is uploaded: no artifacts, no SARIF, no caches. Findings
+# are printed as identifiers only (advisory id / rule id, path, line, commit);
+# secret values are redacted by the scanner and never echoed.
+#
+# Repo-local suppressions are deliberately NOT honoured (osv-scanner.toml,
+# .gitleaks.toml, .gitleaksignore, gitleaks:allow, zizmor config and ignore
+# comments), so a pull request cannot silence its own findings. An accepted
+# exception has to be made here, in this reviewed file.
+#
+# Tools are fetched as release binaries and checked against SHA-256 digests
+# pinned below (taken from each upstream release's checksum file / GitHub
+# release asset digest). Bump version and digest together.
+#
+# Callers (e.g. release.yml):
+#   jobs:
+#     security:
+#       uses: ./.github/workflows/security.yml
+#       permissions:
+#         contents: read
+#       with:
+#         ref: <full commit SHA>   # optional; empty = the triggering ref
+# Under workflow_call the secrets job scans every ref the checkout fetched
+# (branches and tags), plus the given commit.
+
+name: security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, so newly published advisories against unchanged lockfiles surface.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Full commit SHA to scan (release.yml passes the validated tag commit); empty = the triggering ref
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  # github.workflow is the caller's name under workflow_call, so this never
+  # shares a group with the caller (release) or with ci.yml.
+  group: security-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OSV_SCANNER_VERSION: "2.7.1"
+  OSV_SCANNER_SHA256: "fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8" # osv-scanner_linux_amd64
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" # gitleaks_8.30.1_linux_x64.tar.gz
+  ZIZMOR_VERSION: "1.32.0"
+  ZIZMOR_SHA256: "bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b" # zizmor-x86_64-unknown-linux-gnu.tar.gz
+
+jobs:
+  advisories:
+    name: dependency advisories (OSV, Hex + PyPI lockfiles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate ref input
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::ref must be empty or a full 40-hex commit SHA"; exit 1; }
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install osv-scanner (pinned, sha256-verified)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$tools/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $tools/osv-scanner" | sha256sum --check --strict
+          chmod 0755 "$tools/osv-scanner"
+          "$tools/osv-scanner" --version
+
+      - name: Scan lockfiles and assert coverage
+        run: |
+          osv="$RUNNER_TEMP/tools/osv-scanner"
+          out="$RUNNER_TEMP/osv.json"
+          # Empty config overrides any repo-local osv-scanner.toml ignore list.
+          empty_cfg="$RUNNER_TEMP/osv-empty.toml"
+          : > "$empty_cfg"
+
+          set +e
+          "$osv" scan source --recursive --all-packages --all-vulns \
+            --config="$empty_cfg" --format=json --output-file="$out" .
+          rc=$?
+          set -e
+          echo "osv-scanner exit code: $rc"
+
+          # 0 = no vulnerabilities, 1 = vulnerabilities found; anything else
+          # (128 no lockfiles, 127 error, network failure, ...) is a tool failure.
+          if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+            echo "::error::osv-scanner failed (exit $rc); not treating as a pass"
+            exit 1
+          fi
+          jq -e '.results | type == "array"' "$out" > /dev/null
+
+          # Coverage: every tracked lockfile must have been parsed with the same
+          # number of packages as an independent count of its entries. A corrupt
+          # or unsupported lockfile is otherwise skipped with exit 0.
+          for required in mix.lock fixtures/wire/uv.lock; do
+            git ls-files --error-unmatch -- "$required" > /dev/null
+          done
+          fail=0
+          while IFS= read -r f; do
+            case "$f" in
+              */mix.lock|mix.lock) want=$(grep -cE '^  "[^"]+": \{' "$f" || true) ;;
+              */uv.lock|uv.lock)   want=$(grep -cxF '[[package]]' "$f" || true) ;;
+              *)                   want=0 ;;
+            esac
+            got=$(jq --arg p "$PWD/$f" \
+              '[.results[] | select(.source.path == $p) | .packages | length] | add // 0' "$out")
+            echo "coverage: $f expected=$want scanned=$got"
+            if [[ "$want" -lt 1 || "$got" -ne "$want" ]]; then
+              echo "::error file=$f::lockfile not fully scanned (expected $want packages, scanner saw $got)"
+              fail=1
+            fi
+          done < <(git ls-files -- ':(glob)**/mix.lock' ':(glob)**/uv.lock')
+
+          vulns=$(jq '[.results[].packages[] | (.vulnerabilities // []) | length] | add // 0' "$out")
+          echo "vulnerabilities reported: $vulns"
+          if [[ "$vulns" -gt 0 ]]; then
+            jq -r '.results[] | .source.path as $s | .packages[]
+                   | select((.vulnerabilities // []) | length > 0)
+                   | .package as $p | .vulnerabilities[]
+                   | "\(.id)\t\($p.ecosystem)\t\($p.name)@\($p.version)\t\($s)"' "$out" \
+              | sed "s|$PWD/||" | sort -u \
+              | while IFS=$'\t' read -r id eco pkg src; do
+                  echo "::error file=$src::$id affects $eco $pkg (https://osv.dev/$id)"
+                done
+            fail=1
+          elif [[ $rc -ne 0 ]]; then
+            echo "::error::osv-scanner exit $rc but no vulnerabilities in JSON; failing conservatively"
+            fail=1
+          fi
+          exit $fail
+
+  secrets:
+    name: secret scan (gitleaks, full history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate ref input
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::ref must be empty or a full 40-hex commit SHA"; exit 1; }
+
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, sha256-verified)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          tarball="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $tarball" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$tools" gitleaks
+          "$tools/gitleaks" version
+
+      - name: Scan all commits
+        run: |
+          # Fail closed if the checkout is not the full history.
+          if [[ "$(git rev-parse --is-shallow-repository)" != "false" ]]; then
+            echo "::error::checkout is shallow; refusing to report a full-history pass"
+            exit 1
+          fi
+          echo "commits reachable from fetched refs: $(git rev-list --all --count)"
+
+          # Built-in default rules only; repo-local .gitleaks.toml,
+          # .gitleaksignore and gitleaks:allow comments are not honoured.
+          cfg="$RUNNER_TEMP/gitleaks.toml"
+          printf '[extend]\nuseDefault = true\n' > "$cfg"
+          ignore="$RUNNER_TEMP/gitleaksignore"
+          : > "$ignore"
+          report="$RUNNER_TEMP/gitleaks.json"   # stays on the runner; never uploaded
+
+          set +e
+          "$RUNNER_TEMP/tools/gitleaks" git \
+            --no-banner --no-color --redact=100 --exit-code=1 \
+            --config="$cfg" --gitleaks-ignore-path="$ignore" --ignore-gitleaks-allow \
+            --log-opts="--all" \
+            --report-format=json --report-path="$report" \
+            .
+          rc=$?
+          set -e
+          echo "gitleaks exit code: $rc"
+
+          if ! jq -e 'type == "array"' "$report" > /dev/null 2>&1; then
+            echo "::error::gitleaks produced no valid report (exit $rc); not treating as a pass"
+            exit 1
+          fi
+          n=$(jq 'length' "$report")
+          if [[ "$n" -gt 0 ]]; then
+            # Identifiers only: never print Secret, Match or Line.
+            jq -r '.[] | "\(.RuleID)\t\(.File)\t\(.StartLine)\t\(.Commit[0:12])"' "$report" \
+              | while IFS=$'\t' read -r rule file line commit; do
+                  echo "::error file=$file,line=$line::gitleaks rule $rule in commit $commit (value redacted)"
+                done
+            echo "::error::$n potential secret(s) in history. Rotate first if real; history rewrite needs an explicit decision."
+            exit 1
+          fi
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::gitleaks exit $rc with an empty report; failing conservatively"
+            exit 1
+          fi
+
+  workflows:
+    name: workflow audit (zizmor, offline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate ref input
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::ref must be empty or a full 40-hex commit SHA"; exit 1; }
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install zizmor (pinned, sha256-verified)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          tarball="$RUNNER_TEMP/zizmor.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$tarball" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  $tarball" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$tools" zizmor
+          "$tools/zizmor" --version
+
+      - name: Audit workflows
+        run: |
+          # Offline (no token use); no repo-local config or ignore comments.
+          "$RUNNER_TEMP/tools/zizmor" --offline --no-config --no-ignores \
+            --strict-collection --persona=regular --no-progress --color=never \
+            --format=github .github/workflows
