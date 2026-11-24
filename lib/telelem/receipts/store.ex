@@ -2,35 +2,55 @@ defmodule Telelem.Receipts.Store do
   @moduledoc """
   Standalone, bounded, payload-free evidence store (M2a contract §2).
 
-  Not wired into serving. Producers get a `Telelem.Receipts.Producer` via
-  `producer/1` and call `Producer.record/2`, which validates, admits against
-  the shared pending bound **before** the asynchronous `send/2`, and never
-  waits on this process (see `Telelem.Receipts.Producer`).
+  Not wired into serving. A coordinator gets the shared handle with
+  `producer/1` and opens one `Telelem.Receipts.Writer` per request; each
+  accepted record is published by **one** atomic `:ets.insert_new/2` into a
+  fixed-key pending table owned by this process (see
+  `Telelem.Receipts.Producer`). There is no event mailbox: the store empties
+  pending slots with `:ets.take/2` on a periodic sweep (`sweep_ms`) and before
+  every `lookup/3` and `stats/1`, so a read sees every record whose
+  publication completed before the read was issued.
 
   ## Limits (options, contract defaults)
 
-    * `max_pending: 256` – admitted, not yet processed event messages
-    * `max_retained: 1024` – retained events; the oldest event (by arrival)
-      is evicted first and counted as loss for its receipt
+    * `max_pending: 256` – pending slots (hard bound on unswept records)
+    * `max_retained: 1024` – retained records; the oldest published record is
+      evicted first and counted as loss for its receipt
     * `max_event_bytes: 512` – canonical encoding per event
     * `loss_slots: 1024` – fixed number of per-receipt loss flags
+    * `sweep_ms: 10` – pending sweep interval
 
-  These bound event storage, not VM allocation.
+  These bound event storage, not VM or process memory (records, the per-
+  request index and the receipt built for a reply are ordinary heap data).
+
+  The required option `mode: :sandbox | :serving` is the store's binding
+  mode; readers must have the same mode.
 
   ## Reads
 
-  `lookup/3` takes the **authenticated principal** (any map or struct with
-  a valid `tenant_id`, e.g. a §3 `Principal`) and a request id. Only the
-  exact `{principal.tenant_id, request_id}` key is read. Another tenant's
-  request and a request with no retained evidence both return
-  `{:error, :not_found}`; that result is never evidence of success. A
-  principal without a valid tenant id gets `{:error, :denied}`. The tenant is
-  never taken from event or request data. Before answering, the store
-  processes up to `max_pending` already-delivered event messages so a read
-  sees events that were admitted before it.
+  `lookup/3` takes an **already authenticated** principal (§3 shape:
+  `tenant_id`, `subject_id`, `mode`, `permissions`); authentication itself
+  happens outside the store, which only checks the shape it is handed. It
+  requires valid ids, `mode` equal to the store mode, and `:receipt_read` in
+  `permissions` (a `MapSet` or list); otherwise
+  `{:error, {:denied, :unauthenticated | :mode_mismatch | :missing_permission}}`,
+  decided before any data is touched. Only the exact
+  `{principal.tenant_id, request_id}` key is read: another tenant's request
+  and a request with no retained evidence both return `{:error, :not_found}`,
+  which is never evidence of success. Completeness rules are in
+  `Telelem.Receipts.Receipt`.
 
-  Completeness rules are in `Telelem.Receipts.Receipt`. They assume every
-  event of a request is emitted after that request's ingress event.
+  ## Not durable
+
+  Pending and retained evidence live in this process (its ETS table and
+  state) and are lost when it exits. After that, writers get
+  `{:dropped, :store_down}` and the loss counters in the shared `:atomics`
+  array remain readable through `Producer.stats/1`. A restarted store is a new
+  store with new handles and no memory of earlier receipts.
+
+  The pending table is `:public` so writers can insert without a message;
+  code holding the handle is trusted in-VM code. The store still re-validates
+  every row it takes and discards (and counts as `rejected`) malformed ones.
 
   The store does not log. `format_status/1` reduces the state to counts.
   """
@@ -38,7 +58,14 @@ defmodule Telelem.Receipts.Store do
 
   alias Telelem.Receipts.{Event, Producer, Receipt}
 
-  @defaults [max_pending: 256, max_retained: 1024, max_event_bytes: 512, loss_slots: 1024]
+  @defaults [
+    max_pending: 256,
+    max_retained: 1024,
+    max_event_bytes: 512,
+    loss_slots: 1024,
+    sweep_ms: 10
+  ]
+  @modes [:sandbox, :serving]
 
   # -- API -------------------------------------------------------------------
 
@@ -47,16 +74,18 @@ defmodule Telelem.Receipts.Store do
     GenServer.start_link(__MODULE__, opts, gen_opts)
   end
 
-  @doc "Producer handle for non-blocking `Producer.record/2`."
+  @doc "Shared publication handle; pass it to `Telelem.Receipts.Writer.open/3`."
   @spec producer(GenServer.server()) :: Producer.t()
   def producer(store), do: GenServer.call(store, :producer)
 
+  @type denied :: {:denied, :unauthenticated | :mode_mismatch | :missing_permission}
+
   @spec lookup(GenServer.server(), term(), term()) ::
-          {:ok, Receipt.t()} | {:error, :not_found | :denied}
+          {:ok, Receipt.t()} | {:error, :not_found | denied()}
   def lookup(store, principal, request_id),
     do: GenServer.call(store, {:lookup, principal, request_id})
 
-  @doc "Loss counters plus retained counts and limits."
+  @doc "Loss counters plus pending/retained counts and limits."
   @spec stats(GenServer.server()) :: map()
   def stats(store), do: GenServer.call(store, :stats)
 
@@ -64,6 +93,11 @@ defmodule Telelem.Receipts.Store do
 
   @impl true
   def init(opts) do
+    {mode, opts} = Keyword.pop(opts, :mode)
+
+    unless mode in @modes,
+      do: raise(ArgumentError, "receipts store requires mode: :sandbox | :serving")
+
     opts = Keyword.merge(@defaults, opts)
 
     for {k, v} <- opts do
@@ -71,23 +105,29 @@ defmodule Telelem.Receipts.Store do
         do: raise(ArgumentError, "invalid receipts store option #{inspect(k)}")
     end
 
+    table = :ets.new(__MODULE__, [:set, :public, write_concurrency: true])
+
     producer = %Producer{
-      pid: self(),
-      token: make_ref(),
+      table: table,
       ref: :atomics.new(Producer.counters_size(opts[:loss_slots]), signed: true),
       max_pending: opts[:max_pending],
       max_event_bytes: opts[:max_event_bytes],
       loss_slots: opts[:loss_slots]
     }
 
+    schedule(opts[:sweep_ms])
+
     {:ok,
      %{
+       mode: mode,
        producer: producer,
+       sweep_ms: opts[:sweep_ms],
        max_retained: opts[:max_retained],
        retained: 0,
-       # one key per retained event, oldest first
-       order: :queue.new(),
-       # key => %{events: :queue, ingress_epoch: integer | nil, evicted?: boolean}
+       # {stamp, key} per retained record, oldest published first
+       order: :gb_sets.new(),
+       # key => %{records: %{stamp => {seq, dropped_before, event}},
+       #          owner: pid, writer_conflict?: boolean, evicted?: boolean}
        by_key: %{}
      }}
   end
@@ -96,19 +136,21 @@ defmodule Telelem.Receipts.Store do
   def handle_call(:producer, _from, s), do: {:reply, s.producer, s}
 
   def handle_call(:stats, _from, s) do
-    s = drain(s)
+    s = sweep(s)
+    p = s.producer
 
     stats =
-      s.producer
+      p
       |> Producer.stats()
       |> Map.merge(%{
+        pending: :ets.info(p.table, :size),
         retained: s.retained,
         receipts: map_size(s.by_key),
         limits: %{
-          max_pending: s.producer.max_pending,
+          max_pending: p.max_pending,
           max_retained: s.max_retained,
-          max_event_bytes: s.producer.max_event_bytes,
-          loss_slots: s.producer.loss_slots
+          max_event_bytes: p.max_event_bytes,
+          loss_slots: p.loss_slots
         }
       })
 
@@ -116,29 +158,22 @@ defmodule Telelem.Receipts.Store do
   end
 
   def handle_call({:lookup, principal, request_id}, _from, s) do
-    case principal do
-      %{tenant_id: tenant} when is_binary(tenant) ->
-        if Event.valid_id?(tenant) do
-          s = drain(s)
-          {:reply, read(s, {tenant, request_id}), s}
-        else
-          {:reply, {:error, :denied}, s}
-        end
+    case authorize(principal, s.mode) do
+      {:ok, tenant} ->
+        s = sweep(s)
+        {:reply, read(s, {tenant, request_id}), s}
 
-      _ ->
-        {:reply, {:error, :denied}, s}
+      denied ->
+        {:reply, {:error, denied}, s}
     end
   end
 
   @impl true
-  def handle_info(
-        {:telelem_receipt_event, token, epoch, event},
-        %{producer: %{token: token}} = s
-      ),
-      do: {:noreply, ingest(s, epoch, event)}
+  def handle_info(:sweep, s) do
+    schedule(s.sweep_ms)
+    {:noreply, sweep(s)}
+  end
 
-  # Anything else (including forged event messages without our token) is
-  # ignored without touching the pending counter.
   def handle_info(_msg, s), do: {:noreply, s}
 
   @impl true
@@ -151,54 +186,91 @@ defmodule Telelem.Receipts.Store do
 
   # -- Internals -------------------------------------------------------------
 
-  defp drain(s), do: drain(s, s.producer.max_pending)
+  defp schedule(ms), do: Process.send_after(self(), :sweep, ms)
 
-  defp drain(s, 0), do: s
+  defp authorize(
+         %{tenant_id: tenant, subject_id: subject, mode: mode, permissions: perms},
+         store_mode
+       ) do
+    cond do
+      not (Event.valid_id?(tenant) and Event.valid_id?(subject) and mode in @modes) ->
+        {:denied, :unauthenticated}
 
-  defp drain(%{producer: %{token: token}} = s, n) do
-    receive do
-      {:telelem_receipt_event, ^token, epoch, event} -> s |> ingest(epoch, event) |> drain(n - 1)
-    after
-      0 -> s
+      mode != store_mode ->
+        {:denied, :mode_mismatch}
+
+      not permitted?(perms) ->
+        {:denied, :missing_permission}
+
+      true ->
+        {:ok, tenant}
     end
   end
 
-  defp ingest(%{producer: p} = s, epoch, event) do
-    s =
-      case Event.new(event) do
-        {:ok, event} ->
-          s |> retain(epoch, event) |> evict()
+  defp authorize(_, _), do: {:denied, :unauthenticated}
 
-        {:error, _} ->
-          # Unreachable through Producer.record/2; never retain regardless.
-          :atomics.add(p.ref, Producer.ix(:rejected), 1)
-          :atomics.add(p.ref, Producer.ix(:unattributed), 1)
-          s
-      end
+  defp permitted?(%MapSet{} = perms), do: MapSet.member?(perms, :receipt_read)
+  defp permitted?(perms) when is_list(perms), do: :receipt_read in perms
+  defp permitted?(_), do: false
 
-    # Release the admission slot only after the event is fully processed.
-    :atomics.sub(p.ref, Producer.ix(:pending), 1)
+  # Take every occupied slot, then ingest in publication-stamp order (slot
+  # order is meaningless). Reads order by sequence, not by this order.
+  defp sweep(%{producer: p} = s) do
+    if :ets.info(p.table, :size) == 0 do
+      s
+    else
+      1..p.max_pending
+      |> Enum.flat_map(&:ets.take(p.table, &1))
+      |> Enum.sort_by(&elem(&1, 1))
+      |> Enum.reduce(s, &ingest(&2, &1))
+      |> evict()
+    end
+  end
+
+  defp ingest(s, {_slot, stamp, {_, _} = key, owner, seq, dropped, event} = _row)
+       when is_integer(stamp) and is_pid(owner) and is_integer(seq) and seq > 0 and
+              is_integer(dropped) and dropped >= 0 do
+    case Event.new(event) do
+      {:ok, %Event{tenant_id: t, request_id: r} = e} when {t, r} == key ->
+        if :gb_sets.is_member({stamp, key}, s.order),
+          do: discard(s, key),
+          else: retain(s, stamp, key, owner, {seq, dropped, e})
+
+      _ ->
+        discard(s, key)
+    end
+  end
+
+  # Only reachable by writing to the public table without a Writer.
+  defp ingest(s, row), do: discard(s, if(tuple_size(row) >= 3, do: elem(row, 2)))
+
+  defp discard(%{producer: p} = s, key) do
+    Producer.count(p, :rejected)
+
+    case key do
+      {t, r} -> if Event.valid_id?(t) and Event.valid_id?(r), do: Producer.mark_lost(p, key)
+      _ -> :ok
+    end
+
     s
   end
 
-  defp retain(s, epoch, %Event{} = e) do
-    key = {e.tenant_id, e.request_id}
-    entry = Map.get(s.by_key, key, %{events: :queue.new(), ingress_epoch: nil, evicted?: false})
+  defp retain(s, stamp, key, owner, record) do
+    entry =
+      case Map.fetch(s.by_key, key) do
+        {:ok, entry} ->
+          %{entry | writer_conflict?: entry.writer_conflict? or entry.owner != owner}
 
-    entry = %{
-      entry
-      | events: :queue.in(e, entry.events),
-        ingress_epoch:
-          if(e.kind == :ingress and entry.ingress_epoch == nil,
-            do: epoch,
-            else: entry.ingress_epoch
-          )
-    }
+        :error ->
+          %{records: %{}, owner: owner, writer_conflict?: false, evicted?: false}
+      end
+
+    entry = %{entry | records: Map.put(entry.records, stamp, record)}
 
     %{
       s
       | by_key: Map.put(s.by_key, key, entry),
-        order: :queue.in(key, s.order),
+        order: :gb_sets.add({stamp, key}, s.order),
         retained: s.retained + 1
     }
   end
@@ -206,17 +278,17 @@ defmodule Telelem.Receipts.Store do
   defp evict(%{retained: n, max_retained: max} = s) when n <= max, do: s
 
   defp evict(%{producer: p} = s) do
-    {{:value, key}, order} = :queue.out(s.order)
+    {{stamp, key}, order} = :gb_sets.take_smallest(s.order)
     entry = Map.fetch!(s.by_key, key)
-    {{:value, _oldest}, events} = :queue.out(entry.events)
+    records = Map.delete(entry.records, stamp)
 
-    :atomics.add(p.ref, Producer.ix(:evicted), 1)
+    Producer.count(p, :evicted)
     Producer.mark_lost(p, key)
 
     by_key =
-      if :queue.is_empty(events),
+      if records == %{},
         do: Map.delete(s.by_key, key),
-        else: Map.put(s.by_key, key, %{entry | events: events, evicted?: true})
+        else: Map.put(s.by_key, key, %{entry | records: records, evicted?: true})
 
     evict(%{s | order: order, by_key: by_key, retained: s.retained - 1})
   end
@@ -227,11 +299,13 @@ defmodule Telelem.Receipts.Store do
         ctx = %{
           lost?: Producer.lost?(s.producer, key),
           evicted?: entry.evicted?,
-          ingress_epoch: entry.ingress_epoch,
-          unattributed_now: :atomics.get(s.producer.ref, Producer.ix(:unattributed))
+          writer_conflict?: entry.writer_conflict?
         }
 
-        {:ok, Receipt.derive(key, :queue.to_list(entry.events), ctx)}
+        # Publication-stamp order first, so equal sequence numbers keep a
+        # deterministic order; `derive/3` then orders by sequence.
+        records = entry.records |> Enum.sort() |> Enum.map(&elem(&1, 1))
+        {:ok, Receipt.derive(key, records, ctx)}
 
       :error ->
         {:error, :not_found}
