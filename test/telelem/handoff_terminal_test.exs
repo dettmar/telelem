@@ -24,9 +24,12 @@ defmodule Telelem.HandoffTerminalTest do
       grant is stale; coordinator wedged past deadline + grace → the winner
       kills it and gets `:unconfirmed`, and the queued grant never releases.
     * P5b finish/4 with `deadline:`: a coordinator that never sends the
-      initial reply, or replies late and then goes silent, is fenced at one
-      absolute deadline + grace across both waits; legacy finish/3 keeps its
-      5s initial-reply wait.
+      initial reply is fenced at deadline + grace, not the 5s call timeout;
+      a genuine `{:pending, d}` reply the caller only consumes after d (but
+      before d + grace) does not restart the grace: fenced at d + grace, not
+      at consumption + grace. Controls on the same schedules: legacy finish/3
+      keeps its 5s initial-reply wait and restarts the grace from the late
+      reply.
     * P6 write result pending at the deadline (requester alive, silent) →
       `{:incomplete, {:terminal_unconfirmed, :deadline}}`, never done.
     * P7 nil/empty marker; legacy fence-only fakes cannot be terminal
@@ -118,9 +121,14 @@ defmodule Telelem.HandoffTerminalTest do
 
   defp wait_q(p, n, until \\ System.monotonic_time(:millisecond) + 5_000) do
     cond do
-      elem(Process.info(p, :message_queue_len), 1) >= n -> :ok
-      System.monotonic_time(:millisecond) > until -> flunk("queue of #{inspect(p)} never reached #{n}")
-      true -> wait_q(p, n, until)
+      elem(Process.info(p, :message_queue_len), 1) >= n ->
+        :ok
+
+      System.monotonic_time(:millisecond) > until ->
+        flunk("queue of #{inspect(p)} never reached #{n}")
+
+      true ->
+        wait_q(p, n, until)
     end
   end
 
@@ -272,7 +280,8 @@ defmodule Telelem.HandoffTerminalTest do
 
   # ── P4/P5: deadline on the pending grant, no late side effect ──
 
-  test "P4 grant still pending at the deadline: refused; the grant that arrives later is stale", ctx do
+  test "P4 grant still pending at the deadline: refused; the grant that arrives later is stale",
+       ctx do
     c = start(ctx, terminal_deadline: in_ms(300))
     finish_with_authority_suspended(c)
     assert_receive {:res, :a, {:error, :cancelled}}, 2_000
@@ -338,27 +347,92 @@ defmodule Telelem.HandoffTerminalTest do
     assert marker_msgs(drain(:req)) == []
   end
 
-  test "P5b late initial reply then silence: the decision wait shares the same absolute bound",
-       ctx do
-    d = in_ms(700)
-    c = start(ctx, terminal_deadline: d)
+  # The two-phase schedule shared by the timed test and its legacy control.
+  # The coordinator genuinely replies {:pending, d} before d (grant request
+  # stuck at the suspended authority) and then wedges before its deadline
+  # timer can act. The caller is suspended with that reply already in its
+  # mailbox and resumed only at r, after d but before d + grace, so it
+  # consumes the reply (ends phase one) at or after r. Returns {r, actor}.
+  # Synchronization is by mailbox contents, not timing; the only sleep is the
+  # wait for the absolute instant r, by design.
+  @late_by 500
+
+  defp pending_reply_consumed_after_deadline(c, d, finish_fun) do
     h = c.h
+    a = c.p.a
     :sys.suspend(c.auth)
     :sys.suspend(h)
-    timed_finish(c, d)
+    run(a, finish_fun)
+    # The finish call is queued at the wedged coordinator; the caller waits.
     wait_q(h, 1)
-    # Phase one consumes most of the time before the deadline...
-    Process.sleep(max(d - 250 - System.monotonic_time(:millisecond), 0))
+    true = :erlang.suspend_process(a)
     :sys.resume(h)
-    # ...then the coordinator replies {:pending, d} (grant request stuck at
-    # the suspended authority) and wedges before its deadline timer fires.
     assert_receive {:telelem_handoff_trace, ^h, {:terminal_requested, :a}}, @t
+    # Synchronous: returns after the coordinator finished the finish call.
     :sys.suspend(h)
-    assert System.monotonic_time(:millisecond) < d
+    wait_msg(a, &match?({_, {:pending, ^d}}, &1))
+    assert System.monotonic_time(:millisecond) < d, "pending reply not queued before d"
+
+    Process.sleep(max(d + @late_by - System.monotonic_time(:millisecond), 0))
+    r = System.monotonic_time(:millisecond)
+    true = :erlang.resume_process(a)
+    assert r > d and r < d + @grace
+    r
+  end
+
+  defp wait_msg(p, pred, until \\ System.monotonic_time(:millisecond) + 5_000) do
+    {:messages, msgs} = Process.info(p, :messages)
+
+    cond do
+      Enum.any?(msgs, pred) ->
+        :ok
+
+      System.monotonic_time(:millisecond) > until ->
+        flunk("no expected message in #{inspect(msgs)}")
+
+      true ->
+        wait_msg(p, pred, until)
+    end
+  end
+
+  test "P5b pending reply consumed after d but before d + grace: finish/4 does not restart the grace",
+       ctx do
+    d = in_ms(400)
+    c = start(ctx, terminal_deadline: d)
+    h = c.h
+
+    r =
+      pending_reply_consumed_after_deadline(c, d, fn ->
+        res = Handoff.finish(h, {:upstream_done, "stop"}, @marker, deadline: d)
+        {res, System.monotonic_time(:millisecond)}
+      end)
 
     assert_receive {:res, :a, {{:error, :unconfirmed}, t}}, 3_000
+    # Fenced at the absolute bound...
     assert t >= d + @grace
-    assert t < d + @grace + 500
+    # ...not at (reply consumed) + grace, which is >= r + grace.
+    assert t < r + @grace, "grace restarted: t=#{t - d}ms after d, reply consumed at #{r - d}ms"
+    assert_receive {:DOWN, ref, :process, ^h, :killed} when ref == c.hm, @t
+    :sys.resume(c.auth)
+    assert marker_msgs(drain(:req)) == []
+  end
+
+  test "P5b control: on the same schedule legacy finish/3 restarts the grace from the late reply",
+       ctx do
+    d = in_ms(400)
+    c = start(ctx, terminal_deadline: d)
+    h = c.h
+
+    r =
+      pending_reply_consumed_after_deadline(c, d, fn ->
+        res = Handoff.finish(h, {:upstream_done, "stop"}, @marker)
+        {res, System.monotonic_time(:millisecond)}
+      end)
+
+    assert_receive {:res, :a, {{:error, :unconfirmed}, t}}, 3_000
+    # Legacy (unchanged): max(reported deadline, arrival) + grace. This is the
+    # behavior the timed test above must not show.
+    assert t >= r + @grace
     assert_receive {:DOWN, ref, :process, ^h, :killed} when ref == c.hm, @t
     :sys.resume(c.auth)
     assert marker_msgs(drain(:req)) == []
@@ -529,7 +603,8 @@ defmodule Telelem.HandoffTerminalTest do
 
   # ── P7: marker and interface validation ──
 
-  test "P7 nil or empty marker is rejected in admission and ack modes; nothing is requested", ctx do
+  test "P7 nil or empty marker is rejected in admission and ack modes; nothing is requested",
+       ctx do
     for opts <- [[], [terminal_ack: true]] do
       c = start(ctx, opts)
       assert run!(c, :a, fn -> Handoff.finish(c.h, :t, nil) end) == {:error, :invalid_marker}

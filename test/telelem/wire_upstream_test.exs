@@ -91,7 +91,7 @@ defmodule Telelem.WireUpstreamTest do
     cleanup_timeout_ms: 300
   ]
 
-  defp start(ctx, limits_kw \\ @small, lane_kw \\ [], handoff_kw \\ []) do
+  defp start(ctx, limits_kw \\ @small, lane_kw \\ [], handoff_kw \\ [], upstream_kw \\ []) do
     limits = Limits.new(limits_kw)
 
     {:ok, h} =
@@ -112,12 +112,14 @@ defmodule Telelem.WireUpstreamTest do
       DynamicSupervisor.start_child(
         ctx.sup,
         {Upstream,
-         handoff: h,
-         id: :primary,
-         controller: self(),
-         lane: lane,
-         body: ~s({"stream":true}),
-         limits: limits}
+         [
+           handoff: h,
+           id: :primary,
+           controller: self(),
+           lane: lane,
+           body: ~s({"stream":true}),
+           limits: limits
+         ] ++ upstream_kw}
       )
 
     %{h: h, pid: pid, limits: limits, mon: Process.monitor(pid)}
@@ -466,7 +468,7 @@ defmodule Telelem.WireUpstreamTest do
   end
 
   # Released, everything before [DONE] transferred; returns the live pieces.
-  defp streaming_to_done(ctx, handoff_kw) do
+  defp streaming_to_done(ctx, handoff_kw, upstream_kw \\ []) do
     auth = authority!(ctx.tmp_dir)
 
     a =
@@ -474,10 +476,14 @@ defmodule Telelem.WireUpstreamTest do
         ctx,
         @small,
         [],
-        [
-          admission_authority: auth,
-          terminal_deadline: System.monotonic_time(:millisecond) + 10_000
-        ] ++ handoff_kw
+        Keyword.merge(
+          [
+            admission_authority: auth,
+            terminal_deadline: System.monotonic_time(:millisecond) + 10_000
+          ],
+          handoff_kw
+        ),
+        upstream_kw
       )
 
     up = upstream!()
@@ -571,6 +577,99 @@ defmodule Telelem.WireUpstreamTest do
     {msgs, report} = collect(h)
     assert msgs == [{:incomplete, {:downstream_write, :closed}}]
     assert report.terminal.downstream == {:error, :closed}
+  end
+
+  # ── timed terminal authorization: the attempt supplies the shared deadline ──
+  #
+  # The exact arguments of the attempt's Handoff.finish call are captured with
+  # an isolated call-trace session on the attempt process (OTP 27+ `:trace`),
+  # so the deadline it passes is asserted by value, not inferred from timing.
+  # The coordinator is then wedged (:sys.suspend) with the finish call queued,
+  # and the effect is observed end to end: when the attempt gives up.
+
+  @grace 1_000
+
+  defp trace_finish_calls(pid) do
+    session = :trace.session_create(:wire_upstream_finish, self(), [])
+    on_exit(fn -> :trace.session_destroy(session) end)
+    # :local also catches finish/3 -> finish/4 inside Handoff.
+    :trace.function(session, {Handoff, :finish, :_}, true, [:local])
+    1 = :trace.process(session, pid, true, [:call])
+    session
+  end
+
+  # Releases [DONE] with the coordinator wedged; returns once the attempt's
+  # finish call is queued at the coordinator, with that call's arguments.
+  defp finish_into_wedged_coordinator(a) do
+    pid = a.pid
+    h = a.h
+    trace_finish_calls(pid)
+    :sys.suspend(h)
+    push(a.up, @done)
+    send(a.up, :finish)
+    assert_receive {:trace, ^pid, :call, {Handoff, :finish, args}}, 2_000
+    wait_q(h, 1)
+    args
+  end
+
+  @tag :tmp_dir
+  test "timed attempt passes the coordinator's exact terminal_deadline to finish/4 and is fenced at deadline + grace, not the 5s call timeout",
+       ctx do
+    d = System.monotonic_time(:millisecond) + 2_000
+    a = streaming_to_done(ctx, [terminal_deadline: d], terminal_deadline: d)
+    h = a.h
+    hm = Process.monitor(h)
+
+    args = finish_into_wedged_coordinator(a)
+    assert args == [h, {:upstream_done, "stop"}, @done, [deadline: d]]
+    # finish/4 is entered directly: no legacy finish/3 frame.
+    pid = a.pid
+    refute_received {:trace, ^pid, :call, {Handoff, :finish, [_, _, _]}}
+    called = System.monotonic_time(:millisecond)
+    assert called < d, "finish reached the coordinator only after d; test proves nothing"
+
+    assert_receive {:telelem_wire, _, :primary, {:ended, :finish_unconfirmed, stats}}, 4_000
+    t = System.monotonic_time(:millisecond)
+    assert t >= d + @grace
+    # Legacy would wait the 5s call timeout from `called` (>= d + 3_000 here).
+    assert t < d + @grace + 500, "fenced #{t - d}ms after d"
+    assert stats.cleaned_ack == {:error, :handoff_down}
+    assert_receive {:DOWN, ^hm, :process, ^h, :killed}, 1_000
+    refute_received {@tag_h, ^h, {:data, @done}}
+    refute_received {@tag_h, ^h, {:terminal, _, _}}
+    refute_received {@tag_h, ^h, {:done, _}}
+  end
+
+  @tag :tmp_dir
+  test "control: without :terminal_deadline the attempt calls legacy finish/3 and keeps waiting past deadline + grace",
+       ctx do
+    d = System.monotonic_time(:millisecond) + 1_500
+    a = streaming_to_done(ctx, terminal_deadline: d)
+    h = a.h
+
+    args = finish_into_wedged_coordinator(a)
+    assert args == [h, {:upstream_done, "stop"}, @done]
+    pid = a.pid
+    assert_receive {:trace, ^pid, :call, {Handoff, :finish, [^h, _, _, []]}}, 1_000
+    assert System.monotonic_time(:millisecond) < d
+
+    # Well past deadline + grace the legacy attempt is still waiting...
+    refute_receive {:telelem_wire, _, :primary, {:ended, _, _}},
+                   max(d + @grace + 300 - System.monotonic_time(:millisecond), 0)
+
+    # ...so the coordinator's reply still reaches it: refused at the deadline.
+    :sys.resume(h)
+
+    assert_receive {:telelem_wire, _, :primary, {:ended, {:finish_refused, :cancelled}, _}},
+                   2_000
+
+    refute_received {@tag_h, ^h, {:data, @done}}
+  end
+
+  test "a non-integer :terminal_deadline is rejected before the attempt is spawned" do
+    assert_raise ArgumentError, ~r/terminal_deadline/, fn ->
+      Upstream.start_link(handoff: self(), terminal_deadline: :soon)
+    end
   end
 
   # ── supported framing only: raw loopback TLS upstream (no Bandit) ──
@@ -675,7 +774,9 @@ defmodule Telelem.WireUpstreamTest do
         transport_opts: [cacerts: ctx.cacerts]
       )
 
-    {:ok, conn, ref} = Mint.HTTP.request(conn, "POST", "/v1/chat/completions", [], ~s({"stream":true}))
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "POST", "/v1/chat/completions", [], ~s({"stream":true}))
+
     assert_receive :raw_sent, 5_000
     {responses, _conn} = mint_until_done(conn, ref, [])
     assert {:done, ref} in responses

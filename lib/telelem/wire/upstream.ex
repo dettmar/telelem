@@ -52,7 +52,9 @@ defmodule Telelem.Wire.Upstream do
     * The exact `data: [DONE]` event is **held**, not forwarded, until Mint
       reports the chunked body complete (`{:done, ref}` with chunked framing:
       the zero-length terminator chunk arrived). It is never `transfer/2`ed.
-      It goes downstream only as the marker of `Handoff.finish/3` (terminal
+      It goes downstream only as the marker of `Handoff.finish/3`, or
+      `Handoff.finish/4` with `deadline:` when the attempt was started with
+      `:terminal_deadline` (terminal
       authorization; if it is refused the marker is dropped; if it is
       `{:error, :unconfirmed}` the attempt ends `:finish_unconfirmed` and
       never retries), and only if:
@@ -109,9 +111,30 @@ defmodule Telelem.Wire.Upstream do
   @doc """
   Starts an attempt. Options: `:handoff`, `:id`, `:controller` (PID),
   `:lane` (`%{name:, host:, port:, cacerts: | cacertfile:}`), `:path`,
-  `:body`, `:limits` (`Telelem.Wire.Limits`), `:recorder`, `:rid`.
+  `:body`, `:limits` (`Telelem.Wire.Limits`), `:recorder`, `:rid`, and
+  optionally `:terminal_deadline`.
+
+  `:terminal_deadline` is the coordinator's absolute `:terminal_deadline`
+  (`System.monotonic_time(:millisecond)`), the same integer the coordinator
+  was started with. When given, the attempt passes it to
+  `Handoff.finish/4` as `deadline:`, so terminal authorization waits at most
+  until that deadline plus the coordinator's grace across both of finish's
+  waits. When absent or `nil` (legacy M1), the attempt calls
+  `Handoff.finish/3` exactly as before. Any other value raises
+  `ArgumentError` in the caller, before the attempt is spawned.
   """
-  def start_link(opts), do: {:ok, :proc_lib.spawn_link(__MODULE__, :init, [opts])}
+  def start_link(opts) do
+    case Keyword.get(opts, :terminal_deadline) do
+      d when is_nil(d) or is_integer(d) ->
+        :ok
+
+      other ->
+        raise ArgumentError,
+              "Upstream :terminal_deadline must be an integer or nil, got: #{inspect(other)}"
+    end
+
+    {:ok, :proc_lib.spawn_link(__MODULE__, :init, [opts])}
+  end
 
   @doc false
   def init(opts) do
@@ -127,6 +150,8 @@ defmodule Telelem.Wire.Upstream do
       limits: limits,
       rec: Keyword.get(opts, :recorder),
       rid: Keyword.get(opts, :rid),
+      # Absolute, shared with the coordinator; nil = legacy finish/3.
+      terminal_deadline: Keyword.get(opts, :terminal_deadline),
       hmon: nil,
       conn: nil,
       ref: nil,
@@ -350,7 +375,10 @@ defmodule Telelem.Wire.Upstream do
         # Mint also reports {:done, ref} for a close-delimited (or
         # content-length) body; neither is the chunked terminator this slice
         # accepts as completion. Nothing of this response is forwarded.
-        violation(%{s | phase: :unsupported_framing, framing: framing}, {:unsupported_framing, framing})
+        violation(
+          %{s | phase: :unsupported_framing, framing: framing},
+          {:unsupported_framing, framing}
+        )
     end
   end
 
@@ -567,7 +595,7 @@ defmodule Telelem.Wire.Upstream do
   defp authorize_done(%{held_done: done, terminal: {:ok, reason}} = s) do
     note(s, {:done_released, %{terminal: s.terminal}})
 
-    case Handoff.finish(s.h, {:upstream_done, reason}, done) do
+    case finish(s, {:upstream_done, reason}, done) do
       :ok ->
         st = s.stats
 
@@ -594,6 +622,14 @@ defmodule Telelem.Wire.Upstream do
         stop(%{s | held_done: :refused}, {:finish_refused, r})
     end
   end
+
+  # Timed: one absolute bound (deadline + grace) across both of finish's
+  # waits. Legacy (no deadline): finish/3, unchanged.
+  defp finish(%{terminal_deadline: nil} = s, terminal, done),
+    do: Handoff.finish(s.h, terminal, done)
+
+  defp finish(%{terminal_deadline: d} = s, terminal, done),
+    do: Handoff.finish(s.h, terminal, done, deadline: d)
 
   defp success?(s),
     do:
