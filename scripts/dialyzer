@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Optional success-typing diagnostics. Requires scripts/setup and Docker.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+
+TELELEM_RUNNER=docker TELELEM_NETWORK=none MIX_ENV=prod \
+  "$ROOT/scripts/mix" compile --warnings-as-errors
+
+docker run --rm --network none \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,source=$ROOT,target=/work,readonly" -w /work \
+  -e HOME=/tmp -e ERL_CRASH_DUMP=/tmp/dialyzer.dump \
+  "$IMAGE" sh -eu -c '
+    elixir_lib=$(elixir -e "IO.puts(Path.dirname(:code.lib_dir(:elixir)))")
+    set -- "$elixir_lib"/*/ebin _build/prod/lib/*/ebin
+    ERL_FLAGS="-pa $elixir_lib/elixir/ebin" dialyzer \
+      --incremental --output_plt /tmp/telelem.ipl \
+      --apps erts kernel stdlib crypto public_key ssl asn1 inets "$@" \
+      --warning_apps _build/prod/lib/telelem/ebin
+  '

@@ -1,0 +1,601 @@
+# Security checks for this repository's own files and locked dependencies.
+#
+#   advisories   OSV-Scanner against every tracked mix.lock (Hex) and uv.lock
+#                (PyPI), each enumerated from the index, path-validated and
+#                passed explicitly, with a coverage assertion so a skipped or
+#                unparsed lockfile cannot pass silently. Scanner and git
+#                output stays in a runner-temp file; only validated fields
+#                reach the job log.
+#   secrets      gitleaks over the full git history (all fetched refs, every
+#                commit, merge commits diffed against their first parent),
+#                run against an isolated bare copy of the history, not the
+#                checkout.
+#   workflows    zizmor static audit of every tracked .github/workflows/*.y(a)ml
+#                file, passed explicitly (offline).
+#
+# Fork-safe: runs on `pull_request` only (never `pull_request_target`), uses
+# no secrets, a read-only GITHUB_TOKEN, and does not persist credentials in the
+# checkout. Nothing is uploaded: no artifacts, no SARIF, no caches. Findings
+# are printed as identifiers only (advisory id / rule id, path, line, commit);
+# secret values are redacted by the scanner and never echoed. osv-scanner's
+# and gitleaks' own console output stays in log files on the runner and is
+# never printed; only fixed, validated fields (exit code, counts, validated
+# lockfile path / advisory id / package, sanitized rule/path/line/commit)
+# reach the job log.
+#
+# Repo-local suppressions are deliberately NOT honoured (osv-scanner.toml,
+# .gitleaks.toml, .gitleaksignore, gitleaks:allow, .gitattributes, zizmor
+# config and ignore comments, .gitignore), so a pull request cannot silence
+# its own findings. An accepted exception has to be made here, in this
+# reviewed file.
+#
+# Tools are fetched as release binaries and checked against SHA-256 digests
+# pinned below (taken from each upstream release's checksum file / GitHub
+# release asset digest). Bump version and digest together.
+#
+# Callers (e.g. release.yml):
+#   jobs:
+#     security:
+#       uses: ./.github/workflows/security.yml
+#       permissions:
+#         contents: read
+#       with:
+#         ref: <full commit SHA>   # optional; empty = the triggering ref
+# Under workflow_call the secrets job scans every ref the checkout fetched
+# (branches and tags), plus the given commit.
+
+name: security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, so newly published advisories against unchanged lockfiles surface.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Full commit SHA to scan (release.yml passes the validated tag commit); empty = the triggering ref
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  # github.workflow is the caller's name under workflow_call, so this never
+  # shares a group with the caller (release) or with ci.yml.
+  group: security-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OSV_SCANNER_VERSION: "2.7.1"
+  OSV_SCANNER_SHA256: "fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8" # osv-scanner_linux_amd64
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" # gitleaks_8.30.1_linux_x64.tar.gz
+  ZIZMOR_VERSION: "1.32.0"
+  ZIZMOR_SHA256: "bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b" # zizmor-x86_64-unknown-linux-gnu.tar.gz
+
+jobs:
+  advisories:
+    name: dependency advisories (OSV, Hex + PyPI lockfiles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate ref input
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::ref must be empty or a full 40-hex commit SHA"; exit 1; }
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install osv-scanner (pinned, sha256-verified)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$tools/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $tools/osv-scanner" | sha256sum --check --strict
+          chmod 0755 "$tools/osv-scanner"
+          "$tools/osv-scanner" --version
+
+      - name: Scan lockfiles and assert coverage
+        run: |
+          # Byte-wise matching for the path checks below (in a UTF-8 locale
+          # bracket ranges such as A-Z can match non-ASCII letters).
+          export LC_ALL=C
+          osv="$RUNNER_TEMP/tools/osv-scanner"
+          # Raw git, scanner and formatter output stays here (never printed or
+          # uploaded): parse errors quote lockfile content and paths verbatim.
+          work="$RUNNER_TEMP/osv"
+          mkdir -p "$work"
+          # Empty config overrides any repo-local osv-scanner.toml ignore list.
+          empty_cfg="$work/empty.toml"
+          : > "$empty_cfg"
+
+          # 1. Before anything reads a lockfile: enumerate the tracked ones
+          #    from the index (NUL-delimited, into a file, git's exit status
+          #    checked, its stderr kept on the runner), require well-formed,
+          #    NUL-terminated `git ls-files -s` records, and accept only safe
+          #    relative paths. The scanner's own directory walk is not used
+          #    (it honours .gitignore and logs every path it visits); the
+          #    validated paths are passed to it explicitly. No rejected name
+          #    or record is ever echoed.
+          lock_list="$work/lockfiles.nul"
+          if ! git ls-files -z -s -- ':(glob)**/mix.lock' ':(glob)**/uv.lock' \
+              > "$lock_list" 2> "$work/git-ls-files.log"; then
+            echo "::error::git ls-files failed; refusing to report a pass (raw output kept on the runner only)"
+            exit 1
+          fi
+          if [[ ! -s "$lock_list" ]]; then
+            echo "::error::no tracked mix.lock / uv.lock found; refusing to report a pass"
+            exit 1
+          fi
+          if [[ "$(tail -c 1 "$lock_list" | od -An -tx1 | tr -d ' \n')" != 00 ]]; then
+            echo "::error::git ls-files output is not NUL-terminated; refusing to continue"
+            exit 1
+          fi
+          mapfile -d '' -t lock_entries < "$lock_list"
+          nuls=$(tr -cd '\000' < "$lock_list" | wc -c)
+          if [[ ${#lock_entries[@]} -ne $nuls ]]; then
+            echo "::error::git ls-files output did not split into one record per NUL; refusing to continue"
+            exit 1
+          fi
+          record_re=$'^([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-3])\t(.+)$'
+          path_re='^(\.?[A-Za-z0-9_][A-Za-z0-9._-]*/)*(mix|uv)\.lock$'
+          lockfiles=()
+          for entry in "${lock_entries[@]}"; do
+            if [[ ! "$entry" =~ $record_re ]]; then
+              echo "::error::malformed git ls-files record (${#lockfiles[@]} accepted so far); refusing to continue"
+              exit 1
+            fi
+            mode=${BASH_REMATCH[1]}; stage=${BASH_REMATCH[3]}; f=${BASH_REMATCH[4]}
+            if [[ ${#f} -gt 200 || ! "$f" =~ $path_re || "$f" == *..* ]]; then
+              echo "::error::tracked lockfile with an unsupported path name (${#lockfiles[@]} accepted so far; name not printed); refusing to continue"
+              exit 1
+            fi
+            if [[ "$stage" != 0 || ( "$mode" != 100644 && "$mode" != 100755 ) || ! -f "$f" || -L "$f" ]]; then
+              echo "::error file=$f::tracked lockfile is not a regular, merged file in the checkout (mode $mode, stage $stage)"
+              exit 1
+            fi
+            for seen in "${lockfiles[@]}"; do
+              if [[ "$seen" == "$f" ]]; then
+                echo "::error file=$f::lockfile listed twice by git ls-files; refusing to continue"
+                exit 1
+              fi
+            done
+            lockfiles+=("$f")
+          done
+          echo "tracked lockfiles: ${#lockfiles[@]}"
+          for required in mix.lock fixtures/wire/uv.lock; do
+            found=0
+            for f in "${lockfiles[@]}"; do [[ "$f" == "$required" ]] && found=1; done
+            if [[ $found -ne 1 ]]; then
+              echo "::error file=$required::required lockfile is not tracked"
+              exit 1
+            fi
+          done
+
+          # 2. Scan each validated lockfile on its own, so a parse or network
+          #    failure is attributed to a validated path without printing the
+          #    scanner's message. 0 = no vulnerabilities, 1 = vulnerabilities
+          #    found; anything else (127 parse/network error, 128 nothing
+          #    scanned, ...) is a tool failure, never a pass.
+          fail=0
+          fmt_args=()
+          i=0
+          for f in "${lockfiles[@]}"; do
+            i=$((i + 1))
+            # Independent count of the lockfile's entries, for coverage.
+            case "$f" in
+              */mix.lock|mix.lock) want=$(grep -cE '^  "[^"]+": \{' -- "$f" 2> /dev/null || true) ;;
+              */uv.lock|uv.lock)   want=$(grep -cxF '[[package]]' -- "$f" 2> /dev/null || true) ;;
+              *)                   want=0 ;;
+            esac
+            [[ "$want" =~ ^[0-9]{1,9}$ ]] || want=0
+            out="$work/scan-$i.json"
+            set +e
+            "$osv" scan source --all-packages --all-vulns --config="$empty_cfg" \
+              --format=json --output-file="$out" --lockfile="$f" \
+              > "$work/scan-$i.log" 2>&1
+            rc=$?
+            set -e
+            echo "osv-scanner exit code: $rc ($f)"
+            if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+              echo "::error file=$f::osv-scanner could not scan this lockfile (exit $rc; raw output kept on the runner only). Check that it parses and that osv.dev is reachable: osv-scanner scan source --lockfile=$f"
+              fail=1
+              continue
+            fi
+            fmt_args+=("$f" "$want" "$out" "$rc")
+          done
+          if [[ ${#fmt_args[@]} -eq 0 ]]; then
+            echo "::error::no lockfile was scanned successfully; refusing to report a pass"
+            exit 1
+          fi
+
+          # 3. Coverage and findings from the JSON reports. The formatter
+          #    re-validates its arguments, prints only fixed text plus
+          #    validated ASCII fields (lockfile path, counts, advisory id,
+          #    ecosystem, package name and version), and counts any finding
+          #    whose fields fail validation instead of printing it. Any shape
+          #    error yields one fixed line; its stderr (tracebacks) stays on
+          #    the runner, and its stdout is filtered to printable ASCII again.
+          set +e
+          python3 -I -S - "$PWD" "${fmt_args[@]}" > "$work/format.out" 2> "$work/format.log" <<'PY'
+          import json, re, sys
+
+          A = re.ASCII
+          PATH = re.compile(r'(?:\.?[A-Za-z0-9_][A-Za-z0-9._-]*/)*(?:mix|uv)\.lock', A)
+          COUNT = re.compile(r'[0-9]{1,9}', A)
+          VID = re.compile(r'[A-Z][A-Z0-9]{1,15}(?:-[A-Za-z0-9._]{1,40}){1,4}', A)
+          NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', A)
+          VERSION = re.compile(r'[A-Za-z0-9][A-Za-z0-9.+!_-]{0,63}', A)
+          LINE = re.compile(r'[\x20-\x7e]{1,600}', A)
+          ECOSYSTEM = {'mix.lock': 'Hex', 'uv.lock': 'PyPI'}
+
+
+          class Shape(Exception):
+              pass
+
+
+          def emit(line):
+              if not LINE.fullmatch(line):
+                  line = '::error::suppressed a status line that failed validation'
+              sys.stdout.write(line + '\n')
+
+
+          def obj(v):
+              if not isinstance(v, dict):
+                  raise Shape()
+              return v
+
+
+          def arr(v):
+              if not isinstance(v, list):
+                  raise Shape()
+              return v
+
+
+          def text(v, rx):
+              return isinstance(v, str) and rx.fullmatch(v) is not None
+
+
+          def main(argv):
+              if len(argv) < 5 or (len(argv) - 1) % 4:
+                  raise Shape()
+              root, rest = argv[0], argv[1:]
+              fail = False
+              findings = set()
+              total = 0
+              unprintable = 0
+              for i in range(0, len(rest), 4):
+                  f, want, report, rc = rest[i:i + 4]
+                  if not (text(f, PATH) and '..' not in f and len(f) <= 200
+                          and text(want, COUNT) and rc in ('0', '1')):
+                      raise Shape()
+                  eco = ECOSYSTEM[f.rsplit('/', 1)[-1]]
+                  with open(report, 'rb') as fh:
+                      data = json.loads(fh.read().decode('utf-8'))
+                  src_want = root + '/' + f
+                  got = 0
+                  here = 0
+                  foreign = 0
+                  for r in arr(obj(data).get('results')):
+                      r = obj(r)
+                      pkgs = arr(r.get('packages'))
+                      ours = obj(r.get('source')).get('path') == src_want
+                      if ours:
+                          got += len(pkgs)
+                      else:
+                          foreign += 1
+                      for p in pkgs:
+                          p = obj(p)
+                          pkg = obj(p.get('package'))
+                          vulns = p.get('vulnerabilities')
+                          for v in arr([] if vulns is None else vulns):
+                              v = obj(v)
+                              here += 1
+                              vid = v.get('id')
+                              name, ver = pkg.get('name'), pkg.get('version')
+                              if (ours and text(vid, VID) and pkg.get('ecosystem') == eco
+                                      and text(name, NAME) and text(ver, VERSION)):
+                                  findings.add((f, vid, eco, name, ver))
+                              else:
+                                  unprintable += 1
+                  total += here
+                  emit('coverage: %s expected=%s scanned=%d' % (f, want, got))
+                  if int(want) < 1 or got != int(want):
+                      emit('::error file=%s::lockfile not fully scanned (expected %s packages, scanner saw %d)' % (f, want, got))
+                      fail = True
+                  if foreign:
+                      emit('::error file=%s::osv-scanner reported %d result(s) for another source; failing' % (f, foreign))
+                      fail = True
+                  if rc == '1' and here == 0:
+                      emit('::error file=%s::osv-scanner exit 1 but no vulnerabilities in its JSON; failing conservatively' % f)
+                      fail = True
+              emit('vulnerabilities reported: %d' % total)
+              for f, vid, eco, name, ver in sorted(findings):
+                  emit('::error file=%s::%s affects %s %s@%s (https://osv.dev/vulnerability/%s)' % (f, vid, eco, name, ver, vid))
+              if unprintable:
+                  emit('::error::%d finding(s) had fields that failed validation and are not printed (raw JSON kept on the runner only)' % unprintable)
+              if total:
+                  emit('::error::%d vulnerability finding(s) in locked dependencies: upgrade the affected packages and re-lock, or record a reviewed exception in .github/workflows/security.yml' % total)
+                  fail = True
+              return 1 if fail else 0
+
+
+          try:
+              code = main(sys.argv[1:])
+          except BaseException:
+              try:
+                  emit('::error::osv-scanner JSON report missing or not in the expected shape; failing (raw output kept on the runner only)')
+              except BaseException:
+                  pass
+              code = 2
+          try:
+              sys.stdout.flush()
+          except BaseException:
+              code = 2
+          sys.exit(code)
+          PY
+          prc=$?
+          set -e
+          grep -E '^[ -~]{1,600}$' "$work/format.out" || true
+          case "$prc" in
+            0) ;;
+            1) fail=1 ;;
+            *) echo "::error::advisory formatter failed (exit $prc; raw output kept on the runner only)"; fail=1 ;;
+          esac
+          exit $fail
+
+  secrets:
+    name: secret scan (gitleaks, full history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate ref input
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::ref must be empty or a full 40-hex commit SHA"; exit 1; }
+
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, sha256-verified)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          tarball="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $tarball" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$tools" gitleaks
+          "$tools/gitleaks" version
+
+      - name: Scan all commits (isolated git directory)
+        run: |
+          # Byte-wise matching for the sanitizers below (in a UTF-8 locale
+          # bracket ranges such as A-Z can match non-ASCII letters).
+          export LC_ALL=C
+          # Fail closed if the checkout is not the full history.
+          if [[ "$(git rev-parse --is-shallow-repository)" != "false" ]]; then
+            echo "::error::checkout is shallow; refusing to report a full-history pass"
+            exit 1
+          fi
+
+          # gitleaks 8.30.1 always reads <source>/.gitleaksignore (even with
+          # --gitleaks-ignore-path), reads ./.gitleaksignore from the working
+          # directory by default, and logs invalid ignore entries verbatim.
+          # git itself honours the checkout's .gitattributes (-diff/binary
+          # hides content from `git log -p`) and repo/global/system config.
+          # So the history is copied into a fresh bare git directory with no
+          # working tree, a config written only by this step, attributes
+          # forced back to git's defaults, and a hermetic environment; the
+          # scanner never sees the pull request's working tree.
+          scan="$RUNNER_TEMP/gitleaks-scan"
+          rm -rf "$scan"
+          mkdir -p "$scan/home" "$scan/cwd" "$scan/ignore"
+          gitdir="$scan/history.git"
+          genv=(env -i PATH="$PATH" HOME="$scan/home" LC_ALL=C
+                GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+                GIT_ATTR_SOURCE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+                GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0)
+
+          "${genv[@]}" git init --quiet --bare --template= "$gitdir"
+          mkdir -p "$gitdir/info"
+          # Highest-precedence attributes: reset `diff` to unspecified for
+          # every path, so git's own binary detection applies.
+          printf '* !diff\n' > "$gitdir/info/attributes"
+          # Every ref the checkout has, plus its (possibly detached) HEAD.
+          "${genv[@]}" git -C "$gitdir" fetch --quiet --no-tags --no-write-fetch-head \
+            --no-recurse-submodules "$PWD" '+refs/*:refs/*' '+HEAD:refs/gitleaks-scan/HEAD'
+
+          if [[ "$("${genv[@]}" git -C "$gitdir" rev-parse --is-shallow-repository)" != "false" ]]; then
+            echo "::error::isolated history copy is shallow; refusing to report a full-history pass"
+            exit 1
+          fi
+          # The isolated copy must hold exactly the commits the checkout has.
+          src_sum=$(git rev-list --all | LC_ALL=C sort | sha256sum)
+          iso_sum=$("${genv[@]}" git -C "$gitdir" rev-list --all | LC_ALL=C sort | sha256sum)
+          total=$("${genv[@]}" git -C "$gitdir" rev-list --all --count)
+          if [[ "$src_sum" != "$iso_sum" || "$total" -lt 1 ]]; then
+            echo "::error::isolated history copy does not match the checkout; refusing to scan"
+            exit 1
+          fi
+          for f in .gitleaksignore .gitleaks.toml; do
+            if [[ -e "$gitdir/$f" || -e "$scan/cwd/$f" ]]; then
+              echo "::error::unexpected $f in the isolated scan directory"
+              exit 1
+            fi
+          done
+          echo "commits reachable from fetched refs: $total"
+
+          # Built-in default rules only; an empty ignore file outside the
+          # source; gitleaks:allow comments are not honoured.
+          cfg="$scan/gitleaks.toml"
+          printf '[extend]\nuseDefault = true\n' > "$cfg"
+          ignore="$scan/ignore/empty"
+          : > "$ignore"
+          # Raw scanner output stays on the runner (never printed or uploaded).
+          report="$scan/gitleaks.json"
+          rawlog="$scan/gitleaks.log"
+          # Every commit on every ref; merge commits diffed against their first
+          # parent, so content introduced only while resolving a merge is seen.
+          log_opts=(--all --full-history --diff-merges=first-parent --no-ext-diff --no-textconv)
+
+          # git must accept these options on this history (gitleaks only logs
+          # a failing `git log` at debug level).
+          if ! "${genv[@]}" git -C "$gitdir" log -p -U0 "${log_opts[@]}" > /dev/null 2>&1; then
+            echo "::error::git log over the isolated history failed; refusing to report a pass"
+            exit 1
+          fi
+
+          set +e
+          (cd "$scan/cwd" && "${genv[@]}" "$RUNNER_TEMP/tools/gitleaks" git \
+            --no-banner --no-color --redact=100 --exit-code=1 --log-level=info \
+            --config="$cfg" --gitleaks-ignore-path="$ignore" --ignore-gitleaks-allow \
+            --log-opts="${log_opts[*]}" \
+            --report-format=json --report-path="$report" \
+            "$gitdir") > "$rawlog" 2>&1
+          rc=$?
+          set -e
+          scanned=$(grep -oE 'INF [0-9]+ commits scanned' "$rawlog" | grep -oE '[0-9]+' | tail -n 1 || true)
+          errors=$(grep -cE ' (ERR|FTL) ' "$rawlog" || true)
+          echo "gitleaks exit code: $rc"
+          echo "gitleaks commits with scanned content: ${scanned:-unknown} of $total"
+          echo "gitleaks error log lines: $errors (raw log kept on the runner only)"
+
+          if ! jq -e 'type == "array"' "$report" > /dev/null 2>&1; then
+            echo "::error::gitleaks produced no valid report (exit $rc); not treating as a pass"
+            exit 1
+          fi
+          n=$(jq 'length' "$report")
+          if [[ "$n" -gt 0 ]]; then
+            # Fixed, validated fields only: never Secret, Match, Line, Message,
+            # Author or Email, and nothing that could form a workflow command.
+            jq -r '.[] | [(.RuleID|tostring), (.File|tostring), (.StartLine|tostring), (.Commit|tostring)] | @tsv' "$report" \
+              | while IFS=$'\t' read -r rule file line commit; do
+                  rule=${rule//[^A-Za-z0-9_.-]/_}; rule=${rule:0:64}
+                  safe=${file//[^A-Za-z0-9_.\/@+-]/_}; safe=${safe:0:200}
+                  [[ "$safe" == "$file" ]] || safe="$safe (path sanitized)"
+                  [[ "$line" =~ ^[0-9]{1,9}$ ]] || line=0
+                  if [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then commit=${commit:0:12}; else commit=unknown; fi
+                  echo "::error file=${safe%% *},line=$line::gitleaks rule $rule in commit $commit, path $safe (value redacted)"
+                done
+            echo "::error::$n potential secret(s) in history. Rotate first if real; history rewrite needs an explicit decision."
+            exit 1
+          fi
+          if [[ $rc -ne 0 ]]; then
+            echo "::error::gitleaks exit $rc with an empty report; failing conservatively"
+            exit 1
+          fi
+          if [[ "$errors" -ne 0 ]]; then
+            echo "::error::gitleaks logged $errors error line(s); failing conservatively"
+            exit 1
+          fi
+          if [[ ! "$scanned" =~ ^[0-9]+$ || "$scanned" -lt 1 || "$scanned" -gt "$total" ]]; then
+            echo "::error::gitleaks did not report a plausible scanned-commit count; failing conservatively"
+            exit 1
+          fi
+
+  workflows:
+    name: workflow audit (zizmor, offline)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Validate ref input
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ -z "$REF" || "$REF" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::ref must be empty or a full 40-hex commit SHA"; exit 1; }
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install zizmor (pinned, sha256-verified)
+        run: |
+          tools="$RUNNER_TEMP/tools"
+          mkdir -p "$tools"
+          tarball="$RUNNER_TEMP/zizmor.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$tarball" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  $tarball" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$tools" zizmor
+          "$tools/zizmor" --version
+
+      - name: Audit workflows
+        run: |
+          # Byte-wise matching for the name checks below (in a UTF-8 locale
+          # bracket ranges such as A-Z can match non-ASCII letters).
+          export LC_ALL=C
+          # zizmor's directory collection honours .gitignore, so a tracked
+          # workflow could be hidden by an ignore rule. Enumerate the tracked
+          # workflow files from the index instead (NUL-delimited, written to a
+          # file so git's exit status is checked), validate every entry, and
+          # pass them explicitly.
+          wf_list="$RUNNER_TEMP/workflows.nul"
+          git ls-files -z -s -- ':(glob).github/workflows/*.yml' ':(glob).github/workflows/*.yaml' > "$wf_list"
+          mapfile -d '' -t wf_entries < "$wf_list"
+          if [[ ${#wf_entries[@]} -eq 0 ]]; then
+            echo "::error::no tracked workflow files found; refusing to report a pass"
+            exit 1
+          fi
+          workflows=()
+          self=0
+          for entry in "${wf_entries[@]}"; do
+            meta=${entry%%$'\t'*}; f=${entry#*$'\t'}
+            read -r mode _ stage <<< "$meta"
+            if [[ ! "$f" =~ ^\.github/workflows/[A-Za-z0-9_][A-Za-z0-9._-]*\.ya?ml$ ]]; then
+              echo "::error::tracked workflow with an unsupported file name (${#workflows[@]} accepted so far); refusing to continue"
+              exit 1
+            fi
+            if [[ "$stage" != 0 || ( "$mode" != 100644 && "$mode" != 100755 ) || ! -f "$f" || -L "$f" ]]; then
+              echo "::error file=$f::tracked workflow is not a regular, merged file in the checkout (mode $mode, stage $stage)"
+              exit 1
+            fi
+            [[ "$f" == .github/workflows/security.yml ]] && self=1
+            workflows+=("$f")
+          done
+          if [[ $self -ne 1 ]]; then
+            echo "::error::.github/workflows/security.yml is not among the tracked workflows"
+            exit 1
+          fi
+          echo "auditing ${#workflows[@]} tracked workflow file(s):"
+          printf '  %s\n' "${workflows[@]}"
+
+          # Offline (no token use); no repo-local config or ignore comments.
+          "$RUNNER_TEMP/tools/zizmor" --offline --no-config --no-ignores \
+            --strict-collection --persona=regular --no-progress --color=never \
+            --format=github -- "${workflows[@]}"
