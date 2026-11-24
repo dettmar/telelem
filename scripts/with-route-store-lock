@@ -42,6 +42,9 @@ die() {
 
 # Use fixed system paths for this script's own tools. Restore the caller's PATH just
 # before exec, so the wrapper resolves COMMAND exactly as the caller would.
+# Every stat(1) call below runs with a per-command LC_ALL=C, and file types are decided
+# from numeric mode bits (%f), never from translated text such as %F. The caller's
+# locale variables are left untouched for COMMAND.
 if [[ -v PATH ]]; then had_path=1 orig_path=$PATH; else had_path=0 orig_path=; fi
 PATH=/usr/bin:/bin
 
@@ -53,7 +56,7 @@ shift 2
 flock_bin=
 for c in /usr/bin/flock /bin/flock; do
   if [[ -f $c && -x $c ]]; then
-    read -r fu fm < <(stat -L -c '%u %a' -- "$c")
+    read -r fu fm < <(LC_ALL=C stat -L -c '%u %a' -- "$c")
     if [[ $fu == 0 ]] && (((8#$fm & 8#022) == 0)); then
       flock_bin=$c
       break
@@ -72,10 +75,12 @@ done
 canon=$(realpath -e -- "$store") || die 78 "cannot resolve STORE_DIR: $store"
 [[ $canon == "$store" ]] || die 78 "STORE_DIR is not canonical (resolves to $canon): $store"
 
-read -r s_uid s_mode s_dev s_ino < <(stat -c '%u %a %d %i' -- "$store")
+read -r s_uid s_mode s_dev s_ino s_raw < <(LC_ALL=C stat -c '%u %a %d %i %f' -- "$store")
+[[ $s_raw =~ ^[0-9a-f]+$ ]] && (((16#$s_raw & 8#170000) == 8#040000)) ||
+  die 78 "STORE_DIR is not a directory (stat mode 0x$s_raw): $store"
 [[ $s_uid == "$EUID" ]] || die 78 "STORE_DIR is owned by uid $s_uid, not the writer's uid $EUID: $store"
 (((8#$s_mode & 8#022) == 0)) || die 78 "STORE_DIR is group- or other-writable (mode $s_mode): $store"
-fstype=$(stat -f -c '%T' -- "$store")
+fstype=$(LC_ALL=C stat -f -c '%T' -- "$store")
 case $fstype in
   ext2/ext3 | xfs | btrfs | zfs | tmpfs) ;;
   *) die 78 "STORE_DIR is on filesystem type '$fstype'; only local ext4/xfs/btrfs/zfs/tmpfs are accepted: $store" ;;
@@ -94,9 +99,11 @@ case $rc in
 esac
 
 # --- the locked descriptor, the path and the earlier check must be the same inode ----
-held=$(stat -L -c '%d %i %F' -- "/proc/$$/fd/$lock_fd") || die 70 "cannot stat the locked descriptor"
-now=$(stat -c '%d %i %F' -- "$store" 2>/dev/null) || now=missing
-[[ $held == "$s_dev $s_ino directory" && $now == "$held" ]] ||
+# Compare device, inode and the raw st_mode (%f, hex), which also pins the file type to
+# the directory checked above. No locale-dependent text is compared.
+held=$(LC_ALL=C stat -L -c '%d %i %f' -- "/proc/$$/fd/$lock_fd") || die 70 "cannot stat the locked descriptor"
+now=$(LC_ALL=C stat -c '%d %i %f' -- "$store" 2>/dev/null) || now=missing
+[[ $held == "$s_dev $s_ino $s_raw" && $now == "$held" ]] ||
   die 70 "STORE_DIR changed while locking (checked $s_dev $s_ino, locked $held, path now $now): $store"
 canon=$(realpath -e -- "$store" 2>/dev/null) || canon=
 [[ $canon == "$store" ]] || die 70 "STORE_DIR stopped being canonical while locking: $store"

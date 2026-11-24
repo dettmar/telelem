@@ -29,20 +29,54 @@ for need in "$WRAP" "$HOLDER"; do [[ -x $need ]] || { echo "missing or not execu
 
 BASE=$(mktemp -d "${TMPDIR:-/tmp}/telelem-store-lock.XXXXXX") || exit 2
 BASE=$(realpath -e "$BASE")
-case $(stat -f -c %T "$BASE") in
+case $(LC_ALL=C stat -f -c %T "$BASE") in
   ext2/ext3 | xfs | btrfs | zfs | tmpfs) ;;
   *) echo "temp dir $BASE is on an unsupported filesystem; set TMPDIR" >&2; rm -rf "$BASE"; exit 2 ;;
 esac
 
 mkfifo "$BASE/tick"; exec {TICK}<>"$BASE/tick" # never written: read -t on it is a bounded pause
-PIDS=()
+# Processes this run started and may still need to kill on exit, keyed by PID, with the
+# kernel start time (/proc/PID/stat field 22) seen when they were registered. A PID is
+# untracked as soon as it has been reaped, and cleanup signals a PID only if it still
+# has the recorded start time, so it never targets an unrelated process that reused a
+# reaped PID. Bash has no pidfd interface, so a tiny window remains between that check
+# and kill(2) in which the process could exit and its PID be reused. That window is not
+# closed here, only narrowed.
+declare -A OWNED=()
+proc_start() { # pid -> start time in clock ticks, or nothing if the PID is gone
+  local st f
+  { st=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  st=${st##*) } # drop "pid (comm) "; comm may itself contain spaces or parens
+  read -ra f <<<"$st"
+  [[ ${f[19]-} =~ ^[0-9]+$ ]] && printf '%s' "${f[19]}"
+}
+track() { # pid: record its identity; call while it is known to be alive and ours
+  local t
+  t=$(proc_start "$1") && OWNED[$1]=$t
+}
+untrack() { unset 'OWNED[$1]'; }
+reap() { # pid: wait for our own child, untrack it, return its status
+  local rc
+  wait "$1"
+  rc=$?
+  untrack "$1"
+  return "$rc"
+}
 cleanup() {
-  local p
-  for p in "${PIDS[@]}"; do kill -KILL "$p" 2>/dev/null; done
-  wait 2>/dev/null
+  local p t killed=()
+  trap - EXIT INT TERM HUP
+  for p in "${!OWNED[@]}"; do
+    t=$(proc_start "$p") && [[ $t == "${OWNED[$p]}" ]] && kill -KILL "$p" 2>/dev/null && killed+=("$p")
+  done
+  # Reap only what was just SIGKILLed; for a non-child (test 7's orphan) wait returns at
+  # once. Nothing else is waited for, so cleanup cannot block on a live process.
+  for p in "${killed[@]}"; do wait "$p" 2>/dev/null; done
   rm -rf -- "$BASE"
 }
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 PASS=0 FAIL=0 SKIP=0
 ok() { printf 'ok   %s\n' "$*"; PASS=$((PASS + 1)); }
@@ -87,7 +121,7 @@ snapshot() { find "$1" -printf '%P|%i|%s|%T@|%m\n' | sort; }
 start_holder() { # code mode -> HPID; reads holder report into RPT
   "$WRAP" "$STORE" -- "$HOLDER" "$CTL" "$1" "$2" 2>"$CTL/holder.err" &
   HPID=$!
-  PIDS+=("$HPID")
+  track "$HPID"
 }
 read_ctl() { RPT=; read -r -t "$T" RPT <&"$R" || RPT="timeout"; }
 release() { printf 'go\n' >&"$W"; }
@@ -148,7 +182,7 @@ expect "kernel shows one exclusive flock on the store inode $KEY" "$(kernel_floc
 expect "that flock is attached to the writer's own fd (fdinfo)" "$(fd_flock "$HPID" "$KEY" "$rfd")" 1
 expect "process tree: writer's command is holder.sh" "$(tr '\0' ' ' <"/proc/$HPID/cmdline" | awk '{print $2}')" "$HOLDER"
 release
-wait "$HPID"; expect "holder exit status passed through" "$?" 0
+reap "$HPID"; expect "holder exit status passed through" "$?" 0
 end_case
 
 echo "# 3. concurrent writers (startup/provision) are rejected before any mutation"
@@ -167,7 +201,7 @@ PATH="$FAKE:$PATH" contend "$STORE"; expect "PATH-shadowed flock is ignored; sti
 expect "shadow flock never executed" "$([[ -e $BASE/fake-flock-used ]] && echo used || echo unused)" unused
 expect "store tree byte-for-byte and mtime unchanged" "$(snapshot "$STORE")" "$before"
 expect "still exactly one flock, still the writer's" "$(kernel_flocks "$KEY") $(fd_holders "$STORE")" "1 $HPID"
-release; wait "$HPID"
+release; reap "$HPID"
 end_case
 
 new_case
@@ -176,7 +210,7 @@ read_ctl
 before=$(snapshot "$STORE")
 contend "$STORE"; expect "startup rejected while provision holds the store" "$?" 75
 expect "store unchanged" "$(snapshot "$STORE")" "$before"
-release; wait "$HPID"
+release; reap "$HPID"
 end_case
 
 echo "# 4. normal exit releases; exit code passes through; caller PATH restored for the command"
@@ -186,7 +220,7 @@ start_holder 7 plain
 read_ctl
 expect "held before release" "$(kernel_flocks "$KEY")" 1
 release
-wait "$HPID"; expect "writer exit status 7 passed through" "$?" 7
+reap "$HPID"; expect "writer exit status 7 passed through" "$?" 7
 expect "no flock left after exit (no sleep)" "$(kernel_flocks "$KEY")" 0
 contend "$STORE"; expect "next writer acquires" "$?" 0
 "$WRAP" "$STORE" -- /bin/sh -c 'grep -c "^lock:.*FLOCK" /proc/$$/fdinfo/$TELELEM_ROUTE_STORE_LOCK_FD' >"$BASE/self.out" 2>&1
@@ -204,7 +238,7 @@ KEY=$(lock_key "$STORE")
 start_holder 0 plain
 read_ctl
 expect "held before kill" "$(kernel_flocks "$KEY")" 1
-kill -KILL "$HPID"; { wait "$HPID"; } 2>/dev/null; expect "writer died by SIGKILL" "$?" 137
+kill -KILL "$HPID"; { reap "$HPID"; } 2>/dev/null; expect "writer died by SIGKILL" "$?" 137
 expect "no flock left after SIGKILL (no sleep)" "$(kernel_flocks "$KEY")" 0
 contend "$STORE"; expect "next writer acquires after crash" "$?" 0
 end_case
@@ -220,7 +254,7 @@ expect "writer is in its SIGTERM shutdown handler" "$RPT" "stopping $HPID"
 before=$(snapshot "$STORE")
 contend "$STORE"; expect "writer rejected during holder shutdown" "$?" 75
 expect "store unchanged during shutdown" "$(snapshot "$STORE")" "$before"
-release; wait "$HPID"; expect "shutdown completed" "$?" 0
+release; reap "$HPID"; expect "shutdown completed" "$?" 0
 contend "$STORE"; expect "acquires after shutdown completes" "$?" 0
 end_case
 
@@ -228,10 +262,10 @@ echo "# 7. children that inherit the fd keep the store locked after the writer d
 new_case
 KEY=$(lock_key "$STORE")
 start_holder 0 child
-read_ctl; read -r _ cpid <<<"$RPT"; PIDS+=("$cpid")
+read_ctl; read -r _ cpid <<<"$RPT"; track "$cpid"
 read_ctl
 expect "holders are writer and its child" "$(fd_holders "$STORE")" "$(printf '%s\n' "$HPID" "$cpid" | sort -n | tr '\n' ' ' | sed 's/ $//')"
-kill -KILL "$HPID"; { wait "$HPID"; } 2>/dev/null
+kill -KILL "$HPID"; { reap "$HPID"; } 2>/dev/null
 contend "$STORE"; expect "still busy: orphaned child holds the inherited lock" "$?" 75
 expect "one flock remains" "$(kernel_flocks "$KEY")" 1
 cfd=$(find "/proc/$cpid/fd" -maxdepth 1 -lname "$STORE" -printf '%f\n' | head -1)
@@ -240,6 +274,7 @@ printf 'go\n' >&"$CW"
 # The child is not ours to wait(2) for: poll the observed condition, bounded by $T.
 for ((i = 0; i < T * 20; i++)); do [[ -z $(fd_holders "$STORE") ]] && break; read -r -t 0.05 <&"$TICK"; done
 expect "child exited and dropped the fd" "$(fd_holders "$STORE")" ""
+[[ -n $(fd_holders "$STORE") ]] || untrack "$cpid" # gone; its PID is no longer ours
 contend "$STORE"; expect "acquires once the last inheritor is gone" "$?" 0
 end_case
 
@@ -250,7 +285,7 @@ start_holder 0 close
 read_ctl
 expect "writer alive but no flock" "$(kill -0 "$HPID" && echo alive) $(kernel_flocks "$KEY")" "alive 0"
 contend "$STORE"; expect "second writer gets in (detected loss)" "$?" 0
-release; wait "$HPID"
+release; reap "$HPID"
 end_case
 
 echo "# 9. limit: replacing the path defeats the lock (immutable-path assumption)"
@@ -260,7 +295,7 @@ read_ctl
 mv "$STORE" "$STORE.old" && mkdir -m 700 "$STORE"
 contend "$STORE"; expect "a writer on the replacement directory acquires (documented limit)" "$?" 0
 expect "original inode still locked by the first writer" "$(kernel_flocks "$(lock_key "$STORE.old")")" 1
-release; wait "$HPID"
+release; reap "$HPID"
 end_case
 
 # ---------------------------------------------------------------------------------------
@@ -283,7 +318,7 @@ else
   rc=$?
   expect "container writer on the same inode via /store is rejected busy" "$rc $(grep -c busy "$BASE/ns.err")" "75 1"
   expect "store unchanged by the container" "$(snapshot "$STORE")" "$before"
-  release; wait "$HPID"
+  release; reap "$HPID"
   "${DOCKER[@]}" -v "$STORE:/store" "$IMAGE" /opt/lock/with-route-store-lock /store -- \
     /bin/sh -c 'printf x >/store/MUTATED' 2>"$BASE/ns.err"
   expect "control: the same container command acquires once the host writer exits" "$? $(cat "$STORE/MUTATED" 2>/dev/null)" "0 x"
