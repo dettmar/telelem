@@ -14,6 +14,8 @@ Plan {rev, digest, primary: Id, backup: Id | none, absolute_deadline_ms, max_att
 
 Example: `chat, rev 1, [a,b], preferred a, true, 5000ms, 2` with both lanes eligible selects `a`, with `b` available only on positively proved pre-send refusal. Select once per ingress; no reselection after an ambiguous send or commit. The runtime rechecks deadline, remaining attempt budget and the pinned authority before dispatch. Authority loss fences an open committed stream as incomplete and never refunds dispatched exposure. An already recorded valid terminal stays terminal. Digest input is the ordered, version-prefixed list of the revision fields shown above (except the digest), encoded as compact UTF-8 JSON; restrict IDs to ASCII `[a-zA-Z0-9_-]{1,64}`. Keep selection independent of transport, store and global clock.
 
+Use the literal prefix `telelem.route_revision.v1`. Ignore eligibility IDs outside the revision. If the preferred lane is ineligible, the eligible alternate is the initial primary (not a fallback). A backup requires both lanes, refusal permission and a configured budget of two; `Plan.max_attempts` is the effective budget (one when there is no backup). `Revision.with_preferred/2` builds a validated revision successor without a store dependency. An explicit apply advances `rev` once even when the preferred lane is unchanged.
+
 Keep the selector free of socket and worker PIDs. The coordinator binds the plan to grants and attempts locally; the transport owns the socket for its lifetime. Deployment IDs identify destinations, not model identity. These seams preserve future placement and multi-model policy options without adding a hop, pooling, migration or fusion to M2a.
 
 ## 2. Receipt event
