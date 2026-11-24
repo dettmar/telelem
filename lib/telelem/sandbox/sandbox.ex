@@ -14,11 +14,16 @@ defmodule Telelem.Sandbox do
   | principal mode ≠ bindings mode               | `{:denied, :mode_mismatch}`     |
   | principal lacks `:dispatch`                  | `{:denied, :permission_denied}` |
   | malformed deployment ID                      | `{:denied, :invalid_deployment_id}` |
+  | principal tenant ≠ bindings tenant           | `{:denied, :no_binding}`        |
   | no binding for the ID                        | `{:denied, :no_binding}`        |
   | bound target fails re-verification           | `{:denied, :target_unverified}` |
 
-  Tenant is taken only from the authenticated principal; `Bindings` carries no
-  tenant in the §3 shape, so tenant scoping of bindings is a day-two question.
+  Tenant is taken only from the authenticated principal and compared with the
+  tenant the bindings were bootstrapped for. A principal of another tenant
+  gets `:no_binding` for every well-formed ID, so it cannot tell a foreign
+  binding from a missing one. Because `Bindings.check/1` re-verifies every
+  target, a tampered target anywhere in the map denies the whole envelope
+  (`:invalid_bindings`); `:target_unverified` remains as a final guard.
   """
 
   alias Telelem.Sandbox.{Bindings, Id, Principal, VerifiedTarget}
@@ -42,6 +47,7 @@ defmodule Telelem.Sandbox do
          :ok <- deny(principal.mode == bindings.mode, :mode_mismatch),
          :ok <- deny(Principal.permitted?(principal, :dispatch), :permission_denied),
          :ok <- deny(Id.valid?(deployment_id), :invalid_deployment_id),
+         :ok <- deny(principal.tenant_id == bindings.tenant_id, :no_binding),
          {:ok, t} <- fetch(bindings.fixture_targets, deployment_id),
          :ok <- deny(VerifiedTarget.check(t, deployment_id) == :ok, :target_unverified) do
       {:ok, t}

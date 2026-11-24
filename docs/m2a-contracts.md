@@ -38,12 +38,16 @@ Receipts report `completeness` (`complete` or `incomplete`), fixed `gaps`, and `
 ## 3. Principal and sandbox binding
 
 ```text
-Principal {tenant_id: Id, subject_id: Id, mode: sandbox | serving, permissions: set<enum>}
-Bindings {mode, fixture_targets: map<Id, VerifiedTarget>, sandbox_store_root, sandbox_signer_ref}
+Principal {tenant_id: Id, subject_id: Id, mode: sandbox | serving,
+           permissions: set<dispatch | route_read | route_write | receipt_read>}
+Bindings {mode, tenant_id: Id, fixture_targets: map<Id, VerifiedTarget>,
+          sandbox_store_root, sandbox_signer_ref}
 resolve(principal, bindings, deployment_id) -> VerifiedTarget | Denied
 ```
 
 Example: authenticated `local/operator/sandbox` may apply a route revision, read only `local` receipts, and resolve `a` to its explicit fixture target and fixture CA. Never trust tenant from request data. For sandbox, missing or mismatched bindings fail closed; no path to production resolver, secret store or signer. Pass bindings to the same route, grant, transport and operation pipeline used for serving.
+
+Sandbox bootstrap accepts only version-2 documents with an explicit tenant; resolve checks it against the authenticated principal. The launcher must supply trusted fixture and bootstrap roots that are not writable by the sandbox or other untrusted processes, with a separate writable mount for the store directory. Use a dedicated network namespace and set the hosts-only `ERL_INETRC` before BEAM boot. Path and inode checks are defense in depth, not a guarantee against filesystem races. The future store opener must also check its store path and avoid following links within it.
 
 **Isolation acceptance, checked outside the gateway.** In a disposable network boundary, the gateway can reach only the two registered fixture targets. An independently observed canary sink beyond that boundary must receive zero gateway connections; an allowed fixture request and a verifier control request to the canary sink prove the observers are working. A missing binding or disallowed target must fail closed with no new lane or sink arrival. Plant distinct, non-secret sentinel production config/key/store files reachable to the verifier; independently audit opens and writes from the gateway and verify content hashes unchanged. Prove the audit sees a deliberate control access. A test environment without a functioning boundary or observers does not pass. Keep all controls on the disposable local runner; no host firewall edits, provider endpoints or actual production secrets.
 

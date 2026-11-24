@@ -140,7 +140,7 @@ mark start
 # ── bootstrap documents (sandbox root /sbx, fixture root /fx inside the subject) ──
 target() { printf '{"host":"%s","port":%d,"ca_file":"/fx/ca.pem"}' "$1" "$2"; }
 doc() {
-  printf '{"version":1,"mode":"sandbox","fixture_targets":{"a":%s,"b":%s},"sandbox_store_root":"/sbx/store","sandbox_signer_ref":"sandbox:local-fixture"}\n' "$1" "$2"
+   printf '{"version":2,"tenant_id":"local","mode":"sandbox","fixture_targets":{"a":%s,"b":%s},"sandbox_store_root":"/sbx/store","sandbox_signer_ref":"sandbox:local-fixture"}\n' "$1" "$2"
 }
 doc "$(target 127.0.0.1 18443)" "$(target 127.0.0.1 18444)" >"$RUN/sbx/bootstrap.json"
 doc "$(target "$CANARY_IP" 443)" "$(target 127.0.0.1 18444)" >"$RUN/sbx/bootstrap-disallowed.json"

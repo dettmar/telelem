@@ -7,21 +7,33 @@ defmodule Telelem.Sandbox.Principal do
   re-validates every struct it is handed, so a hand-built or mutated struct
   fails closed rather than being trusted.
 
-  Permission enum (proposal for day-two review; §3 leaves it open):
-  `:route_read`, `:route_plan`, `:route_apply`, `:receipt_read`, `:dispatch`.
-  `Telelem.Sandbox.resolve/3` requires `:dispatch`.
+  ## Permission enum (closed; day-two proposal)
+
+  One atom per consumer check, so the same principal works unchanged at every
+  boundary:
+
+  | Permission      | Required by                                            |
+  | --------------- | ------------------------------------------------------ |
+  | `:dispatch`     | `Telelem.Sandbox.resolve/3`                            |
+  | `:route_read`   | `Telelem.Ops.Route.read/3` (§4 `read_route`)           |
+  | `:route_write`  | `Telelem.Ops.Route.plan/5` and `apply/6` (§4)          |
+  | `:receipt_read` | `Telelem.Receipts.Store.lookup/3` (§2)                 |
+
+  Any other atom (including the earlier `:route_plan` / `:route_apply`
+  proposal, which §4 replaced with `:route_write`) makes the principal
+  invalid. Permissions never carry tenant: tenant is `tenant_id` only.
   """
 
   alias Telelem.Sandbox.Id
 
   @modes [:sandbox, :serving]
-  @permissions [:route_read, :route_plan, :route_apply, :receipt_read, :dispatch]
+  @permissions [:dispatch, :route_read, :route_write, :receipt_read]
 
   @enforce_keys [:tenant_id, :subject_id, :mode, :permissions]
   defstruct @enforce_keys
 
   @type mode :: :sandbox | :serving
-  @type permission :: :route_read | :route_plan | :route_apply | :receipt_read | :dispatch
+  @type permission :: :dispatch | :route_read | :route_write | :receipt_read
   @type t :: %__MODULE__{
           tenant_id: String.t(),
           subject_id: String.t(),
@@ -59,5 +71,6 @@ defmodule Telelem.Sandbox.Principal do
   def check(_), do: {:error, :invalid_principal}
 
   @spec permitted?(t(), permission()) :: boolean()
-  def permitted?(%__MODULE__{permissions: ps}, perm), do: MapSet.member?(ps, perm)
+  def permitted?(%__MODULE__{permissions: %MapSet{} = ps}, perm), do: MapSet.member?(ps, perm)
+  def permitted?(_, _), do: false
 end
