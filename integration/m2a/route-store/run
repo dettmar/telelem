@@ -9,24 +9,33 @@
 #
 # Every store is a fresh `mktemp -d` directory (mode 700) that is removed on exit.
 # Readiness and acknowledgements are JSON lines read from the writer's stdout through
-# FIFOs; every wait is a bounded `read -t` and a timeout counts as FAIL. Process exit
-# is observed by a bounded poll of /proc (0.2 s slices, same bound); no step relies on
-# a sleep for ordering.
+# FIFOs. Every wait is a bounded `read -t`, and a timeout counts as FAIL. No step relies
+# on a sleep for ordering.
 #
-# Host signals go only to processes this run started (the docker clients and the case-3
-# holder), each through sig_ours: a pidfd opened on the PID, then the kernel start time
-# recorded at spawn is rechecked, then the signal goes to the pidfd. No signal is ever
-# sent by host PID to a BEAM. A BEAM is stopped or killed only through docker, by the
-# full container ID, after verify_writer tied that ID to this run, role, store, BEAM PID
-# and store lock; a failed check aborts the run before the action.
+# Host processes: the docker clients and the case-3 holder each run under `supervise`
+# (next to this script), a Python supervisor owned by the suite. The supervisor spawns
+# the child itself and opens a pidfd on it before the child can be reaped. The
+# supervisor is the only process that can reap it, and it reaps only after the pidfd
+# reports the exit. The suite asks for TERM or KILL over the supervisor's control FIFO.
+# The supervisor signals only through that pidfd, and it reports each send and the
+# exit code on a status FIFO. Neither this script nor the supervisor ever signals by a
+# PID. Closing the control FIFO (which also happens if this shell dies) makes the
+# supervisor SIGKILL its child. No host signal ever goes to a BEAM. A BEAM is stopped
+# or killed only through docker, by the full container ID, after verify_writer tied
+# that ID to this run, role, store, BEAM PID and store lock. A failed check aborts the
+# run before the action.
 #
-# Cleanup removes a container only by full ID and only after owned_cid accepted it: a
-# name this run registered, exactly one container with it, the inspected Id and Name,
-# the registered role label and exactly one bind mount at /sbx/store whose source is
-# the store this run registered for that name (inside this run's mktemp dir). Once an
-# ID is accepted for a name it is pinned: later lookups of that name (including cleanup)
-# must give the same ID. Anything else is left alone, reported, and fails the run.
-# Case 0 tests those rejections against a stubbed docker that only records rm calls.
+# Cleanup removes a container only by full ID and only after owned_cid accepted it. It
+# must be a name this run registered, with exactly one container under it, the
+# inspected Id and Name, the registered role label, and exactly one bind mount at
+# /sbx/store whose source is the store registered for that name (inside this run's
+# mktemp dir). Once an ID is accepted for a name it is pinned: later lookups of that
+# name, cleanup's included, must give the same ID. A container counts as gone only if
+# a `docker ps` exited 0 with empty output. A failed lookup, inspect or rm is never
+# taken as gone. It is reported with docker's stderr and fails the run. Anything else
+# is left alone, reported, and fails the run. Case 0 tests those paths against a
+# stubbed docker that only records rm calls, and tests the supervisor on its own
+# children.
 # Nothing here uses a network (all containers run --network none), touches host
 # settings or writes outside the temp directory.
 set -uo pipefail
@@ -47,9 +56,10 @@ esac
 prereq() { echo "prerequisite missing: $*" >&2; exit 2; }
 [[ $(uname -s) == Linux ]] || prereq "Linux"
 [[ -r /proc/self/fdinfo/0 ]] || prereq "/proc"
-command -v python3 >/dev/null 2>&1 || prereq "python3 (JSON parsing, pidfd signals)"
-python3 -I -c 'import os, signal; os.pidfd_open; signal.pidfd_send_signal' 2>/dev/null ||
+command -v python3 >/dev/null 2>&1 || prereq "python3 (JSON parsing, process supervisor)"
+python3 -I -c 'import os, signal; os.pidfd_open(os.getpid()); signal.pidfd_send_signal; os.waitstatus_to_exitcode' 2>/dev/null ||
   prereq "python3 >= 3.9 with os.pidfd_open (kernel >= 5.3)"
+[[ -r $HERE/supervise ]] || prereq "$HERE/supervise"
 if ((!SELFTEST_ONLY)); then
   for x in "$RS/provision" "$RS/start" "$RS/launch" "$WRAP"; do [[ -x $x ]] || prereq "executable $x"; done
   command -v docker >/dev/null 2>&1 || prereq "docker CLI"
@@ -67,8 +77,9 @@ esac
 NONCE=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 PREFIX="telelem-rs-test-$NONCE"
 
-# --- process identity and signals ---------------------------------------------------------
-declare -A OWNED=() # pid -> kernel start time when registered
+# --- supervised host processes ------------------------------------------------------------
+# The BEAM's kernel start time, read only (verify_writer, still_same). Never used to
+# pick a signal target.
 proc_start() {
   local st f
   { st=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
@@ -76,40 +87,81 @@ proc_start() {
   read -ra f <<<"$st"
   [[ ${f[19]-} =~ ^[0-9]+$ ]] && printf '%s' "${f[19]}"
 }
-proc_state() { # pid -> one-letter state (R, S, Z, ...), or nothing if gone
-  local st
-  { st=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
-  st=${st##*) }
-  printf '%s' "${st%% *}"
+# Each supervised child has a KEY. SCTL[KEY] is this shell's fd on the supervisor's
+# control FIFO (unset once released). SST[KEY] is the fd on its status FIFO (unset
+# once the exit is read). SEXIT[KEY] is the reported exit code.
+declare -A SCTL=() SST=() SEXIT=()
+# spawn KEY [KEEP_FD ...] -- CMD ...: start CMD under a new `supervise`. Redirections on
+# the `spawn` call become CMD's stdio, and KEEP_FDs are passed through as well. Waits
+# (bounded) for "started". On failure sets WHY and returns 1.
+spawn() {
+  local key=$1 d c s
+  shift
+  [[ -z ${SST[$key]-} && -z ${SEXIT[$key]-} ]] || { WHY="supervisor key '$key' reused"; return 1; }
+  d="$BASE/sup-$key"
+  mkdir "$d" && mkfifo "$d/ctl" "$d/st" || { WHY="cannot create $d"; return 1; }
+  exec {c}<>"$d/ctl" {s}<>"$d/st"
+  SCTL[$key]=$c SST[$key]=$s
+  # `<&0`: an async command with no stdin redirection of its own gets /dev/null.
+  python3 -I "$HERE/supervise" "$d/ctl" "$d/st" "$@" <&0 {c}>&- {s}>&- &
+  # $! is not kept: the supervisor is never signalled, waited on or identified by PID.
+  sup_line "$key" || { WHY="supervisor for '$key' did not start within ${T}s"; sup_end "$key"; return 1; }
+  [[ $SLINE == started\ * ]] || { WHY="supervisor for '$key' answered '$SLINE', not started"; sup_end "$key"; return 1; }
 }
-track() { local t; t=$(proc_start "$1") && OWNED[$1]=$t; }
-untrack() { unset 'OWNED[$1]'; }
-ours_alive() { local t; t=$(proc_start "$1") && [[ $t == "${OWNED[$1]-x}" ]]; }
-# sig_ours SIG PID (SIG: KILL, TERM or 0): signal PID only if it is still the process
-# this run registered. pidfd_open pins whatever process has PID now; if /proc/PID then
-# still shows the recorded start time, that pinned process is ours (one that held PID
-# before and after the open), and the signal goes to the pidfd, never to a PID that was
-# recycled in between. Returns 1, sending nothing, if PID is unregistered, gone or
-# not ours.
-SIG_PY='import os, signal, sys
-name, pid, want = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-sig = 0 if name == "0" else int(getattr(signal, "SIG" + name))
-try:
-    fd = os.pidfd_open(pid)
-except OSError:
-    sys.exit(1)
-try:
-    with open("/proc/%d/stat" % pid) as f:
-        st = f.read()
-    if st[st.rindex(")") + 2:].split()[19] != want:
-        sys.exit(1)
-    signal.pidfd_send_signal(fd, sig)
-except (OSError, ValueError, IndexError):
-    sys.exit(1)'
-sig_ours() {
-  [[ $1 == KILL || $1 == TERM || $1 == 0 ]] || return 1
-  [[ -n ${OWNED[$2]-} ]] || return 1
-  python3 -I -c "$SIG_PY" "$1" "$2" "${OWNED[$2]}" 2>/dev/null
+# sup_line KEY: next status line of KEY -> SLINE (bounded). Records "exit RC" in SEXIT.
+sup_line() {
+  SLINE=
+  read -r -t "$T" -u "${SST[$1]}" SLINE || { check_sig; SLINE="<timeout>"; return 1; }
+  check_sig
+  [[ $SLINE =~ ^exit\ ([0-9]+)$ ]] && SEXIT[$1]=${BASH_REMATCH[1]}
+  return 0
+}
+# sup_sig KEY TERM|KILL: ask KEY's supervisor to signal its child through the pidfd.
+# Returns 0 only on "sent SIG". Otherwise sets WHY and returns 1, and nothing was sent,
+# or the child had already exited.
+sup_sig() {
+  [[ $2 == TERM || $2 == KILL ]] || { WHY="SIG$2 is not a signal this suite sends"; return 1; }
+  [[ -n ${SCTL[$1]-} && -z ${SEXIT[$1]-} ]] || { WHY="'$1' is not a running supervised child"; return 1; }
+  printf '%s\n' "$2" >&"${SCTL[$1]}"
+  while sup_line "$1"; do
+    [[ $SLINE == "sent $2" ]] && return 0
+    [[ -n ${SEXIT[$1]-} ]] && { WHY="'$1' exited (${SEXIT[$1]}) before SIG$2 was sent"; return 1; }
+    WHY="supervisor for '$1' answered '$SLINE' to $2"
+    return 1
+  done
+  WHY="supervisor for '$1' did not answer $2 within ${T}s"
+  return 1
+}
+# sup_release KEY: close the control FIFO. The supervisor then SIGKILLs a still-running
+# child (through its pidfd) and reports the exit.
+sup_release() {
+  local c=${SCTL[$1]-}
+  [[ -n $c ]] || return 0
+  exec {c}>&-
+  unset 'SCTL[$1]'
+}
+# sup_end KEY: release KEY, read up to its "exit" line (bounded), and close its status
+# FIFO. Returns 1, keeping the status FIFO for cleanup to retry, if no exit was reported.
+sup_end() {
+  local s=${SST[$1]-}
+  sup_release "$1"
+  [[ -n $s ]] || return 0
+  until [[ -n ${SEXIT[$1]-} ]]; do sup_line "$1" || return 1; done
+  exec {s}<&-
+  unset 'SST[$1]'
+}
+# sup_wait KEY: wait (bounded) for KEY's child to exit -> WAIT_RC. If the bound hits:
+# release it (SIGKILL through the pidfd), WAIT_RC=124, return 1.
+sup_wait() {
+  until [[ -n ${SEXIT[$1]-} ]]; do sup_line "$1" || break; done
+  if [[ -n ${SEXIT[$1]-} ]]; then
+    WAIT_RC=${SEXIT[$1]}
+    sup_end "$1"
+    return 0
+  fi
+  WAIT_RC=124
+  sup_end "$1" || echo "supervisor for '$1' reported no exit after its release" >&2
+  return 1
 }
 
 # --- container ownership and cleanup -------------------------------------------------------
@@ -117,7 +169,7 @@ NAMES=()             # container names this run passed to the launcher (or to do
 declare -A ROLE=()   # name -> telelem.route-store label value it was created with
 declare -A MOUNT=()  # name -> host store this run bind-mounted at /sbx/store for it
 declare -A CIDOF=()  # name -> full ID pinned at the first accepted check
-REJECTED=0           # containers cleanup refused to remove
+REJECTED=0           # container lookups cleanup could not resolve to "removed" or "gone"
 HEX64='^[0-9a-f]{64}$'
 OWNER_PY='import json, sys
 cid, name, role, store = sys.argv[1:5]
@@ -143,39 +195,75 @@ if len(ms) != 1:
     no("%d mounts at /sbx/store, want exactly 1" % len(ms))
 if ms[0].get("Type") != "bind" or ms[0].get("Source") != store:
     no("/sbx/store is %s %r, not a bind of %r" % (ms[0].get("Type"), ms[0].get("Source"), store))'
+# dk ARGS...: run docker. stdout -> DOUT, stderr (one line) -> DERR, returns its status.
+dk() {
+  local rc
+  DOUT=$(docker "$@" 2>"$BASE/dk-err")
+  rc=$?
+  DERR=$(tr '\n' ' ' <"$BASE/dk-err" 2>/dev/null)
+  DERR=${DERR% }
+  return "$rc"
+}
+# ps_ids FILTER -> IDS: full IDs of every container (running or not) matching FILTER.
+# Returns 1 and sets WHY, including docker's status and stderr, if `docker ps` failed.
+# Only a 0 return with empty IDS means "no such container".
+ps_ids() {
+  local rc
+  IDS=
+  dk ps -a --no-trunc --filter "$1" --format '{{.ID}}'
+  rc=$?
+  ((rc == 0)) || { WHY="docker ps --filter $1 failed (exit $rc): ${DERR:-no stderr}"; return 1; }
+  IDS=$DOUT
+}
+# gone_by_id ID: 0 only if `docker ps` exited 0 and listed nothing for this full ID.
+# Otherwise sets WHY and returns 1.
+gone_by_id() {
+  ps_ids "id=$1" || return 1
+  [[ -z $IDS ]] || { WHY="$1 is still listed"; return 1; }
+}
 # owned_cid NAME -> CID: the full (64-hex, immutable) ID of this run's container NAME.
 # Accepted only if NAME was registered with a role and a store inside this run's mktemp
 # dir, exactly one container has that exact name, its ID equals the one pinned for NAME
 # (if any), and `docker inspect ID` shows that Id and Name, the registered role label and
 # exactly one bind mount at /sbx/store from the registered store. The first accepted ID
-# is pinned in CIDOF. Otherwise sets WHY (GONE=1 if no container has the name) and
-# returns 1. Docker addresses a full ID to exactly one container, never to a later one,
-# so every action below uses only CID. Never call it in $(...): CIDOF must persist.
+# is pinned in CIDOF. Otherwise sets WHY and returns 1. GONE=1 only if a `docker ps`
+# exited 0 and listed nothing: for the name, or for the listed ID after a failed
+# inspect. A failed lookup is never "gone". Docker addresses a full ID to exactly one
+# container, never to a later one, so every action below uses only CID. Never call it
+# in $(...): CIDOF must persist.
 owned_cid() {
-  local name=$1 ids js why
+  local name=$1 ids js why ierr
   CID= WHY= GONE=0
   [[ -n ${ROLE[$name]-} ]] || { WHY="name '$name' was not registered by this run"; return 1; }
   [[ ${MOUNT[$name]-} == "$BASE"/?* ]] || { WHY="'$name' store '${MOUNT[$name]-}' is not inside $BASE"; return 1; }
-  ids=$(docker ps -a --no-trunc --filter "name=^${name}\$" --format '{{.ID}}' 2>/dev/null) ||
-    { WHY="docker ps failed for '$name'"; return 1; }
+  ps_ids "name=^${name}\$" || return 1
+  ids=$IDS
   [[ -n $ids ]] || { GONE=1; WHY="no container named '$name'"; return 1; }
   [[ $ids =~ $HEX64 ]] || { WHY="want one full container ID for '$name', got '${ids//$'\n'/,}'"; return 1; }
   [[ -z ${CIDOF[$name]-} || ${CIDOF[$name]} == "$ids" ]] ||
     { WHY="'$name' now resolves to $ids, not the pinned ${CIDOF[$name]}"; return 1; }
-  if ! js=$(docker inspect --type container "$ids" 2>/dev/null); then
-    # Removed (--rm) between ps and inspect: gone, not a rejection.
-    [[ -z $(docker ps -a --no-trunc --filter "id=$ids" --format '{{.ID}}' 2>/dev/null) ]] && GONE=1
-    WHY="docker inspect $ids failed"
+  if ! dk inspect --type container "$ids"; then
+    ierr=${DERR:-no stderr}
+    # Removed (--rm) between ps and inspect is gone, but only if a lookup by ID says so.
+    if gone_by_id "$ids"; then GONE=1 WHY="$ids removed before inspect"; else WHY="docker inspect $ids failed ($ierr); $WHY"; fi
     return 1
   fi
+  js=$DOUT
   why=$(python3 -I -c "$OWNER_PY" "$ids" "$name" "${ROLE[$name]}" "${MOUNT[$name]}" <<<"$js") ||
     { WHY="$ids: ${why:-ownership check failed}"; return 1; }
   CID=$ids
   CIDOF[$name]=$ids
 }
-rm_owned() { # NAME: force-remove this run's container by full ID; else leave it alone
+# rm_owned NAME: force-remove this run's container by full ID; else leave it alone. Every
+# outcome other than "removed" or "gone" (per gone_by_id) is reported and counted.
+rm_owned() {
+  local rerr
   if owned_cid "$1"; then
-    docker rm -f "$CID" >/dev/null 2>&1 || true
+    dk rm -f "$CID" && return 0
+    rerr=${DERR:-no stderr}
+    gone_by_id "$CID" && return 0 # removed by --rm or another pass in between
+    echo "cleanup: could not remove '$1' ($CID): docker rm failed ($rerr); $WHY" >&2
+    REJECTED=$((REJECTED + 1))
   elif ((!GONE)); then
     echo "cleanup: left '$1' alone: $WHY" >&2
     REJECTED=$((REJECTED + 1))
@@ -187,22 +275,26 @@ reap_containers() { # every registered name, twice: a create already in flight a
   for n in "${NAMES[@]}"; do rm_owned "$n"; done
 }
 cleanup() {
-  local rc=$? p killed=()
+  local rc=$? k
   trap - EXIT INT TERM HUP
-  # Clients first, so none of them goes on to create or start a container.
-  for p in "${!OWNED[@]}"; do sig_ours KILL "$p" && killed+=("$p"); done
-  for p in "${killed[@]}"; do { wait "$p"; } 2>/dev/null; done
+  SIG=0 # the signal (if any) is in rc already; let the bounded reads below run
+  # Clients first, so none of them goes on to create or start a container. Releasing
+  # every supervisor makes each SIGKILL its child through its pidfd.
+  for k in "${!SCTL[@]}"; do sup_release "$k"; done
+  for k in "${!SST[@]}"; do
+    sup_end "$k" || { echo "cleanup: supervisor for '$k' reported no exit; its child may still run" >&2; ((rc)) || rc=1; }
+  done
   reap_containers
   rm -rf -- "$BASE"
   if ((REJECTED)); then
-    echo "cleanup left $REJECTED container lookup(s) alone that failed the ownership check" >&2
+    echo "cleanup could not confirm removal of $REJECTED container lookup(s): ownership not shown, or docker failed" >&2
     ((rc)) || rc=1
   fi
   exit "$rc"
 }
 trap cleanup EXIT
 # Signal traps only record the signal. The run exits at its next checkpoint (every
-# bounded wait slice, every event read, every check), never from inside the trap:
+# bounded read, every check), never from inside the trap:
 # bash 5.3 was seen to segfault when a trap's `exit` ran during a $(...) expansion
 # and the EXIT trap then ran more command substitutions, skipping cleanup.
 SIG=0
@@ -245,54 +337,33 @@ PROV_ARGS=(--tenant local --route chat --deployments a,b --preferred a
   --fallback-on-refusal true --deadline-ms 5000 --max-attempts 2)
 
 # run_cmd NAME provision|start STORE ARGS... : foreground, synchronous, bounded. Sets RC,
-# OUT (stdout) and ERR (stderr). A run that exceeds the bound is a FAIL; its client
-# (sig_ours) and its container (owned_cid, full ID) are killed.
+# OUT (stdout) and ERR (stderr). A run that exceeds the bound is a FAIL. Its client is
+# then SIGKILLed through its supervisor and its container is removed (owned_cid, full
+# ID).
 run_cmd() {
-  local n mode=$2 store=$3 pid
+  local n mode=$2 store=$3
   cname "$1" "$mode" "$store"
   n=$CNAME
   shift 3
-  "$RS/$mode" --container-name "$n" --store "$store" "$@" >"$BASE/out" 2>"$BASE/err" </dev/null &
-  pid=$!
-  track "$pid"
-  if ! bounded_wait "$pid"; then
+  spawn "$n" -- "$RS/$mode" --container-name "$n" --store "$store" "$@" >"$BASE/out" 2>"$BASE/err" </dev/null ||
+    abort "$mode ($n) not started: $WHY"
+  if ! sup_wait "$n"; then
     bad "$mode ($n) did not exit within ${T}s"
     rm_owned "$n"
   fi
   RC=$WAIT_RC
-  untrack "$pid"
   OUT=$(<"$BASE/out") ERR=$(<"$BASE/err")
 }
-# bounded_wait PID: wait for our background child with a bound. `wait` has no timeout,
-# so a helper reaps nothing; it only reports when /proc/PID is gone or the bound hits.
-bounded_wait() {
-  local pid=$1 deadline=$((SECONDS + T))
-  # Block on a FIFO read that only times out; recheck between slices (no busy loop).
-  while ours_alive "$pid" && [[ $(proc_state "$pid") != Z ]]; do
-    if ((SECONDS >= deadline)); then
-      sig_ours KILL "$pid"
-      { wait "$pid"; } 2>/dev/null
-      WAIT_RC=124
-      return 1
-    fi
-    read -r -t 0.2 -u "$TICK" _ || true
-    check_sig
-  done
-  { wait "$pid"; } 2>/dev/null # no "Killed" job notice for deliberate kills
-  WAIT_RC=$?
-  return 0
-}
-mkfifo "$BASE/tick"
-exec {TICK}<>"$BASE/tick" # never written: `read -t` on it is a bounded pause
-# client_sig SIG: signal the current writer's docker client (never the BEAM), or abort.
+# client_sig SIG: through its supervisor, signal the current writer's docker client
+# (never the BEAM), or abort.
 client_sig() {
-  sig_ours "$1" "$WPID" || abort "writer client $WPID is no longer the process this run started; no SIG$1 sent"
+  sup_sig "$WNAME" "$1" || abort "SIG$1 to the writer client of $WNAME not sent: $WHY"
 }
 
-# Long-running writer. start_writer NAME STORE [plain]: sets WPID (docker client),
-# WIN/WOUT (fds for the writer's stdin/stdout), WNAME. Default: under harness control
-# (stdin attached). `plain`: the product form, no stdin attached, stopped only by
-# SIGTERM.
+# Long-running writer. start_writer NAME STORE [plain]: starts the docker client under a
+# supervisor keyed by WNAME and sets WIN/WOUT (fds for the writer's stdin/stdout).
+# Default: under harness control (stdin attached). `plain`: the product form, no stdin
+# attached, stopped only by SIGTERM.
 start_writer() {
   cname "$1" start "$2"
   WNAME=$CNAME
@@ -301,13 +372,12 @@ start_writer() {
   mkdir "$d"
   mkfifo "$d/in" "$d/out"
   exec {WIN}<>"$d/in" {WOUT}<>"$d/out"
-  "$RS/start" --container-name "$WNAME" --store "$2" --tenant local --route chat \
-    "${ctl[@]}" <&"$WIN" >&"$WOUT" 2>"$d/err" &
-  WPID=$!
-  track "$WPID"
+  spawn "$WNAME" -- "$RS/start" --container-name "$WNAME" --store "$2" --tenant local --route chat \
+    "${ctl[@]}" <&"$WIN" >&"$WOUT" 2>"$d/err" || abort "writer $WNAME not started: $WHY"
   WERR="$d/err"
 }
-end_writer() { exec {WIN}>&- {WOUT}>&-; untrack "$WPID"; }
+writer_wait() { sup_wait "$WNAME"; } # -> WAIT_RC (124 and the client SIGKILLed on timeout)
+end_writer() { exec {WIN}>&- {WOUT}>&-; }
 event() { # wait (bounded) for the next stdout line of the writer -> LINE
   LINE=
   read -r -t "$T" -u "$WOUT" LINE || { check_sig; LINE="<timeout>"; return 1; }
@@ -389,32 +459,54 @@ still_same() {
 # action, and stop the run (cleanup then removes only containers owned_cid accepts).
 abort() { bad "$1"; echo "aborting before the action; passed $PASS, failed $FAIL"; exit 1; }
 
-# --- case 0: cleanup ownership self-test ---------------------------------------------------
-# Runs the real owned_cid / rm_owned / reap_containers and sig_ours in a subshell where
-# `docker` is a shell function answering from fixed tables and only RECORDING `rm`.
-# No daemon, container or delivered signal is involved (sig_ours is exercised with the
-# null signal 0, which only checks existence). Prints ok/FAIL lines; returns the
-# number of failed checks (capped at 100).
+# --- case 0: cleanup ownership and supervisor self-test --------------------------------------
+# Runs the real owned_cid / rm_owned / reap_containers in a subshell where `docker` is a
+# shell function. It answers from fixed tables, can be told to fail a lookup or an rm,
+# and only RECORDS `rm`. Then runs the real spawn / sup_sig / sup_wait / sup_end and
+# `supervise` on this subshell's own short-lived children (sh, true, sleep). No daemon
+# or container is involved. The only signals sent are TERM and KILL from a supervisor,
+# through its pidfd, to the `sleep` it spawned itself. Prints ok/FAIL lines and returns
+# the number of failed checks (capped at 100).
 cleanup_selftest() (
   trap - EXIT INT TERM HUP
-  local log="$BASE/selftest-rm" err="$BASE/selftest-err" S="$BASE/selftest-store" fails=0 n i me
+  local log="$BASE/selftest-rm" gonef="$BASE/selftest-gone" err="$BASE/selftest-err" S="$BASE/selftest-store" fails=0 n i kf
   : >"$log"
-  NAMES=() ROLE=() MOUNT=() CIDOF=() OWNED=() REJECTED=0
-  declare -A PS=() INSPECT=()
+  : >"$gonef"
+  NAMES=() ROLE=() MOUNT=() CIDOF=() REJECTED=0
+  declare -A PS=() INSPECT=() LIVE=() PSFAIL=() IDFAIL=() RMFAIL=() RMVANISH=()
   ck() { if [[ $2 == "$3" ]]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s (got %s, want %s)\n' "$1" "'$2'" "'$3'"; fails=$((fails + 1)); fi; }
-  removed() { grep -qx -- "$1" "$log"; }
-  docker() { # stub: ps by exact-name filter, inspect by ID, rm only recorded
-    local a n=
+  removed() { grep -qx -- "$1" "$gonef"; }
+  # Stub. ps: by exact-name filter (PS table) or by id filter (LIVE table); PSFAIL or
+  # IDFAIL make it fail with empty stdout. inspect: by ID (INSPECT table). rm: recorded
+  # in $log, then removes (gone file), or fails (RMFAIL), or fails although the
+  # container went away meanwhile (RMVANISH, like a --rm race).
+  docker() {
+    local a n= id=
     case ${1-} in
       ps)
-        for a; do [[ $a == name=* ]] && { n=${a#name=^}; n=${n%\$}; }; done
-        [[ -n $n ]] || return 0
-        for a in ${PS[$n]-}; do removed "$a" || printf '%s\n' "$a"; done ;;
+        for a; do
+          [[ $a == name=* ]] && { n=${a#name=^}; n=${n%\$}; }
+          [[ $a == id=* ]] && id=${a#id=}
+        done
+        if [[ -n $n ]]; then
+          [[ -z ${PSFAIL[$n]-} ]] || { echo "Cannot connect to the Docker daemon (stub)" >&2; return 1; }
+          for a in ${PS[$n]-}; do removed "$a" || printf '%s\n' "$a"; done
+        elif [[ -n $id ]]; then
+          [[ -z ${IDFAIL[$id]-} ]] || { echo "error during connect (stub)" >&2; return 1; }
+          [[ -n ${LIVE[$id]-} ]] && ! removed "$id" && printf '%s\n' "$id"
+        fi
+        return 0 ;;
       inspect)
         a=${!#}
-        [[ -n ${INSPECT[$a]-} ]] && ! removed "$a" || return 1
+        [[ -n ${INSPECT[$a]-} ]] && ! removed "$a" || { echo "Error: No such container: $a (stub)" >&2; return 1; }
         printf '%s\n' "${INSPECT[$a]}" ;;
-      rm) printf '%s\n' "${!#}" >>"$log" ;;
+      rm)
+        a=${!#}
+        printf '%s\n' "$a" >>"$log"
+        if [[ -n ${RMFAIL[$a]-} ]]; then echo "Error response from daemon: removal refused (stub)" >&2; return 1; fi
+        printf '%s\n' "$a" >>"$gonef"
+        if [[ -n ${RMVANISH[$a]-} ]]; then echo "Error response from daemon: No such container: $a (stub)" >&2; return 1; fi
+        return 0 ;;
       *) echo "stub: unexpected docker $*" >&2; return 1 ;;
     esac
   }
@@ -426,13 +518,17 @@ cleanup_selftest() (
   }
   # scen KEY STORE PS-IDS INSPECT-ID NAME LABEL TYPE DEST SOURCE: register KEY as a start
   # container on STORE, docker ps for it lists PS-IDS, inspect of PS-IDS[0] answers with
-  # the given fields (INSPECT-ID is the Id inside that answer).
+  # the given fields (INSPECT-ID is the Id inside that answer), and a lookup by that ID
+  # lists it. An empty INSPECT-ID: inspect of PS-IDS[0] fails and a lookup by ID lists
+  # nothing.
   scen() {
     cname "st-$1" start "$2"
     PS[$CNAME]=$3
-    [[ -n $3 ]] && INSPECT[${3%% *}]=$(js "$4" "$5" "$6" "$7" "$8" "$9")
+    [[ -n $3 && -n $4 ]] || return 0
+    INSPECT[${3%% *}]=$(js "$4" "$5" "$6" "$7" "$8" "$9")
+    LIVE[${3%% *}]=1
   }
-  for i in {1..15}; do printf -v "h$i" '%064x' "$i"; done
+  for i in {1..21}; do printf -v "h$i" '%064x' "$i"; done
   P="$PREFIX-st"
   scen ok "$S" "$h1" "$h1" "$P-ok" start bind /sbx/store "$S"
   scen mount "$S" "$h2" "$h2" "$P-mount" start bind /sbx/store /srv/foreign
@@ -451,41 +547,101 @@ cleanup_selftest() (
   scen pinned "$S" "$h15" "$h15" "$P-pinned" start bind /sbx/store "$S"
   CIDOF[$CNAME]=$h15
   scen gone "$S" "" "" "" "" "" "" ""
+  # Failed lookups are never "gone": ps by name fails with empty output; inspect fails and
+  # ps by ID fails with empty output; inspect fails while ps by ID still lists it.
+  scen psfail "$S" "$h21" "$h21" "$P-psfail" start bind /sbx/store "$S"
+  PSFAIL[$CNAME]=1
+  scen inspectfail "$S" "$h17" "" "" "" "" "" ""
+  IDFAIL[$h17]=1
+  scen inspectlisted "$S" "$h18" "" "" "" "" "" ""
+  LIVE[$h18]=1
+  # Control: inspect fails and ps by ID exits 0 with nothing: removed in between, gone.
+  scen inspectrace "$S" "$h16" "" "" "" "" "" ""
+  # rm fails and ps by ID still lists the container: reported. rm fails because the
+  # container went away meanwhile (ps by ID exits 0 with nothing): gone.
+  scen rmfail "$S" "$h19" "$h19" "$P-rmfail" start bind /sbx/store "$S"
+  RMFAIL[$h19]=1
+  scen rmgone "$S" "$h20" "$h20" "$P-rmgone" start bind /sbx/store "$S"
+  RMVANISH[$h20]=1
   PS[$P-unregistered]=$h2 # a perfect-looking container whose name this run never registered
 
   reap_containers 2>"$err"
   rm_owned "$P-unregistered" 2>>"$err"
-  ck "cleanup: docker rm called for exactly the accepted IDs (ok, pinned), once each" \
-    "$(sort "$log" | tr '\n' ' ')" "$(printf '%s\n' "$h1" "$h15" | sort | tr '\n' ' ')"
-  for n in mount dest type role nolabel name idmix two short outside pinned-swap unregistered; do
+  ck "cleanup: docker rm called only for accepted IDs (ok, pinned, rmgone once; rmfail in both passes)" \
+    "$(sort "$log" | tr '\n' ' ')" "$(printf '%s\n' "$h1" "$h15" "$h19" "$h19" "$h20" | sort | tr '\n' ' ')"
+  for n in mount dest type role nolabel name idmix two short outside pinned-swap psfail inspectfail inspectlisted unregistered; do
     ck "cleanup: '$n' left alone and reported" "$(grep -c "^cleanup: left '$P-$n' alone: " "$err")" \
       "$([[ $n == unregistered ]] && echo 1 || echo 2)"
   done
-  ck "cleanup: a name with no container is neither removed nor reported" "$(grep -c "'$P-gone'" "$err")" 0
-  ck "cleanup: rejections counted (11 names x 2 passes + 1 unregistered)" "$REJECTED" 23
+  ck "cleanup: a failed ps by name (empty output) is reported with docker's stderr, not taken as gone" \
+    "$(grep -c "^cleanup: left '$P-psfail' alone: docker ps --filter name=.* failed (exit 1): Cannot connect to the Docker daemon (stub)$" "$err")" 2
+  ck "cleanup: a failed inspect plus a failed ps by ID (empty output) is reported with both errors" \
+    "$(grep -c "^cleanup: left '$P-inspectfail' alone: docker inspect $h17 failed (Error: No such container: $h17 (stub)); docker ps --filter id=$h17 failed (exit 1): error during connect (stub)$" "$err")" 2
+  ck "cleanup: a failed rm of an accepted ID that is still listed is reported with docker's stderr" \
+    "$(grep -c "^cleanup: could not remove '$P-rmfail' ($h19): docker rm failed (Error response from daemon: removal refused (stub)); $h19 is still listed$" "$err")" 2
+  for n in gone inspectrace rmgone; do
+    ck "cleanup: '$n' (a successful empty docker ps) is gone: not reported" "$(grep -c "'$P-$n'" "$err")" 0
+  done
+  ck "cleanup: unresolved lookups counted (15 names x 2 passes + 1 unregistered)" "$REJECTED" 31
   ck "cleanup: pin carried: 'pinned-swap' still pinned to the gone ID, not to its successor" "${CIDOF[$P-pinned-swap]}" "$h1"
   ck "cleanup: a rejected candidate is never pinned" "${CIDOF[$P-mount]-unset}" unset
+  ck "cleanup: stderr has nothing besides those reports" "$(grep -vc '^cleanup: ' "$err")" 0
 
-  # Signal gate, with the null signal only.
-  OWNED=()
-  me=$BASHPID # this subshell; captured here, since $BASHPID inside $(...) is the child
-  sig_ours 0 "$me"
-  ck "sig_ours: unregistered PID gets nothing" "$?" 1
-  OWNED[$me]=1
-  sig_ours 0 "$me"
-  ck "sig_ours: registered PID with a different start time gets nothing" "$?" 1
-  OWNED[$me]=$(proc_start "$me")
-  sig_ours 0 "$me"
-  ck "sig_ours: control: the registered process (same start time) is reachable" "$?" 0
-  OWNED[999999999]=1
-  sig_ours 0 999999999
-  ck "sig_ours: registered but gone PID gets nothing" "$?" 1
+  # Supervisor, on this subshell's own children only.
+  unset -f docker
+  SCTL=() SST=() SEXIT=()
+  T=10
+  spawn sx-exit -- /bin/sh -c 'exit 7' </dev/null
+  ck "supervise: started" "$?" 0
+  sup_wait sx-exit
+  ck "supervise: reports the child's exit code" "$? $WAIT_RC" "0 7"
+  spawn sx-in -- /bin/sh -c 'read -r l; echo "$l"' <<<"from-the-caller" >"$BASE/selftest-in"
+  sup_wait sx-in
+  ck "supervise: the child's stdin is the one redirected on the spawn call" "$WAIT_RC $(<"$BASE/selftest-in")" "0 from-the-caller"
+  exec {kf}</dev/null
+  spawn sx-fds "$kf" -- /bin/sh -c 'n=0; while [ $n -lt 1024 ]; do [ -e /proc/self/fd/$n ] && printf "%s " $n; n=$((n + 1)); done' \
+    </dev/null >"$BASE/selftest-fds" 2>/dev/null
+  sup_wait sx-fds
+  ck "supervise: the child holds only stdio and the kept fd (no control or status FIFO)" "$(<"$BASE/selftest-fds")" "0 1 2 $kf "
+  exec {kf}<&-
+  spawn sx-term -- sleep 30 </dev/null
+  sup_sig sx-term TERM
+  ck "supervise: TERM to its running child is sent through the pidfd" "$?" 0
+  sup_wait sx-term
+  ck "supervise: that child reports 143" "$WAIT_RC" 143
+  spawn sx-kill -- sleep 30 </dev/null
+  sup_sig sx-kill KILL
+  ck "supervise: KILL to its running child is sent through the pidfd" "$?" 0
+  sup_wait sx-kill
+  ck "supervise: that child reports 137" "$WAIT_RC" 137
+  sup_sig sx-kill KILL
+  ck "supervise: nothing is sent once the child's exit was reported" "$?" 1
+  spawn sx-ref -- sleep 30 </dev/null
+  sup_sig sx-ref INT
+  ck "supervise: the suite sends only TERM or KILL" "$?" 1
+  printf 'HUP\n' >&"${SCTL[sx-ref]}"
+  sup_line sx-ref
+  ck "supervise: the supervisor refuses any other request" "$SLINE" "refused HUP"
+  sup_end sx-ref
+  ck "supervise: releasing the control FIFO SIGKILLs the child and reports it" "$? ${SEXIT[sx-ref]-}" "0 137"
+  # Each supervisor drops the descriptors it inherited, so a later supervisor does not
+  # keep an earlier one's control FIFO open: releasing the earlier one still reaches it.
+  spawn sx-a -- sleep 30 </dev/null
+  spawn sx-b -- sleep 30 </dev/null
+  sup_end sx-a
+  ck "supervise: releasing one supervisor works while a later one still runs" "$? ${SEXIT[sx-a]-}" "0 137"
+  sup_end sx-b
+  spawn sx-noexec -- "$BASE/no-such-command" </dev/null 2>/dev/null
+  ck "supervise: a command that cannot run fails spawn with exit 127" "$? ${SEXIT[sx-noexec]-}" "1 127"
+  spawn sx-exit -- true </dev/null
+  ck "supervise: a key is never reused" "$?" 1
+  ck "supervise: no supervisor left open" "${#SCTL[@]} ${#SST[@]}" "0 0"
   ((fails > 100)) && fails=100
   exit "$fails"
 )
 
 # =========================================================================================
-echo "# 0. cleanup ownership and signal gate (stubbed docker: no daemon, containers or signals)"
+echo "# 0. cleanup ownership (stubbed docker) and the process supervisor (own children only)"
 cleanup_selftest
 expect "case 0: every check above held" "$?" 0
 if ((SELFTEST_ONLY)); then
@@ -527,9 +683,8 @@ mkfifo "$BASE/h-ready" "$BASE/h-release"
 exec {HR}<>"$BASE/h-ready" {HW}<>"$BASE/h-release"
 # A foreign wrapped writer on the host holds the store; the commands' wrapper runs in
 # the container and sees the same inode through the bind mount.
-"$WRAP" "$STORE" -- /bin/bash -c 'echo ready >&"$1"; read -r _ <&"$2"' _ "$HR" "$HW" &
-HPID=$!
-track "$HPID"
+spawn holder "$HR" "$HW" -- "$WRAP" "$STORE" -- /bin/bash -c 'echo ready >&"$1"; read -r _ <&"$2"' _ "$HR" "$HW" </dev/null ||
+  abort "host holder not started: $WHY"
 read -r -t "$T" -u "$HR" hl || { check_sig; hl=timeout; }
 expect "host holder acquired the lock" "$hl" ready
 before=$(snapshot "$STORE")
@@ -539,8 +694,8 @@ expect "provision while held: no writer event, nothing written" "${OUT:-none} $(
 run_cmd busy-start start "$STORE" --tenant local --route chat
 expect "start while held: busy 75, store unchanged" "$RC $(snapshot "$STORE")" "75 $before"
 echo go >&"$HW"
-bounded_wait "$HPID"
-untrack "$HPID"
+sup_wait holder
+expect "host holder exits 0 once released (cooperatively, over its FIFO)" "$WAIT_RC" 0
 exec {HR}>&- {HW}>&-
 run_cmd busy-after provision "$STORE" "${PROV_ARGS[@]}"
 expect "control: provision acquires once the holder exits" "$RC $(jget "$OUT" 'd["record"]["rev"]')" "0 1"
@@ -590,10 +745,11 @@ expect "provision after the change: still busy 75, store unchanged" "$RC $(snaps
 client_sig TERM # to the launcher's docker client, which forwards it to the BEAM (--sig-proxy)
 event
 expect "SIGTERM to the start command: orderly stop event" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["reason"]')" "stopped sigterm"
-bounded_wait "$WPID"
+writer_wait
 expect "start command exit 0 after normal stop" "$WAIT_RC" 0
 end_writer
-expect "the container is gone" "$(docker ps -aq --filter "name=^${WNAME}\$")" ""
+expect "the container is gone (docker ps exits 0 and lists nothing)" \
+  "$(if ps_ids "name=^${WNAME}\$"; then echo "${IDS:-none}"; else echo "lookup failed: $WHY"; fi)" none
 expect "nothing holds the store any more" "$(holders_of "$LS")" ""
 expect "normal stop left the record as acknowledged" "$(snapshot "$LS")" "$before"
 
@@ -617,7 +773,7 @@ ok "writer verified: container ${CID:0:12}… runs beam.smp (host pid $VPID, ns 
 still_same || abort "writer changed before docker kill: $WHY"
 expect "docker kill --signal KILL of exactly that container (full ID)" \
   "$(timeout -k 5 "$T" docker kill --signal KILL "$CID" 2>&1)" "$CID"
-bounded_wait "$WPID"
+writer_wait
 expect "start command reports the BEAM killed (137)" "$WAIT_RC" 137
 end_writer
 expect "nothing holds the store after SIGKILL" "$(holders_of "$LS")" ""
@@ -634,7 +790,7 @@ expect "read back through the store: rev 3, plan digest $P3" "$(jget "$LINE" 'd[
 send "stop"
 event
 expect "harness stop: orderly stop" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["reason"]')" "stopped harness"
-bounded_wait "$WPID"
+writer_wait
 expect "exit 0" "$WAIT_RC" 0
 end_writer
 expect "record unchanged by restart and stop" "$(snapshot "$LS")" "$after3"
@@ -647,7 +803,7 @@ expect "plain start ready at rev 3" "$(jget "$LINE" 'd["event"]') $(jget "$LINE"
 verify_writer "$WNAME" "$LS" start || abort "verify the plain writer before killing its client: $WHY"
 BP=$VPID C4=$CID # read only; C4 is pinned to the name from here on
 client_sig KILL # the docker client this run started, not the BEAM
-bounded_wait "$WPID"
+writer_wait
 end_writer
 expect "client dead; the container still runs and its BEAM still holds the store" \
   "$(docker inspect -f '{{.State.Running}}' "$C4" 2>/dev/null) $(holders_of "$LS")" "true $BP"
@@ -671,12 +827,19 @@ expect "after docker stop: the lock is released and start reopens rev 3 / $P3" \
   "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" "ready 3 $P3"
 verify_writer "$WNAME" "$LS" start || abort "verify the harness writer before killing its client: $WHY"
 client_sig KILL # the docker client this run started, not the BEAM
-bounded_wait "$WPID"
+writer_wait
 end_writer
-w=$(timeout -k 5 "$T" docker wait "$CID" 2>&1)
-# `docker wait` prints the exit code if it saw the exit, or the --rm removal already
-# happened; the latter says nothing about how the writer exited.
-case $w in 0 | *"No such container"*) w=exited ;; esac
+# `docker wait` prints the exit code if it saw the exit. If it fails, the container
+# counts as exited only if a lookup by full ID exits 0 and lists nothing (--rm removal
+# already happened, which says nothing about how the writer exited). Any other failure
+# is shown as is.
+if w=$(timeout -k 5 "$T" docker wait "$CID" 2>&1); then
+  [[ $w == 0 ]] && w=exited
+elif gone_by_id "$CID"; then
+  w=exited
+else
+  w="docker wait failed ($w); $WHY"
+fi
 expect "harness client SIGKILLed: the container exits by itself (exit 0 seen, or already removed)" "$w" exited
 expect "nothing holds the store; record still rev 3" "$(holders_of "$LS") $(snapshot "$LS")" " $before"
 start_writer w6 "$LS"
@@ -686,7 +849,7 @@ expect "after the harness-form exit: start reopens rev 3 / $P3" \
 send "stop"
 event
 ev=$(jget "$LINE" 'd["event"]')
-bounded_wait "$WPID"
+writer_wait
 expect "harness stop: stopped event, exit 0, record unchanged" "$ev $WAIT_RC $(snapshot "$LS")" "stopped 0 $before"
 end_writer
 
