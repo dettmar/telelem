@@ -1,18 +1,48 @@
-# Manual, opt-in source release for telelem. It never runs on push or tag events.
+# Manual, dry-run-only source release check for telelem. It never runs on push or
+# tag events, and no job has write permission.
 #
-#   Actions -> release -> Run workflow (from main), tag=vX.Y.Z, publish=false|true
+#   Actions -> release -> Run workflow (from main), tag=vX.Y.Z
 #
-# 1. validate:  run from main; the tag already exists, is strict vX.Y.Z, matches
+# 1. validate:  run from main; the tag already exists, is strict vX.Y.Z, is a
+#               lightweight tag or ONE annotated tag object pointing straight at
+#               a commit (nested tags are rejected, never peeled), matches
 #               mix.exs, and its commit is on main. This workflow never creates a tag.
 # 2. ci, security: the same gates as push/PR, run on the validated commit.
-# 3. package:   read-only. Builds a versioned source archive (git archive) and a
-#               provenance text, plus SHA256SUMS. These are source files only:
-#               no binary, image or deploy.
-# 4. publish:   only with publish=true. The only job with write permission. It
-#               checks out nothing and runs no repository scripts. It re-checks
-#               the tag and the checksums, then creates a DRAFT release on the
-#               existing tag (gh --verify-tag). A maintainer reviews it and
-#               publishes it by hand.
+# 3. package:   git only, no repository scripts. Builds a versioned source archive
+#               (git archive), a provenance text and SHA256SUMS. Source only: no
+#               binary, image or deploy. Uploads one attempt-specific artifact and
+#               passes its immutable artifact ID, digest and file hashes forward
+#               as job outputs.
+# 4. verify:    downloads that artifact by ID (not by name), requires exactly the
+#               three expected files and the exact two-line manifest, re-checks the
+#               hashes against the package outputs, and re-reads the tag through
+#               the API under the same nested-tag policy. The tag ref must still
+#               name the object that validate saw.
+#
+# Why there is no publish job: a release written by this workflow is only as
+# trustworthy as the tag it names. On 2026-11-24 the repository had no tag
+# ruleset (GET /repos/{owner}/{repo}/rulesets -> []) and immutable releases were
+# disabled. Ruleset bypass actors are only returned to callers with write access
+# to the ruleset, so the job token cannot prove "no bypass". Re-add a write job
+# only after a ruleset blocks update and deletion of refs/tags/v*.*.* with no
+# bypass actors, and a maintainer has confirmed that.
+#
+# Operator handoff (a maintainer, outside this workflow):
+#   1. Note the run ID, attempt and the verify job summary (artifact ID, digest,
+#      commit, SHA-256 of both files).
+#   2. gh run download <run-id> -n release-vX.Y.Z-attempt-<N> -D dist
+#      (cd dist && sha256sum --strict -c SHA256SUMS), and compare the hashes with the summary.
+#   3. git fetch --tags && git rev-parse 'vX.Y.Z^{commit}' must equal the
+#      commit in telelem-X.Y.Z-provenance.txt.
+#   4. Publish by hand, as a draft first, on the existing tag only:
+#      gh release create vX.Y.Z --verify-tag --draft --title "telelem vX.Y.Z" \
+#        --notes-file dist/telelem-X.Y.Z-provenance.txt dist/telelem-X.Y.Z-src.tar.gz \
+#        dist/telelem-X.Y.Z-provenance.txt dist/SHA256SUMS
+#
+# Same-repository reusable workflows use GitHub's `$/` self-repository syntax
+# (github.com only; runner >= 2.336.0). It resolves to the running commit and
+# does not depend on workspace state. actionlint 1.7.12 predates this syntax:
+# lint a copy with `$/` replaced by `./` to check the call contracts.
 #
 # Action pins (verified upstream on 2026-11-24; see ci.yml for the rest):
 #   actions/checkout          v7.0.1 3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -27,10 +57,6 @@ on:
         description: Existing release tag on main, vMAJOR.MINOR.PATCH (must equal mix.exs version)
         type: string
         required: true
-      publish:
-        description: Create a draft GitHub release from the checked artifacts (default is a dry run)
-        type: boolean
-        default: false
 
 permissions: {}
 
@@ -52,6 +78,7 @@ jobs:
       contents: read
     outputs:
       sha: ${{ steps.check.outputs.sha }}
+      ref_object: ${{ steps.check.outputs.ref_object }}
       version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -65,32 +92,47 @@ jobs:
           [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
             || { echo "::error::tag must be vMAJOR.MINOR.PATCH, got '$TAG'"; exit 1; }
           version="${TAG#v}"
-          sha="$(git rev-parse --verify --quiet "refs/tags/$TAG^{commit}")" \
+          ref_object="$(git rev-parse --verify --quiet "refs/tags/$TAG")" \
             || { echo "::error::tag $TAG does not exist; create and push it first (this workflow never tags)"; exit 1; }
+          # Nested-tag policy (same as verify): a lightweight tag names a commit, or
+          # exactly one annotated tag object names a commit. Anything else is rejected.
+          case "$(git cat-file -t "$ref_object")" in
+            commit) sha="$ref_object" ;;
+            tag)
+              [[ "$(git cat-file tag "$ref_object" | sed -n '1,4s/^type //p')" == commit ]] \
+                || { echo "::error::$TAG is a nested tag (tag of a non-commit); rejected"; exit 1; }
+              [[ "$(git cat-file tag "$ref_object" | sed -n '1,4s/^tag //p')" == "$TAG" ]] \
+                || { echo "::error::annotated tag object under $TAG carries another tag name"; exit 1; }
+              sha="$(git cat-file tag "$ref_object" | sed -n '1s/^object //p')" ;;
+            *) echo "::error::$TAG names a $(git cat-file -t "$ref_object"), not a commit"; exit 1 ;;
+          esac
+          [[ "$sha" =~ ^[0-9a-f]{40}$ && "$(git cat-file -t "$sha")" == commit ]] \
+            || { echo "::error::could not resolve $TAG to a commit"; exit 1; }
           git merge-base --is-ancestor "$sha" refs/remotes/origin/main \
             || { echo "::error::$TAG ($sha) is not on main"; exit 1; }
           mix_version="$(git show "$sha:mix.exs" | sed -nE 's/^ *version: "([^"]+)",?$/\1/p')"
           [[ "$mix_version" == "$version" ]] \
             || { echo "::error::mix.exs version '$mix_version' != tag version '$version'"; exit 1; }
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "release $TAG -> $sha (on main, mix.exs $mix_version)"
+          {
+            echo "sha=$sha"
+            echo "ref_object=$ref_object"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "release $TAG -> ref object $ref_object -> commit $sha (on main, mix.exs $mix_version)"
 
   ci:
     needs: validate
     permissions:
       contents: read
-    uses: ./.github/workflows/ci.yml
+    uses: $/.github/workflows/ci.yml
     with:
       ref: ${{ needs.validate.outputs.sha }}
 
   security:
-    # Owned separately. Contract: `on: workflow_call` with an optional string
-    # input `ref` (commit to scan), needing no more than contents: read.
     needs: validate
     permissions:
       contents: read
-    uses: ./.github/workflows/security.yml
+    uses: $/.github/workflows/security.yml
     with:
       ref: ${{ needs.validate.outputs.sha }}
 
@@ -101,20 +143,29 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_name: ${{ steps.build.outputs.artifact_name }}
+      archive_sha256: ${{ steps.build.outputs.archive_sha256 }}
+      provenance_sha256: ${{ steps.build.outputs.provenance_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
       - name: Build (git only; no repository scripts run)
+        id: build
         env:
           TAG: ${{ inputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
+          REF_OBJECT: ${{ needs.validate.outputs.ref_object }}
           VERSION: ${{ needs.validate.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
           ACTOR: ${{ github.triggering_actor }}
+          ATTEMPT: ${{ github.run_attempt }}
         run: |
           [[ "$(git rev-parse HEAD)" == "$SHA" ]] || { echo "::error::checkout is not $SHA"; exit 1; }
           out="$RUNNER_TEMP/dist"; mkdir -p "$out"
@@ -125,7 +176,7 @@ jobs:
             echo "telelem $TAG source release (provenance, plain text, unsigned)"
             echo
             echo "artifact:        $name-src.tar.gz  (git archive of the commit; source only, no binary)"
-            echo "tag:             $TAG"
+            echo "tag:             $TAG  (ref object $REF_OBJECT)"
             echo "commit:          $SHA"
             echo "tree:            $(git rev-parse "$SHA^{tree}")"
             echo "commit date:     $(git show -s --format=%cI "$SHA")"
@@ -139,44 +190,86 @@ jobs:
             echo "triggered by:    $ACTOR"
             echo "gates passed:    ci.yml (shell, elixir, fixture, m1), security.yml, run on $SHA in this run"
             echo "build host:      ${ImageOS:-unknown} ${ImageVersion:-unknown}, $(git --version)"
+            echo "status:          dry run; not a GitHub release. Publication is a separate maintainer step."
           } > "$out/$name-provenance.txt"
           (cd "$out" && sha256sum "$name-src.tar.gz" "$name-provenance.txt" > SHA256SUMS && cat SHA256SUMS)
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+          {
+            echo "artifact_name=release-$TAG-attempt-$ATTEMPT"
+            echo "archive_sha256=$(sha256sum "$out/$name-src.tar.gz" | cut -d' ' -f1)"
+            echo "provenance_sha256=$(sha256sum "$out/$name-provenance.txt" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-${{ inputs.tag }}
+          name: ${{ steps.build.outputs.artifact_name }}
           path: ${{ runner.temp }}/dist/
           if-no-files-found: error
+          overwrite: false
           retention-days: 30
 
-  publish:
-    name: draft GitHub release (write)
+  verify:
+    name: verify artifact and tag (read-only)
     needs: [validate, package]
-    if: inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      contents: write
+      contents: read
     steps:
-      # No checkout: nothing from the repository runs with write permission.
+      # No checkout: only the uploaded artifact and the GitHub API are inspected.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: release-${{ inputs.tag }}
+          artifact-ids: ${{ needs.package.outputs.artifact_id }}
           path: dist
-      - name: Verify checksums and tag, then create the draft release
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Exact files, manifest, hashes and unchanged tag
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           SHA: ${{ needs.validate.outputs.sha }}
+          REF_OBJECT: ${{ needs.validate.outputs.ref_object }}
           VERSION: ${{ needs.validate.outputs.version }}
+          ARTIFACT_ID: ${{ needs.package.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.package.outputs.artifact_digest }}
+          ARTIFACT_NAME: ${{ needs.package.outputs.artifact_name }}
+          ARCHIVE_SHA256: ${{ needs.package.outputs.archive_sha256 }}
+          PROVENANCE_SHA256: ${{ needs.package.outputs.provenance_sha256 }}
         run: |
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "::error::no artifact ID from package"; exit 1; }
           cd dist
+          a="telelem-$VERSION-src.tar.gz"; p="telelem-$VERSION-provenance.txt"
+          # Exactly these three regular files, nothing else (no subdirectories, links or extras).
+          got="$(find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)"
+          want="$(printf 'f %s\n' SHA256SUMS "$a" "$p" | LC_ALL=C sort)"
+          [[ "$got" == "$want" ]] || { echo "::error::unexpected artifact contents:"; echo "$got"; exit 1; }
+          # Exact manifest, byte for byte, built from the package job outputs.
+          printf '%s  %s\n%s  %s\n' "$ARCHIVE_SHA256" "$a" "$PROVENANCE_SHA256" "$p" | cmp - SHA256SUMS \
+            || { echo "::error::SHA256SUMS differs from the hashes package reported"; exit 1; }
           sha256sum --strict -c SHA256SUMS
-          # The tag must still point at the commit that passed the gates (it may be annotated).
+          grep -qxF "commit:          $SHA" "$p" || { echo "::error::provenance names another commit"; exit 1; }
+          # The tag ref must still name the object validate saw, under the same nested-tag policy.
           read -r type obj < <(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
-          [[ "$type" == tag ]] && obj="$(gh api "repos/$GH_REPO/git/tags/$obj" --jq .object.sha)"
-          [[ "$obj" == "$SHA" ]] || { echo "::error::tag $TAG now points at $obj, gates ran on $SHA"; exit 1; }
-          gh release create "$TAG" --verify-tag --draft \
-            --title "telelem $TAG" \
-            --notes-file "telelem-$VERSION-provenance.txt" \
-            "telelem-$VERSION-src.tar.gz" "telelem-$VERSION-provenance.txt" SHA256SUMS
+          [[ "$obj" == "$REF_OBJECT" ]] || { echo "::error::tag $TAG moved: now $obj, validated $REF_OBJECT"; exit 1; }
+          case "$type" in
+            commit) target="$obj" ;;
+            tag)
+              read -r ttype target < <(gh api "repos/$GH_REPO/git/tags/$obj" --jq '.object.type + " " + .object.sha')
+              [[ "$ttype" == commit ]] || { echo "::error::$TAG is a nested tag; rejected"; exit 1; } ;;
+            *) echo "::error::$TAG names a $type"; exit 1 ;;
+          esac
+          [[ "$target" == "$SHA" ]] || { echo "::error::$TAG resolves to $target, gates ran on $SHA"; exit 1; }
+          {
+            echo "### Release dry run: $TAG (nothing published)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| commit | \`$SHA\` |"
+            echo "| tag ref object | \`$REF_OBJECT\` ($type) |"
+            echo "| artifact | \`$ARTIFACT_NAME\`, ID \`$ARTIFACT_ID\` |"
+            echo "| artifact digest | \`$ARTIFACT_DIGEST\` |"
+            echo "| \`$a\` sha256 | \`$ARCHIVE_SHA256\` |"
+            echo "| \`$p\` sha256 | \`$PROVENANCE_SHA256\` |"
+            echo
+            echo "Publishing is a maintainer step; see the operator handoff at the top of release.yml."
+          } >> "$GITHUB_STEP_SUMMARY"

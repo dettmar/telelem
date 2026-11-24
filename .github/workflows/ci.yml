@@ -55,7 +55,15 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
-      - run: bash -n scripts/setup scripts/mix integration/m1/run
+      # One `bash -n` per file: `bash -n a b c` parses only `a` (b and c become its arguments).
+      - name: bash -n, each script separately
+        run: |
+          fail=0
+          for f in scripts/setup scripts/mix integration/m1/run; do
+            git ls-files --error-unmatch -- "$f" > /dev/null
+            if bash -n "$f"; then echo "ok   $f"; else echo "::error file=$f::bash -n failed"; fail=1; fi
+          done
+          exit "$fail"
 
   elixir:
     name: elixir (format, compile, xref, tests, prod build)
@@ -73,16 +81,31 @@ jobs:
       - name: Format
         run: scripts/mix format --check-formatted
       - name: Compile (test env, warnings as errors)
-        run: MIX_ENV=test scripts/mix compile --force --warnings-as-errors
+        run: MIX_ENV="test" scripts/mix compile --force --warnings-as-errors
       - name: Xref, no compile-connected dependency cycles
-        run: MIX_ENV=test scripts/mix xref graph --format cycles --label compile-connected --fail-above 0
-      - name: Unit and property tests (fixed seed; M1 real-SDK cases run in the m1 job)
+        run: MIX_ENV="test" scripts/mix xref graph --format cycles --label compile-connected --fail-above 0
+      - name: Unit and property tests (fixed seed; every test file except the M1 real-SDK file)
         run: |
-          scripts/mix test --seed 0 --warnings-as-errors --exclude m1 2>&1 | tee "$RUNNER_TEMP/unit.log"
+          # Selection by file, not by tag: the only file left out is the M1 file,
+          # which the m1 job runs through integration/m1/run.
+          m1=test/telelem/wire_m1_test.exs
+          mapfile -t all < <(git ls-files -- ':(glob)test/**/*_test.exs' | sort)
+          mapfile -t unit < <(printf '%s\n' "${all[@]}" | grep -vxF -- "$m1")
+          mapfile -t m1refs < <(git grep -lE 'TELELEM_TEST_M1_|@moduletag[[:space:]]+:m1\b' -- "${all[@]}")
+          printf 'selected %s\n' "${unit[@]}"; echo "left out $m1 (m1 job)"
+          [[ "$(printf '%s\n' "${all[@]}" | grep -cxF -- "$m1")" == 1 ]] \
+            || { echo "::error::$m1 is not exactly one tracked test file"; exit 1; }
+          [[ ${#unit[@]} -gt 0 && $(( ${#unit[@]} + 1 )) -eq ${#all[@]} ]] \
+            || { echo "::error::selection must be all test files minus exactly $m1"; exit 1; }
+          [[ "${m1refs[*]}" == "$m1" ]] \
+            || { echo "::error::M1 markers outside $m1: ${m1refs[*]}"; exit 1; }
+          scripts/mix test --seed 0 --warnings-as-errors "${unit[@]}" 2>&1 | tee "$RUNNER_TEMP/unit.log"
           result="$(grep -E '^Result: ' "$RUNNER_TEMP/unit.log" | tail -n 1)"
           echo "$result"
-          [[ "$result" =~ ^Result:\ [1-9][0-9]*\ passed ]] || { echo "::error::no passing tests"; exit 1; }
-          [[ ! "$result" =~ skipped|invalid|failure ]] || { echo "::error::skipped or invalid tests are not passes"; exit 1; }
+          # Only "N passed" or "N passed (P properties, T tests)": any skipped,
+          # excluded, invalid or failed count fails the job.
+          [[ "$result" =~ ^Result:\ [1-9][0-9]*\ passed(\ \([^\)]*\))?$ ]] \
+            || { echo "::error::tests skipped, excluded, invalid or failed: $result"; exit 1; }
       - name: "Prod build (locked deps, offline, warnings as errors)"
         run: |
           scripts/mix deps.unlock --check-unused
@@ -146,7 +169,9 @@ jobs:
       - name: integration/m1/run (every case must run; skips fail)
         run: |
           integration/m1/run
-          log="$(ls -1d integration/m1/_run/*/ | tail -n 1)mix-test.log"
+          runs=(integration/m1/_run/*/)
+          [[ ${#runs[@]} -eq 1 && -d "${runs[0]}" ]] || { echo "::error::expected exactly one M1 run directory"; exit 1; }
+          log="${runs[0]}mix-test.log"
           result="$(grep -E '^Result: ' "$log" | tail -n 1)"
           echo "$result"
           [[ "$result" =~ ^Result:\ [1-9][0-9]*\ passed(\ \([^\)]*\))?$ ]] || { echo "::error::M1 cases skipped, excluded, invalid or failed"; exit 1; }
