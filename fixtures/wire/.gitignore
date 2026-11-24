@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# Trust material is generated per run and must never be committed.
+*.pem
+*.key
+ready.json

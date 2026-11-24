@@ -1,0 +1,39 @@
+[project]
+name = "telelem-wire"
+version = "0.1.0"
+description = "TEL-004: counted two-lane loopback TLS HTTP/1.1 SSE wire fixture (OpenAI-compatible grammar) for telelem"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+# Runtime: only what the fixture itself needs (ephemeral CA/leaf generation).
+dependencies = [
+    "cryptography>=46",
+]
+
+[project.optional-dependencies]
+# The client SDK used for the reference run (direct-wire tests and `telelem-wire probe`).
+# Exact version is pinned by uv.lock; see README "Pins".
+sdk = [
+    "openai>=2",
+]
+
+[project.scripts]
+telelem-wire = "telelem_wire.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "openai>=2",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+# Supply-chain cooldown: resolve only releases at least a week old at lock time.
+exclude-newer = "2026-11-17T00:00:00Z"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
