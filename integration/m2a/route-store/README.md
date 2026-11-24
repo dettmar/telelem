@@ -62,7 +62,15 @@ This is how the suite makes an **acknowledged change**. It is a test harness, no
 
 ## What the suite shows
 
-`run` uses fresh `mktemp -d` stores (mode 700, under `TMPDIR`) that are removed on exit. Every container gets a per-run nonce name. Readiness and acks are JSON lines read through FIFOs with bounded `read -t`. Process exit is observed by a bounded `/proc` poll. A timeout counts as FAIL. Cleanup kills only PIDs this run started (checked against the kernel start time), then removes only containers with this run's exact names and the launcher label. SIGINT and SIGTERM abort with 130 and 143, and cleanup runs. Run time is about 25 s.
+`run` uses fresh `mktemp -d` stores (mode 700, under `TMPDIR`) that are removed on exit. Every container gets a per-run nonce name. Readiness and acks are JSON lines read through FIFOs with bounded `read -t`. Process exit is observed by a bounded `/proc` poll. A timeout counts as FAIL. Host signals go only to PIDs this run started, checked against the kernel start time: the docker clients and the case-3 holder. The suite never sends a signal by host PID to a BEAM. A BEAM is killed or stopped only through `docker kill` or `docker stop`, using the full 64-hex container ID. Before that, `verify_writer` checks all of the following:
+
+- The ID belongs to the one container with a name this run registered and the label `telelem.route-store=start`.
+- `docker inspect ID` shows the same ID and name, the container is running, and this run's store is mounted at `/sbx/store`.
+- Its `State.Pid` is `beam.smp`, is PID 1 in its own namespace (`NSpid`), and sits in a cgroup that contains the ID.
+- That PID has exactly one fd on the store, with an exclusive flock (`fdinfo`), and no other process holds the store.
+- Right before the action, the container still shows the same `State.Pid` with the same start time.
+
+If any check fails, the run counts a FAIL and exits 1 before it acts on the writer. Cleanup kills the remaining clients this run started. It then removes containers by full ID, and only after the ID was looked up by exact name and label and the inspected name matched. SIGINT and SIGTERM abort with 130 and 143, and cleanup runs. Run time is about 25 s.
 
 | # | Case | Observed |
 | --- | --- | --- |
@@ -70,8 +78,8 @@ This is how the suite makes an **acknowledged change**. It is a test harness, no
 | 2 | Interrupted provision | A store holding only `route.rec.tmp` (the exact bytes a real provision stages): `start` and `provision` → exit 3 `interrupted_provision`; the temp is untouched (inode, size, mtime, hash) and no `route.rec` appears |
 | 3 | Contention before mutation | A host-side wrapped holder holds an empty store: real `provision` and `start` → 75 busy from the wrapper inside the container, no writer event, the store stays empty. Control: `provision` succeeds after the holder exits. |
 | 4 | Lifecycle and normal stop | `provision` gives rev 1 with no plan digest; a second `provision` gives `already_provisioned` with the record unchanged. `start`: `ready` at rev 1. On the host, the writer is `beam.smp`, the container's PID 1, with exactly one fd on the store inode, an exclusive flock attached to it (`fdinfo`), and no other process holding the store. A real `provision` and a second `start` → 75 with the store unchanged. `apply b` → acked rev 2 (`last_plan_digest` = plan digest), and `route.rec` on disk holds exactly that revision and plan digest with no temp. Contention after the change is still 75. SIGTERM to the start command → `stopped sigterm`, exit 0, container gone, nothing holds the store, record unchanged. |
-| 5 | Restart after normal stop, then abrupt exit | `start` → `ready` with the acked rev 2, digest and plan digest, and the record is not rewritten. `apply a` gives acked rev 3. SIGKILL of exactly that BEAM (host PID of this run's container, verified to be `beam.smp` holding the store) → 137, the lock is gone, the record is untouched. `start` → `ready` with the acked rev 3, digest and plan digest. `read` agrees, and `stop` exits 0. |
-| 6 | Client death | (a) Product form: the client is SIGKILLed, the container still runs and its BEAM still holds the store; `start` and `provision` → 75, store unchanged; `docker stop NAME` recovers. (b) Harness form: the client is SIGKILLed, stdin EOF gives an orderly stop, and the lock is released. |
+| 5 | Restart after normal stop, then abrupt exit | `start` → `ready` with the acked rev 2, digest and plan digest, and the record is not rewritten. `apply a` gives acked rev 3. `docker kill --signal KILL FULL_ID` of this run's container, after `verify_writer` → 137, the lock is gone, the record is untouched. `start` → `ready` with the acked rev 3, digest and plan digest. `read` agrees, and `stop` exits 0. |
+| 6 | Client death | (a) Product form: the client is SIGKILLed, the container still runs and its BEAM still holds the store; `start` and `provision` → 75, store unchanged; `docker stop FULL_ID` recovers, after `verify_writer` (the same BEAM PID that was ready). (b) Harness form: the client is SIGKILLed, stdin EOF gives an orderly stop, and the lock is released. |
 | 7 | No lock, no touch | `main.exs` run in the same container without the wrapper → exit 4, and an interrupted-provision temp is not removed or promoted |
 
 Mutation check, done by hand during authoring and not shipped. The suite failed for each broken copy of the commands:
@@ -86,6 +94,13 @@ Mutation check, done by hand during authoring and not shipped. The suite failed 
 - **Power loss or kernel crash.** Not tested. There is no directory `fsync`, so a completed rename can be lost. No durability, rollback-resistance or freshness claim is made (FileStore moduledoc).
 - **Interrupted provision** is reproduced by planting the staged bytes, not by killing a real `provision` between `fsync` and `rename`.
 - **Two concurrent real provisions.** Provisioning is too short to hold open without a hook. Contention against a provision is shown with the wrapped stand-in holder (case 3) and against a running `start` (case 4).
+- **Container actions and cleanup.** These limits remain:
+  - The container ID is found by name, because `launch` takes no `--cidfile`. Ownership therefore rests on the per-run nonce name, the label and the mount of this run's `mktemp` store. Docker labels and names are not access control: any process with access to the daemon could create a matching container.
+  - Between `still_same` and `docker kill`, the BEAM can still exit. A full ID never refers to a later container, and docker/containerd/runc deliver the signal to that container's init, not to a recycled host PID. The suite trusts that runtime behavior and does not test it.
+  - `verify_writer`'s abort path has not been exercised. Triggering it would mean tampering with a container or a process, which this suite does not do.
+  - Cleanup uses `docker rm -f FULL_ID`, which sends SIGKILL through docker. Cleanup does not run `verify_writer` on these containers; it checks only the exact name, the label and the inspected name.
+  - A `docker run` already in flight when cleanup's two passes run can still create a container after both passes. That container keeps a name with this run's nonce and must be removed by hand.
+  - Case 7's container and the `timeout` around `docker` commands signal only docker clients this run started.
 - **Docker itself.** Not tested: daemon restart, `live-restore`, or `docker kill` of a container whose client is attached elsewhere. Stopping an orphaned writer is the operator's job, by container name.
 - **Immutable path.** The wrapper's assumption holds: whoever controls `HOST_DIR`'s ancestors can swap the directory (store-lock README, test 9). The host-side ancestor check is a snapshot, not a guarantee.
 - **Wrapper exit-code collisions.** The writer's own codes (2/3/4) do not collide with the wrapper's, but a signal status (128+N) can come from either the BEAM or the client. Use stdout events and stderr prefixes when the difference matters.
