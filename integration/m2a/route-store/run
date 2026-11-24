@@ -463,9 +463,10 @@ abort() { bad "$1"; echo "aborting before the action; passed $PASS, failed $FAIL
 # Runs the real owned_cid / rm_owned / reap_containers in a subshell where `docker` is a
 # shell function. It answers from fixed tables, can be told to fail a lookup or an rm,
 # and only RECORDS `rm`. Then runs the real spawn / sup_sig / sup_wait / sup_end and
-# `supervise` on this subshell's own short-lived children (sh, true, sleep). No daemon
-# or container is involved. The only signals sent are TERM and KILL from a supervisor,
-# through its pidfd, to the `sleep` it spawned itself. Prints ok/FAIL lines and returns
+# `supervise` on this subshell's own short-lived children (sh, true, sleep, cat), and
+# the supervisor's writer check against FIFOs this subshell owns. No daemon or
+# container is involved. The only signals sent are TERM and KILL from a supervisor,
+# through its pidfd, to the child it spawned itself. Prints ok/FAIL lines and returns
 # the number of failed checks (capped at 100).
 cleanup_selftest() (
   trap - EXIT INT TERM HUP
@@ -633,6 +634,56 @@ cleanup_selftest() (
   sup_end sx-b
   spawn sx-noexec -- "$BASE/no-such-command" </dev/null 2>/dev/null
   ck "supervise: a command that cannot run fails spawn with exit 127" "$? ${SEXIT[sx-noexec]-}" "1 127"
+  # Writer check. `spawn` always opens CTL before it starts the supervisor, so these run
+  # `supervise` directly, with CTL in a chosen state when the supervisor opens it:
+  #   closed           the only writer opened and closed again (the pipe is gone)
+  #   closed-buffered  TERM and HUP written, then the only writer closed while this
+  #                    shell keeps a read-only fd, so the bytes stay in the pipe
+  #   open-buffered    KILL written and the writer kept open (control)
+  # The child would create $d/ran, then waits for EOF on $d/hold, a FIFO whose only
+  # writer is this shell. "alive" is a FIFO whose only writer is a KEEP_FD of the
+  # supervisor, inherited by any child it starts: EOF on it means that both have exited.
+  # raw_sup NAME MODE -> RAW (status lines, "started PID" normalised), RAWEND (eof or
+  # timeout), RAN (yes or no). Closing $d/hold at the end ends a leaked child (EOF on its
+  # stdin), so no failure here needs a signal.
+  raw_sup() {
+    local d="$BASE/raw-$1" c s r= h ar aw al l
+    mkdir "$d" && mkfifo "$d/ctl" "$d/st" "$d/alive" "$d/hold" || return 1
+    exec {s}<>"$d/st" {h}<>"$d/hold" {ar}<>"$d/alive"
+    exec {aw}>"$d/alive" {al}<"$d/alive"
+    exec {ar}<&-
+    exec {c}<>"$d/ctl"
+    case $2 in
+      closed) exec {c}>&- ;;
+      closed-buffered) exec {r}<"$d/ctl"; printf 'TERM\nHUP\n' >&"$c"; exec {c}>&- ;;
+      open-buffered) printf 'KILL\n' >&"$c" ;;
+    esac
+    # The supervisor itself closes everything inherited except stdio and "alive" (and
+    # so drops the read-only fd $r); the redirections below only make that explicit.
+    python3 -I "$HERE/supervise" "$d/ctl" "$d/st" "$aw" -- /bin/sh -c ': >"$1"; exec cat >/dev/null' _ "$d/ran" \
+      <"$d/hold" >/dev/null {c}>&- {s}>&- {h}>&- {al}<&- &
+    exec {aw}>&-
+    RAW= RAWEND=timeout
+    while read -r -t "$T" -u "$s" l; do
+      [[ $l == started\ * ]] && l="started PID"
+      RAW+=${RAW:+ }$l
+      [[ $l == exit\ * ]] && break
+    done
+    read -r -t "$T" -u "$al" l
+    (($? == 1)) && RAWEND=eof
+    [[ -e $d/ran ]] && RAN=yes || RAN=no
+    exec {c}>&- {h}>&- {s}<&- {al}<&-
+    [[ -z $r ]] || exec {r}<&-
+  }
+  raw_sup closed closed
+  ck "supervise: CTL writer closed before the supervisor opened it: no child started, exit 125, supervisor gone" \
+    "$RAW|$RAWEND|$RAN" "exit 125|eof|no"
+  raw_sup buffered closed-buffered
+  ck "supervise: requests buffered before that EOF are each answered (no child), then exit 125" \
+    "$RAW|$RAWEND|$RAN" "gone TERM refused HUP exit 125|eof|no"
+  raw_sup early-kill open-buffered
+  ck "supervise: control: a request written before the supervisor opened CTL reaches the child" \
+    "$RAW|$RAWEND" "started PID sent KILL exit 137|eof"
   spawn sx-exit -- true </dev/null
   ck "supervise: a key is never reused" "$?" 1
   ck "supervise: no supervisor left open" "${#SCTL[@]} ${#SST[@]}" "0 0"

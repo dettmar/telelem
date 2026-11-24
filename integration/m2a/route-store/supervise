@@ -13,15 +13,28 @@ this supervisor or the child by PID.
 
 CTL is a FIFO that the suite holds open for writing. It sends one request per line:
 "TERM" or "KILL". The answer on STATUS is "sent SIG" (the kernel accepted the signal
-for this child, though the child may already have exited) or "gone SIG" (the child
-has exited). Any other line gets "refused LINE". EOF on CTL means the suite closed it
-or died. The supervisor then SIGKILLs the child through the pidfd, reaps it, reports
-it and quits. SIGTERM or SIGHUP to the supervisor does the same.
+for this child, though the child may already have exited) or "gone SIG" (no child is
+running to receive it: it has exited, or it was never started). Any other line gets
+"refused LINE". EOF on CTL means the suite closed it or died. The supervisor then
+SIGKILLs the child through the pidfd, reaps it, reports it and quits. SIGTERM or
+SIGHUP to the supervisor does the same.
+
+The suite must hold CTL open for writing BEFORE the supervisor opens it. The
+supervisor checks that before it starts CMD: right after opening CTL it reads it
+(non-blocking) until it would block. A read that returns EOF means no writer is
+left, so CMD is never started. A read that would block means a writer exists, and
+from then on Linux reports POLLHUP to this reader once the last writer closes (a
+non-blocking FIFO reader opened with no writer gets no POLLHUP until a writer opens;
+without this check a suite that died before the open would leave CMD running with
+nobody to release it). Requests read by this check are kept and handled, in order,
+before any later one.
 
 STATUS is a FIFO that the suite holds open for reading. The supervisor writes
 "started PID", then any answers, then exactly one "exit RC" as its last line. RC is
-the exit code, or 128+N for signal N. If CMD cannot be executed, the only line is
-"exit 127".
+the exit code, or 128+N for signal N. Without "started" no child ran: if CMD cannot
+be executed, the only line is "exit 127"; if CTL had no writer left, each request
+read before the EOF is answered ("gone SIG" or "refused LINE") and the last line is
+"exit 125".
 """
 import os
 import select
@@ -77,6 +90,45 @@ def main():
         except OSError:
             pass  # suite gone: still reap the child below
 
+    pidfd = None  # set only once the child exists
+
+    def send(name):
+        if pidfd is None:
+            return False  # no child was started: nothing to signal
+        try:
+            signal.pidfd_send_signal(pidfd, getattr(signal, "SIG" + name))
+            return True
+        except ProcessLookupError:
+            return False
+
+    buf = b""
+
+    def handle():  # answer every complete request line in buf, in order
+        nonlocal buf
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            req = line.decode("ascii", "replace").strip()
+            if req in ("TERM", "KILL"):
+                say(("sent " if send(req) else "gone ") + req)
+            else:
+                say("refused " + req)
+
+    # Writer check, before any child exists (see the docstring). Keep what it reads.
+    writer = True
+    while True:
+        try:
+            data = os.read(ctl, 512)
+        except BlockingIOError:
+            break  # empty, and a writer is still open
+        if not data:
+            writer = False  # EOF: no writer left, and buf holds everything it wrote
+            break
+        buf += data
+    if not writer:
+        handle()
+        say("exit 125")
+        return
+
     try:
         child = subprocess.Popen(cmd, close_fds=True, pass_fds=keep)
     except OSError as e:
@@ -85,21 +137,14 @@ def main():
         return
     pidfd = os.pidfd_open(child.pid)  # child unreaped: this PID can only be the child
 
-    def send(name):
-        try:
-            signal.pidfd_send_signal(pidfd, getattr(signal, "SIG" + name))
-            return True
-        except ProcessLookupError:
-            return False
-
     poll = select.poll()
     poll.register(pidfd, select.POLLIN)
     poll.register(ctl, select.POLLIN)
-    buf = b""
     try:
         signal.signal(signal.SIGTERM, stop)
         signal.signal(signal.SIGHUP, stop)
         say("started %d" % child.pid)
+        handle()  # requests read by the writer check
         while True:
             ready = dict(poll.poll())
             if pidfd in ready:
@@ -115,13 +160,7 @@ def main():
                 send("KILL")
                 continue
             buf += data
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                req = line.decode("ascii", "replace").strip()
-                if req in ("TERM", "KILL"):
-                    say(("sent " if send(req) else "gone ") + req)
-                else:
-                    say("refused " + req)
+            handle()
     except Stop:
         send("KILL")
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
