@@ -92,7 +92,7 @@ All numbers below come from 5 consecutive `integration/m1/run` runs on 2026-11-2
 
 ### Terminal grammar through the real SDK (scripted upstream)
 
-The independent fixture has no fault for these byte sequences. In these cases the primary lane is an in-BEAM Bandit TLS upstream that writes exact, test-authored bytes; the client is still the real SDK through the real gateway, and lane b (the fixture) must show `tcp_accepts 0`. These are **not** independent-fixture evidence. Each case was **reproduced as a false success at fe483cf** and fixed afterwards:
+The independent fixture has no fault for these byte sequences. In these cases the primary lane is an in-BEAM Bandit TLS upstream that writes exact, test-authored bytes; the client is still the real SDK through the real gateway, and lane b (the fixture) must show `tcp_accepts 0`. These are **not** independent-fixture evidence. The table distinguishes the valid control from the cases where the SDK or the gateway reported false success at `fe483cf`:
 
 | Upstream bytes (after the role chunk) | fe483cf (before) | now |
 | --- | --- | --- |
