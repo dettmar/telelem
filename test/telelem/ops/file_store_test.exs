@@ -5,8 +5,19 @@ defmodule Telelem.Ops.FileStoreTest do
   These tests run inside one VM and do not take the launcher's cross-VM lock;
   they check the store's own behaviour under that assumed contract. A "new
   VM" after an abandoned store is simulated by copying the directory to a
-  fresh path (the in-VM guard is keyed by directory identity). Not covered:
-  foreign file ownership (needs root), power loss, a real launcher lock.
+  fresh path, which gives a new inode (the in-VM guard is keyed by device and
+  inode).
+
+  Path aliases: the only alias reachable here without root is the same
+  directory under a new name after `rename(2)`; that is what the identity
+  tests use. A bind mount (same device/inode, two live paths) needs
+  `CAP_SYS_ADMIN` and is not exercised. Symlinked paths are refused by
+  `PathPolicy.safe_root/1` before the guard is keyed. The `{:dir, :changed}`
+  re-check (path swapped between the keying `lstat` and the guarded one) has
+  no hook between those two `lstat`s and is not exercised.
+
+  Not covered: foreign file ownership (needs root), power loss, a real
+  launcher lock, a real second VM.
   """
   use ExUnit.Case, async: true
 
@@ -53,7 +64,7 @@ defmodule Telelem.Ops.FileStoreTest do
 
   defp open(dir, extra \\ []) do
     name = :"fs_#{System.unique_integer([:positive])}"
-    opts = [name: name, dir: dir, tenant_id: "local", route_id: "chat"] ++ extra
+    opts = Keyword.merge([name: name, dir: dir, tenant_id: "local", route_id: "chat"], extra)
 
     case FileStore.start(opts) do
       {:ok, pid} ->
@@ -252,13 +263,20 @@ defmodule Telelem.Ops.FileStoreTest do
       assert File.ls!(dir) == []
     end
 
-    test "killed before rename: temp only, needs a fresh directory", c do
+    test "killed before rename: abandoned in this VM; a new VM sees an interrupted provision",
+         c do
       run_killed_provision(c, :provision_synced)
       assert %{"route.rec" => :absent, "route.rec.tmp" => {:regular, _, 1, _}} = snapshot(c.dir)
       before = snapshot(c.dir)
-      assert {:error, :interrupted_provision} = open(c.dir)
-      assert {:error, :interrupted_provision} = FileStore.provision(c.dir, "local", c.rev1)
+      assert {:error, :abandoned_in_this_vm} = open(c.dir)
+      assert {:error, :abandoned_in_this_vm} = FileStore.provision(c.dir, "local", c.rev1)
       assert snapshot(c.dir) == before
+
+      copy = copy_dir(c.dir, c.tmp)
+      before = snapshot(copy)
+      assert {:error, :interrupted_provision} = open(copy)
+      assert {:error, :interrupted_provision} = FileStore.provision(copy, "local", c.rev1)
+      assert snapshot(copy) == before
 
       fresh = Path.join(c.tmp, "fresh")
       File.mkdir!(fresh)
@@ -267,17 +285,39 @@ defmodule Telelem.Ops.FileStoreTest do
       assert {:ok, _} = open(fresh)
     end
 
-    test "killed after rename: provisioned", c do
+    test "killed after rename: abandoned in this VM; a new VM sees it provisioned", c do
       run_killed_provision(c, :provision_renamed)
       assert %{"route.rec.tmp" => :absent, "route.rec" => {:regular, _, 1, _}} = snapshot(c.dir)
-      name = open!(c.dir)
+      before = snapshot(c.dir)
+      assert {:error, :abandoned_in_this_vm} = open(c.dir)
+      assert {:error, :abandoned_in_this_vm} = FileStore.provision(c.dir, "local", c.rev1)
+      assert snapshot(c.dir) == before
+
+      name = open!(copy_dir(c.dir, c.tmp))
       rev1 = c.rev1
 
       assert {:ok, %{revision: ^rev1, last_plan_digest: nil}} =
                FileStore.fetch(name, "local", "chat")
     end
 
-    test "concurrent provisions: one wins, main is valid", %{dir: dir} do
+    test "a provisioning call that raises releases the guard (its I/O has returned)", c do
+      assert_raise RuntimeError, "boom", fn ->
+        FileStore.provision(c.dir, "local", c.rev1,
+          barrier: fn
+            :provision_synced -> raise "boom"
+            _ -> :ok
+          end
+        )
+      end
+
+      # Not abandoned: the ordinary interrupted-provision refusal, nothing touched.
+      before = snapshot(c.dir)
+      assert {:error, :interrupted_provision} = open(c.dir)
+      assert {:error, :interrupted_provision} = FileStore.provision(c.dir, "local", c.rev1)
+      assert snapshot(c.dir) == before
+    end
+
+    test "concurrent provisions: one wins, the rest are busy or see it provisioned", %{dir: dir} do
       results =
         for p <- ["a", "b", "a", "b", "a", "b", "a", "b"] do
           Task.async(fn -> FileStore.provision(dir, "local", rev1(preferred: p)) end)
@@ -287,16 +327,196 @@ defmodule Telelem.Ops.FileStoreTest do
       assert Enum.count(results, &(&1 == :ok)) == 1
 
       for r <- results, r != :ok do
-        assert r in [
-                 {:error, :already_provisioned},
-                 {:error, :interrupted_provision},
-                 {:error, {:io, :create, :eexist}}
-               ]
+        assert r in [{:error, :busy}, {:error, :already_provisioned}]
       end
 
       name = open!(dir)
       assert {:ok, %{revision: %Revision{rev: 1}}} = FileStore.fetch(name, "local", "chat")
       assert snapshot(dir)[FileStore.temp_name()] == :absent
+    end
+  end
+
+  ## In-VM guard: provision and open contention (deterministic, barrier-held)
+
+  describe "provision and open share one in-VM guard" do
+    for stage <- [:provision_synced, :provision_renamed] do
+      test "provision held at #{stage} excludes open and provision; files untouched", c do
+        {holder, task} = hold_provision(c, unquote(stage))
+        before = snapshot(c.dir)
+
+        assert {:error, :already_open} = open(c.dir)
+        assert {:error, :busy} = FileStore.provision(c.dir, "local", rev1(preferred: "b"))
+        assert {:error, :already_open} = open(c.dir, barrier: fn _ -> raise "must not run" end)
+        assert snapshot(c.dir) == before
+
+        send(holder, :go)
+        assert :ok = Task.await(task)
+
+        # Released cleanly: provision is serialized behind it, open succeeds.
+        assert {:error, :already_provisioned} =
+                 FileStore.provision(c.dir, "local", rev1(preferred: "b"))
+
+        name = open!(c.dir)
+        rev1 = c.rev1
+        assert {:ok, %{revision: ^rev1}} = FileStore.fetch(name, "local", "chat")
+        assert snapshot(c.dir)[FileStore.temp_name()] == :absent
+      end
+    end
+
+    test "open held between main validation and temp cleanup excludes provision and open", c do
+      :ok = FileStore.provision(c.dir, "local", c.rev1)
+      File.write!(temp(c.dir), "leftover")
+      test = self()
+
+      barrier = fn
+        :open_validated ->
+          send(test, {:at, :open_validated, self()})
+          receive do: (:go -> :ok)
+
+        _ ->
+          :ok
+      end
+
+      name = :"fs_held_#{System.unique_integer([:positive])}"
+      opts = [name: name, dir: c.dir, tenant_id: "local", route_id: "chat", barrier: barrier]
+      opener = Task.async(fn -> FileStore.start(opts) end)
+      assert_receive {:at, :open_validated, store}, 5000
+      on_exit(fn -> stop_quietly(store) end)
+      before = snapshot(c.dir)
+      assert File.read!(temp(c.dir)) == "leftover"
+
+      assert {:error, :busy} = FileStore.provision(c.dir, "local", c.rev1)
+      assert {:error, :already_open} = open(c.dir)
+      assert snapshot(c.dir) == before
+
+      send(store, :go)
+      assert {:ok, ^store} = Task.await(opener)
+      assert snapshot(c.dir)[FileStore.temp_name()] == :absent
+      assert {:error, :busy} = FileStore.provision(c.dir, "local", c.rev1)
+
+      # A provisioning call against a live store's directory is busy, not a
+      # no-overwrite race; after a clean stop it is serialized normally.
+      :ok = FileStore.stop(name)
+      assert {:error, :already_provisioned} = FileStore.provision(c.dir, "local", c.rev1)
+    end
+
+    test "killed while holding the guard during open: abandoned for open and provision", c do
+      :ok = FileStore.provision(c.dir, "local", c.rev1)
+      File.write!(temp(c.dir), "leftover")
+      test = self()
+
+      barrier = fn
+        :open_validated ->
+          send(test, {:at, :open_validated, self()})
+          receive do: (:go -> :ok)
+
+        _ ->
+          :ok
+      end
+
+      opener =
+        Task.async(fn ->
+          FileStore.start(
+            name: :"fs_k_#{System.unique_integer([:positive])}",
+            dir: c.dir,
+            tenant_id: "local",
+            route_id: "chat",
+            barrier: barrier
+          )
+        end)
+
+      assert_receive {:at, :open_validated, store}, 5000
+      ref = Process.monitor(store)
+      Process.exit(store, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^store, :killed}, 5000
+      assert {:error, :killed} = Task.await(opener)
+
+      before = snapshot(c.dir)
+      assert {:error, :abandoned_in_this_vm} = open(c.dir)
+      assert {:error, :abandoned_in_this_vm} = FileStore.provision(c.dir, "local", c.rev1)
+      assert snapshot(c.dir) == before
+      assert File.read!(temp(c.dir)) == "leftover"
+    end
+  end
+
+  defp hold_provision(c, stage) do
+    test = self()
+
+    task =
+      Task.async(fn ->
+        FileStore.provision(c.dir, "local", c.rev1,
+          barrier: fn
+            ^stage ->
+              send(test, {:at, stage, self()})
+              receive do: (:go -> :ok)
+
+            _ ->
+              :ok
+          end
+        )
+      end)
+
+    assert_receive {:at, ^stage, holder}, 5000
+    {holder, task}
+  end
+
+  ## In-VM guard: keyed by filesystem identity
+
+  describe "guard identity is the directory's device and inode" do
+    test "key is derived from lstat device/inode only", %{dir: dir, tmp: tmp} do
+      {:ok, st} = File.lstat(dir, time: :posix)
+
+      assert FileStore.dir_key(st) ==
+               {FileStore, :dir, st.major_device, st.minor_device, st.inode}
+
+      moved = Path.join(tmp, "moved")
+      File.rename!(dir, moved)
+      {:ok, st2} = File.lstat(moved, time: :posix)
+      assert FileStore.dir_key(st2) == FileStore.dir_key(st)
+
+      other = copy_dir(moved, tmp)
+      {:ok, st3} = File.lstat(other, time: :posix)
+      refute FileStore.dir_key(st3) == FileStore.dir_key(st)
+    end
+
+    test "a live store's directory under a new path is still open", c do
+      :ok = FileStore.provision(c.dir, "local", c.rev1)
+      _name = open!(c.dir)
+      alias_path = Path.join(c.tmp, "renamed")
+      File.rename!(c.dir, alias_path)
+      before = snapshot(alias_path)
+
+      assert {:error, :already_open} = open(alias_path)
+      assert {:error, :busy} = FileStore.provision(alias_path, "local", c.rev1)
+      assert snapshot(alias_path) == before
+    end
+
+    test "a provision in progress excludes open via another path", c do
+      {holder, task} = hold_provision(c, :provision_synced)
+      alias_path = Path.join(c.tmp, "renamed")
+      File.rename!(c.dir, alias_path)
+      assert {:error, :already_open} = open(alias_path)
+      assert {:error, :busy} = FileStore.provision(alias_path, "local", c.rev1)
+
+      # The holder's own path no longer names the guarded directory; its rename
+      # fails and it reports an I/O error without touching the moved directory.
+      send(holder, :go)
+      assert {:error, {:io, :rename, :enoent}} = Task.await(task)
+
+      assert %{"route.rec" => :absent, "route.rec.tmp" => {:regular, _, 1, _}} =
+               snapshot(alias_path)
+    end
+
+    test "an abandoned directory stays abandoned under a new path", c do
+      :ok = FileStore.provision(c.dir, "local", c.rev1)
+      {_name, _d} = kill_during_apply(c, :cas_renamed)
+      alias_path = Path.join(c.tmp, "renamed")
+      File.rename!(c.dir, alias_path)
+      before = snapshot(alias_path)
+
+      assert {:error, :abandoned_in_this_vm} = open(alias_path)
+      assert {:error, :abandoned_in_this_vm} = FileStore.provision(alias_path, "local", c.rev1)
+      assert snapshot(alias_path) == before
     end
   end
 
@@ -312,6 +532,158 @@ defmodule Telelem.Ops.FileStoreTest do
       end)
 
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 5000
+  end
+
+  ## Pre-staging check: canonical size bound and read round trip
+  #
+  # Every ID at its 64-byte maximum. A decodable rev 1 record is at most 892
+  # bytes, so neither provisioning nor the rev 1 -> 2 switch from `null` to a
+  # plan digest can reach the bound with a decodable record; near-limit cases
+  # come from `rev` growing a digit (10^k - 1 -> 10^k), with `deadline_ms`
+  # digits as filler. JSON integers decode up to 310 digits.
+
+  @t String.duplicate("t", 64)
+  @r String.duplicate("r", 64)
+  @dep_a String.duplicate("a", 64)
+  @dep_b String.duplicate("b", 64)
+
+  defp long_rev(rev, deadline_ms) do
+    Revision.new!(
+      route_id: @r,
+      rev: rev,
+      deployments: [@dep_a, @dep_b],
+      preferred: @dep_a,
+      fallback_on_refusal: true,
+      deadline_ms: deadline_ms,
+      max_attempts: 2
+    )
+  end
+
+  defp last_for(%Revision{rev: 1}), do: nil
+  defp last_for(%Revision{} = r), do: PlanDigest.compute(@t, @r, r.rev - 1, r.preferred, r.digest)
+
+  defp size_of(%Revision{} = r, last), do: byte_size(FileStore.encode(@t, r, last))
+
+  # A valid record at `rev` (correct last plan digest) whose canonical
+  # encoding is exactly `size` bytes; `deadline_ms` digits fill the gap.
+  defp sized(rev, size) do
+    probe = long_rev(rev, 1)
+    digits = size - size_of(probe, last_for(probe)) + 1
+    assert digits in 1..310
+    r = long_rev(rev, Integer.pow(10, digits - 1))
+    last = last_for(r)
+    assert size_of(r, last) == size
+    {r, last}
+  end
+
+  defp next_of(%Revision{} = r) do
+    {:ok, r2} = Revision.with_preferred(r, @dep_b)
+    {r2, PlanDigest.compute(@t, @r, r.rev, @dep_b, r2.digest)}
+  end
+
+  defp long_open!(dir), do: open!(dir, tenant_id: @t, route_id: @r)
+
+  defp long_cas(name, %Revision{} = cur, new, d),
+    do: FileStore.compare_and_write(name, @t, @r, %{rev: cur.rev, digest: cur.digest}, new, d)
+
+  # Seed a provisioned directory with `record` as main (as an earlier run would).
+  defp seed(dir, {%Revision{} = r, last}) do
+    :ok = FileStore.provision(dir, @t, long_rev(1, 1))
+    File.write!(main(dir), FileStore.encode(@t, r, last))
+  end
+
+  describe "pre-staging check" do
+    test "provision refuses unstaged: over the bound, and within it but not decodable",
+         %{dir: dir} do
+      max = FileStore.max_bytes()
+      # 311-digit deadline: within the bound, refused by JSON.decode/1.
+      undecodable = long_rev(1, Integer.pow(10, 310))
+      assert size_of(undecodable, nil) <= max
+      assert {:error, :not_decodable} = FileStore.provision(dir, @t, undecodable)
+      assert File.ls!(dir) == []
+
+      too_large = long_rev(1, Integer.pow(10, max))
+      assert size_of(too_large, nil) > max
+      assert {:error, :too_large} = FileStore.provision(dir, @t, too_large)
+      assert File.ls!(dir) == []
+
+      # Largest decodable rev 1 provisions and reopens.
+      largest = long_rev(1, Integer.pow(10, 310) - 1)
+      assert size_of(largest, nil) == 892
+      assert :ok = FileStore.provision(dir, @t, largest)
+      name = long_open!(dir)
+      assert {:ok, %{revision: ^largest, last_plan_digest: nil}} = FileStore.fetch(name, @t, @r)
+    end
+
+    test "CAS: successor one byte over the bound is refused; nothing staged", %{dir: dir} do
+      max = FileStore.max_bytes()
+      {cur, last} = sized(Integer.pow(10, 100) - 1, max)
+      seed(dir, {cur, last})
+      {nxt, d} = next_of(cur)
+      assert size_of(nxt, d) == max + 1
+      name = long_open!(dir)
+      before = snapshot(dir)
+
+      assert {:error, {:rejected, :too_large}} = long_cas(name, cur, nxt, d)
+      assert snapshot(dir) == before
+
+      # Through ops the refusal is the conservative outcome-unknown; nothing landed.
+      op = %{@op | tenant_id: @t}
+
+      assert {:error, {:apply_outcome_unknown, %{cause: :store_integrity}}} =
+               Route.apply(op, ctx(name), @r, cur.rev, @dep_b, d)
+
+      assert snapshot(dir) == before
+      assert {:ok, %{revision: ^cur, last_plan_digest: ^last}} = FileStore.fetch(name, @t, @r)
+      :ok = FileStore.stop(name)
+      assert {:ok, _} = open(dir, tenant_id: @t, route_id: @r)
+    end
+
+    test "CAS: successor within the bound but not decodable is refused; nothing staged",
+         %{dir: dir} do
+      # rev 10^310 - 1 -> 10^310 (311 digits).
+      cur = long_rev(Integer.pow(10, 310) - 1, 1)
+      seed(dir, {cur, last_for(cur)})
+      {nxt, d} = next_of(cur)
+      assert size_of(nxt, d) <= FileStore.max_bytes()
+      name = long_open!(dir)
+      before = snapshot(dir)
+
+      assert {:error, {:rejected, :not_decodable}} = long_cas(name, cur, nxt, d)
+      assert snapshot(dir) == before
+      assert {:ok, %{revision: ^cur}} = FileStore.fetch(name, @t, @r)
+    end
+
+    test "CAS: successor exactly at the bound commits and reopens", %{dir: dir} do
+      max = FileStore.max_bytes()
+      {cur, last} = sized(Integer.pow(10, 100) - 1, max - 1)
+      seed(dir, {cur, last})
+      {nxt, d} = next_of(cur)
+      assert size_of(nxt, d) == max
+      name = long_open!(dir)
+
+      assert {:ok, %{revision: ^nxt, last_plan_digest: ^d}} = long_cas(name, cur, nxt, d)
+      assert byte_size(File.read!(main(dir))) == max
+      assert snapshot(dir)[FileStore.temp_name()] == :absent
+      :ok = FileStore.stop(name)
+
+      name = long_open!(dir)
+      assert {:ok, %{revision: ^nxt, last_plan_digest: ^d}} = FileStore.fetch(name, @t, @r)
+
+      # And the largest decodable rev (310 digits) is reachable by a commit.
+      :ok = FileStore.stop(name)
+      cur = long_rev(Integer.pow(10, 309) - 1, 1)
+      seed_dir = Path.join(Path.dirname(dir), "top")
+      File.mkdir!(seed_dir)
+      File.chmod!(seed_dir, 0o700)
+      seed(seed_dir, {cur, last_for(cur)})
+      {nxt, d} = next_of(cur)
+      name = long_open!(seed_dir)
+      assert {:ok, %{revision: ^nxt}} = long_cas(name, cur, nxt, d)
+      :ok = FileStore.stop(name)
+      name = long_open!(seed_dir)
+      assert {:ok, %{revision: ^nxt}} = FileStore.fetch(name, @t, @r)
+    end
   end
 
   ## Open validation
@@ -485,9 +857,13 @@ defmodule Telelem.Ops.FileStoreTest do
     test "blocked before rename: disk holds old main and new temp; fetch waits", %{dir: dir} do
       test = self()
 
-      barrier = fn stage ->
-        send(test, {:at, stage, self()})
-        receive do: (:go -> :ok)
+      barrier = fn
+        :open_validated ->
+          :ok
+
+        stage ->
+          send(test, {:at, stage, self()})
+          receive do: (:go -> :ok)
       end
 
       name = open!(dir, barrier: barrier)

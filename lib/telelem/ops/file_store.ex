@@ -20,14 +20,37 @@ defmodule Telelem.Ops.FileStore do
   directory. This module never takes that lock itself; the integration with a
   launcher that does is not tested here.
 
-  Within one VM the module adds two guards: a live store holds a `:global`
-  lock on the directory's identity (`{:error, :already_open}` for a second
-  open), and a store that may have died with file I/O in flight blocks any
-  later open of that directory in the same VM (see *I/O quiescence*).
+  Within one VM the module adds a guard that does not replace that lock. It
+  is keyed only by the directory's filesystem identity (device and inode from
+  `lstat` of `:dir`), never by the path string or the registered name, so a
+  renamed or bind-mounted path to the same directory shares it. It has two
+  parts:
+
+    * exclusion: a live owner (a store process for its whole life, or a
+      `provision/3` caller for the whole provisioning call) holds a `:global`
+      lock on that identity. A concurrent open gets `{:error, :already_open}`,
+      a concurrent provision `{:error, :busy}`; neither touches any file. Open
+      and provision take the guard before their first `lstat` of `route.rec`
+      or `route.rec.tmp` and hold it through temp cleanup or the rename.
+    * abandonment: an owner that may have died with file I/O in flight
+      leaves the identity marked, and every later open or provision of that
+      directory in this VM returns `{:error, :abandoned_in_this_vm}` (see
+      *I/O quiescence*).
+
+  Before touching the files, the owner re-`lstat`s `:dir` and refuses
+  `{:error, {:dir, :changed}}` if it no longer has the guarded identity.
 
   ## Record schema
 
-  Bounded (`max_bytes/0`) and checksummed:
+  Bounded (`max_bytes/0`) and checksummed. Before anything is staged, the
+  exact canonical bytes are checked against what a later open accepts: size
+  within the bound (`:too_large`), and the read validator below must return
+  the same revision and plan digest (`:not_decodable`; for example an
+  integer of more than 310 digits, which `JSON.decode/1` refuses). A
+  refusal is `{:error, reason}` from provisioning and `{:error, {:rejected,
+  reason}}` from a compare-and-write, with nothing written. A growing `rev`
+  can therefore stop a route from advancing. It never leaves a main that the
+  store cannot read. The format is:
 
       <payload> "\\n" <lowercase hex SHA-256 of payload> "\\n"
 
@@ -52,11 +75,12 @@ defmodule Telelem.Ops.FileStore do
 
   ## Provisioning (`provision/3`)
 
-  Explicit and only into a directory with neither name present. It writes the
-  `rev` 1 record to an exclusively created temp file, syncs and closes it,
-  re-checks that no main exists and renames it into place. The no-overwrite
-  guarantee for the rename rests on the launcher lock; inside one VM the
-  exclusive temp serializes concurrent provisions. On any failure the
+  Explicit and only into a directory with neither name present. Under the
+  in-VM guard for the whole call, it checks both names, writes the `rev` 1
+  record to an exclusively created temp file, syncs and closes it, re-checks
+  that no main exists and renames it into place. The no-overwrite guarantee
+  across OS processes rests on the launcher lock. Inside one VM the guard
+  serializes provisions with each other and with open. On any failure the
   directory is left as it is.
 
   ## Open (`start_link/1`)
@@ -74,14 +98,16 @@ defmodule Telelem.Ops.FileStore do
 
   ## Compare-and-write
 
-  Within the GenServer: if `expected` is not exactly the current `rev` and
+  Within the GenServer, which holds the in-VM guard: if `expected` is not exactly the current `rev` and
   revision digest, the reply is `{:conflict, current}` only when `current` is
   strictly newer than `expected.rev`; otherwise `{:error, {:rejected,
   :expected_not_current}}`. The new revision must be accepted by
   `Revision.new/1` with its own digest, have `rev` = current + 1 and the same
   `route_id`, `deployments` (order included), `fallback_on_refusal`,
   `deadline_ms` and `max_attempts`; re-preferring the current deployment is a
-  valid successor. The plan digest must equal the recomputed one. A refused
+  valid successor. The plan digest must equal the recomputed one, and the
+  encoded record must pass the pre-staging check (`:too_large`,
+  `:not_decodable`; see *Record schema*). A refused
   successor gets `{:error, {:rejected, reason}}` (nothing written; outside the
   `RevisionStore` reply set, so `Telelem.Ops.Route` reports it as
   outcome-unknown/`store_integrity`, which is conservative).
@@ -109,13 +135,20 @@ defmodule Telelem.Ops.FileStore do
   The store traps exits, so ordinary shutdown and callback crashes run
   `terminate/2` after its last file operation returned; only then is the
   directory released for a reopen in the same VM. If the store dies any other
-  way, or dies during `init/1`, the directory stays marked and every later
-  `start_link/1` for it in this VM returns `{:error, :abandoned_in_this_vm}`:
-  restart the OS process (whose exit ends all its syscalls before the kernel
-  releases the launcher's lock). `provision/3` runs in the caller's process
-  and has the same limit; a killed provisioning caller is recovered by a new
-  OS process. Concurrent provisions in one VM are still serialized by the
-  exclusive temp.
+  way, or crashes during `init/1`, the directory stays marked.
+  `provision/3` runs in the caller's process and releases the guard when it
+  returns or raises; a caller killed by an exit signal during the call leaves
+  the directory marked, whatever stage it reached. Either way, every later
+  `start_link/1` or `provision/3` for that directory in this VM returns
+  `{:error, :abandoned_in_this_vm}`, nothing is reseeded or cleaned, and the
+  only recovery is to restart the OS process (whose exit ends all its
+  syscalls before the kernel releases the launcher's lock). The new process
+  then sees whatever reached the disk: main, a leftover temp, or an
+  interrupted provision.
+
+  The marker is per VM and per device/inode. It is not persisted. If a
+  marked directory is deleted and its inode is reused by a new directory on
+  the same device, the new directory is refused too (fail closed).
 
   ## Calls
 
@@ -140,7 +173,8 @@ defmodule Telelem.Ops.FileStore do
   @group_other_write 0o022
   @fixed [:route_id, :deployments, :fallback_on_refusal, :deadline_ms, :max_attempts]
 
-  @type barrier_stage :: :provision_synced | :provision_renamed | :cas_synced | :cas_renamed
+  @type barrier_stage ::
+          :provision_synced | :provision_renamed | :open_validated | :cas_synced | :cas_renamed
   @type opt ::
           {:name, atom()}
           | {:dir, String.t()}
@@ -195,6 +229,9 @@ defmodule Telelem.Ops.FileStore do
   Errors: `{:error, {:dir, reason}}`, `{:error, {:invalid, :tenant_id}}`,
   `{:error, {:invalid_revision, reason}}` (not a valid `rev` 1 revision;
   `reason` is `:rev`, `:digest` or a `Revision.new/1` error),
+  `{:error, :too_large}` / `{:error, :not_decodable}` (the encoded record
+  would be refused by a later open; nothing written), `{:error, :busy}` (another live owner holds the in-VM guard),
+  `{:error, :abandoned_in_this_vm}`, `{:error, {:dir, :changed}}`,
   `{:error, :already_provisioned}`, `{:error, :interrupted_provision}` (temp
   present, left untouched), `{:error, {:io, stage, reason}}` (directory left
   as is; if a temp remains it needs fresh-directory recovery).
@@ -208,28 +245,52 @@ defmodule Telelem.Ops.FileStore do
     with :ok <- valid_id(tenant_id, :tenant_id),
          {:ok, revision} <- invalid_revision(revalidate(revision)),
          :ok <- if(revision.rev == 1, do: :ok, else: {:error, {:invalid_revision, :rev}}),
-         {:ok, _dir_stat} <- check_dir(dir),
-         :ok <- absent(dir) do
-      bytes = encode(tenant_id, revision, nil)
-
-      with :ok <- stage_temp(dir, bytes) |> io(:temp) do
-        barrier.(:provision_synced)
-
-        case lstat(Path.join(dir, @main)) do
-          {:error, :enoent} ->
-            with :ok <- :file.rename(Path.join(dir, @temp), Path.join(dir, @main)) |> io(:rename) do
-              barrier.(:provision_renamed)
-              :ok
-            end
-
-          _ ->
-            {:error, :already_provisioned}
-        end
+         {:ok, bytes} <- storable(encode(tenant_id, revision, nil), tenant_id, revision, nil),
+         {:ok, dir_stat} <- check_dir(dir) do
+      case guarded(dir, dir_stat, fn -> provision_locked(dir, bytes, barrier) end) do
+        {:error, :held} -> {:error, :busy}
+        other -> other
       end
     end
   end
 
   def provision(_dir, _tenant_id, _revision, _opts), do: {:error, {:invalid_revision, :revision}}
+
+  # Runs entirely under the in-VM directory guard, from the first lstat of the
+  # two names to the rename.
+  defp provision_locked(dir, bytes, barrier) do
+    with :ok <- absent(dir),
+         :ok <- stage_temp(dir, bytes) |> io(:temp) do
+      barrier.(:provision_synced)
+
+      case lstat(Path.join(dir, @main)) do
+        {:error, :enoent} ->
+          with :ok <- :file.rename(Path.join(dir, @temp), Path.join(dir, @main)) |> io(:rename) do
+            barrier.(:provision_renamed)
+            :ok
+          end
+
+        _ ->
+          {:error, :already_provisioned}
+      end
+    end
+  end
+
+  # Runs `fun` in the calling process under the in-VM guard. Any return or
+  # exception from `fun` releases the guard (the caller's own file I/O has
+  # returned by then); an exit signal that kills the caller does not, so the
+  # directory stays marked abandoned in this VM.
+  defp guarded(dir, dir_stat, fun) do
+    key = dir_key(dir_stat)
+
+    with :ok <- claim(key) do
+      try do
+        with :ok <- same_dir(dir, dir_stat), do: fun.()
+      after
+        release(key)
+      end
+    end
+  end
 
   defp invalid_revision({:ok, _} = ok), do: ok
   defp invalid_revision({:error, reason}), do: {:error, {:invalid_revision, reason}}
@@ -247,9 +308,15 @@ defmodule Telelem.Ops.FileStore do
   @doc """
   Opens the store. Required: `:name` (atom; the store is one registered
   process), `:dir` (normalized absolute path), `:tenant_id`, `:route_id`.
-  Optional `:barrier` test hook (`:cas_synced` before, `:cas_renamed` after the
-  rename, run inside the store process). Caller contract: the launcher lock is
-  held (see moduledoc).
+  Optional `:barrier` test hook, run inside the store process:
+  `:open_validated` (in `init/1`, main validated, before temp cleanup),
+  `:cas_synced` before and `:cas_renamed` after a write's rename. Caller
+  contract: the launcher lock is held (see moduledoc).
+
+  Errors besides the validation ones listed in the moduledoc:
+  `{:error, :already_open}` (another live owner, a store or a provisioning
+  call, holds the in-VM guard), `{:error, :abandoned_in_this_vm}` and
+  `{:error, {:dir, :changed}}`.
   """
   @spec start_link([opt()]) :: GenServer.on_start()
   def start_link(opts), do: start(opts, :start_link)
@@ -294,37 +361,72 @@ defmodule Telelem.Ops.FileStore do
     with :ok <- valid_id(opts[:tenant_id], :tenant_id),
          :ok <- valid_id(opts[:route_id], :route_id),
          {:ok, dir_stat} <- check_dir(opts[:dir]) do
-      key =
-        {__MODULE__, :dir, opts[:dir], dir_stat.major_device, dir_stat.minor_device,
-         dir_stat.inode}
+      key = dir_key(dir_stat)
 
-      claim(key, fn -> open(opts, key) end)
+      case claim(key) do
+        :ok ->
+          # Released here only for an error *returned* by open/2. A crash in
+          # init leaves the marker set (fail closed).
+          case open(opts, dir_stat, key) do
+            {:ok, state} ->
+              {:ok, state}
+
+            {:error, _} = err ->
+              release(key)
+              err
+          end
+
+        {:error, :held} ->
+          {:error, :already_open}
+
+        {:error, _} = err ->
+          err
+      end
     else
       {:error, reason} -> {:error, reason}
     end
   end
 
-  # In-VM exclusion and quiescence marker; set before any file I/O beyond
-  # the directory lstat and cleared only once our own I/O has returned.
-  defp claim(key, open) do
-    if :global.set_lock({key, self()}, [node()], 0) do
-      if :persistent_term.get(key, nil) do
-        :global.del_lock({key, self()}, [node()])
-        {:error, :abandoned_in_this_vm}
-      else
-        :persistent_term.put(key, :open)
+  # In-VM guard, keyed only by the directory's filesystem identity (device
+  # and inode from `lstat`), so two paths that reach the same directory (a
+  # rename, a bind mount) share it and the registered name plays no part.
+  # Two parts:
+  #
+  #   * a `:global` lock on `{key, owner}`: exclusion between live owners
+  #     (a store process or a provisioning caller), released by `:global`
+  #     as soon as the owner is observed dead;
+  #   * a `:persistent_term` marker holding the owner pid, set before any
+  #     file I/O beyond the directory lstat and erased (before the lock) only
+  #     after the owner's own I/O returned.
+  #
+  # Holding the lock while the marker is still set therefore means the
+  # previous owner died without releasing: its I/O may still be in flight.
+  @doc false
+  def dir_key(%File.Stat{major_device: major, minor_device: minor, inode: inode}),
+    do: {__MODULE__, :dir, major, minor, inode}
 
-        case open.() do
-          {:ok, state} ->
-            {:ok, state}
+  defp claim(key) do
+    me = self()
 
-          {:error, _} = err ->
-            release(key)
-            err
+    case :persistent_term.get(key, nil) do
+      # Re-entrant call by the current owner (`:global` would grant it).
+      ^me ->
+        {:error, :held}
+
+      _ ->
+        if :global.set_lock({key, me}, [node()], 0) do
+          case :persistent_term.get(key, nil) do
+            nil ->
+              :persistent_term.put(key, me)
+              :ok
+
+            _dead_owner ->
+              :global.del_lock({key, me}, [node()])
+              {:error, :abandoned_in_this_vm}
+          end
+        else
+          {:error, :held}
         end
-      end
-    else
-      {:error, :already_open}
     end
   end
 
@@ -333,14 +435,29 @@ defmodule Telelem.Ops.FileStore do
     :global.del_lock({key, self()}, [node()])
   end
 
-  defp open(opts, key) do
+  # The guard was taken for the identity seen by the first lstat; the path
+  # must still name that directory.
+  defp same_dir(dir, %File.Stat{} = before) do
+    case lstat(dir) do
+      {:ok, %File.Stat{type: :directory} = now} ->
+        if dir_key(now) == dir_key(before), do: :ok, else: {:error, {:dir, :changed}}
+
+      _ ->
+        {:error, {:dir, :changed}}
+    end
+  end
+
+  defp open(opts, dir_stat, key) do
     Process.flag(:trap_exit, true)
     dir = opts[:dir]
     tenant = opts[:tenant_id]
     route = opts[:route_id]
+    barrier = Keyword.get(opts, :barrier, fn _ -> :ok end)
 
-    with {:ok, euid} <- euid(),
+    with :ok <- same_dir(dir, dir_stat),
+         {:ok, euid} <- euid(),
          {:ok, record} <- read_main(dir, tenant, route, euid),
+         _ = barrier.(:open_validated),
          :ok <- clear_temp(dir, euid) do
       {:ok,
        %{
@@ -349,7 +466,7 @@ defmodule Telelem.Ops.FileStore do
          tenant: tenant,
          route: route,
          record: record,
-         barrier: Keyword.get(opts, :barrier, fn _ -> :ok end)
+         barrier: barrier
        }}
     end
   end
@@ -366,8 +483,11 @@ defmodule Telelem.Ops.FileStore do
 
     case check_expected(expected, current) do
       :current ->
-        case successor(current, new, plan_digest, s) do
-          {:ok, revision} -> commit(revision, plan_digest, s)
+        with {:ok, revision} <- successor(current, new, plan_digest, s),
+             bytes = encode(s.tenant, revision, plan_digest),
+             {:ok, bytes} <- storable(bytes, s.tenant, revision, plan_digest) do
+          commit(revision, plan_digest, bytes, s)
+        else
           {:error, reason} -> {:reply, {:error, {:rejected, reason}}, s}
         end
 
@@ -419,9 +539,7 @@ defmodule Telelem.Ops.FileStore do
     end
   end
 
-  defp commit(revision, plan_digest, s) do
-    bytes = encode(s.tenant, revision, plan_digest)
-
+  defp commit(revision, plan_digest, bytes, s) do
     with :ok <- stage_temp(s.dir, bytes) |> io(:temp),
          _ = s.barrier.(:cas_synced),
          :ok <- :file.rename(Path.join(s.dir, @temp), Path.join(s.dir, @main)) |> io(:rename) do
@@ -436,6 +554,21 @@ defmodule Telelem.Ops.FileStore do
   end
 
   ## Files
+
+  # Bytes are staged only if a later open would accept exactly them: within
+  # the size bound, and `decode/3` (the read validator) returns the same
+  # revision and plan digest. `JSON.decode/1` refuses integers longer than
+  # 310 digits, so a huge `rev` or `deadline_ms` can fail here even within
+  # the size bound.
+  defp storable(bytes, _tenant, _revision, _last) when byte_size(bytes) > @max_bytes,
+    do: {:error, :too_large}
+
+  defp storable(bytes, tenant, %Revision{} = revision, last) do
+    case decode(bytes, tenant, revision.route_id) do
+      {:ok, %{revision: ^revision, last_plan_digest: ^last}} -> {:ok, bytes}
+      _ -> {:error, :not_decodable}
+    end
+  end
 
   # Exclusive create, restrict mode, write, fsync, close. Leaves the temp in
   # place on failure (only an open with a valid main may remove it).
