@@ -1,0 +1,177 @@
+# telelem CI gates. Also reused by release.yml through workflow_call.
+#
+# Every Mix command runs in the pinned runner image (scripts/Dockerfile) through
+# scripts/mix. TELELEM_RUNNER=docker turns off the local-mix fallback. Only
+# scripts/setup (image build + `deps.get --check-locked`) and `uv sync --locked`
+# use the network. After that, Mix runs with `--network none`, or with
+# `--network host` for the loopback M1 fixture. No secrets or provider
+# credentials are referenced anywhere in this workflow.
+#
+# Action pins (verified upstream on 2026-11-24: tag -> commit, GitHub-verified signature):
+#   actions/checkout        v7.0.1  3d3c42e5aac5ba805825da76410c181273ba90b1
+#   astral-sh/setup-uv      v10.3.3 68559e99cc807c1eb7e9238fd43a15bba460eec2
+#     (v10.4.0 of 2026-11-20 is newer than the 2026-11-17 dependency cooldown)
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request: # fork-safe: read-only token, no secrets; never pull_request_target
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit SHA to test (release.yml passes the validated tag commit)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow is the caller's name under workflow_call, so release runs never share this group.
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+env:
+  TELELEM_RUNNER: docker
+  UV_VERSION: "0.13.4"
+  UV_SHA256: 2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f # uv-x86_64-unknown-linux-gnu.tar.gz
+  UV_PYTHON: "3.13.9"
+  UV_PYTHON_PREFERENCE: only-managed
+
+jobs:
+  shell:
+    name: shell syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      # One `bash -n` per file: `bash -n a b c` parses only `a` (b and c become its arguments).
+      - name: bash -n, each script separately
+        run: |
+          fail=0
+          for f in scripts/setup scripts/mix integration/m1/run; do
+            git ls-files --error-unmatch -- "$f" > /dev/null
+            if bash -n "$f"; then echo "ok   $f"; else echo "::error file=$f::bash -n failed"; fail=1; fi
+          done
+          exit "$fail"
+
+  elixir:
+    name: elixir (format, compile, xref, tests, prod build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Require a Docker daemon (no local-mix fallback)
+        run: docker info --format 'docker {{.ServerVersion}}'
+      - name: "[online] scripts/setup: pinned image, deps.get --check-locked"
+        run: scripts/setup
+      - name: Format
+        run: scripts/mix format --check-formatted
+      - name: Compile (test env, warnings as errors)
+        run: MIX_ENV="test" scripts/mix compile --force --warnings-as-errors
+      - name: Xref, no compile-connected dependency cycles
+        run: MIX_ENV="test" scripts/mix xref graph --format cycles --label compile-connected --fail-above 0
+      - name: Unit and property tests (fixed seed; every test file except the M1 real-SDK file)
+        run: |
+          # Selection by file, not by tag: the only file left out is the M1 file,
+          # which the m1 job runs through integration/m1/run.
+          m1=test/telelem/wire_m1_test.exs
+          mapfile -t all < <(git ls-files -- ':(glob)test/**/*_test.exs' | sort)
+          mapfile -t unit < <(printf '%s\n' "${all[@]}" | grep -vxF -- "$m1")
+          mapfile -t m1refs < <(git grep -lE 'TELELEM_TEST_M1_|@moduletag[[:space:]]+:m1\b' -- "${all[@]}")
+          printf 'selected %s\n' "${unit[@]}"; echo "left out $m1 (m1 job)"
+          [[ "$(printf '%s\n' "${all[@]}" | grep -cxF -- "$m1")" == 1 ]] \
+            || { echo "::error::$m1 is not exactly one tracked test file"; exit 1; }
+          [[ ${#unit[@]} -gt 0 && $(( ${#unit[@]} + 1 )) -eq ${#all[@]} ]] \
+            || { echo "::error::selection must be all test files minus exactly $m1"; exit 1; }
+          [[ "${m1refs[*]}" == "$m1" ]] \
+            || { echo "::error::M1 markers outside $m1: ${m1refs[*]}"; exit 1; }
+          scripts/mix test --seed 0 --warnings-as-errors "${unit[@]}" 2>&1 | tee "$RUNNER_TEMP/unit.log"
+          result="$(grep -E '^Result: ' "$RUNNER_TEMP/unit.log" | tail -n 1)"
+          echo "$result"
+          # Only "N passed" or "N passed (P properties, T tests)": any skipped,
+          # excluded, invalid or failed count fails the job.
+          [[ "$result" =~ ^Result:\ [1-9][0-9]*\ passed(\ \([^\)]*\))?$ ]] \
+            || { echo "::error::tests skipped, excluded, invalid or failed: $result"; exit 1; }
+      - name: "Prod build (locked deps, offline, warnings as errors)"
+        run: |
+          scripts/mix deps.unlock --check-unused
+          MIX_ENV=prod scripts/mix deps.compile
+          MIX_ENV=prod scripts/mix compile --warnings-as-errors
+      - name: Tracked files unchanged (mix.lock, formatting)
+        run: git diff --exit-code
+
+  fixture:
+    name: python wire fixture (locked)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          checksum: ${{ env.UV_SHA256 }}
+          enable-cache: false
+      - name: "[online] uv sync --locked"
+        working-directory: fixtures/wire
+        run: uv sync --locked
+      - name: pytest (offline; skips fail the job)
+        working-directory: fixtures/wire
+        run: |
+          uv run --locked --offline pytest -q -p no:cacheprovider --junitxml="$RUNNER_TEMP/junit.xml"
+          python3 -I - "$RUNNER_TEMP/junit.xml" <<'EOF'
+          import sys, xml.etree.ElementTree as ET
+          s = ET.parse(sys.argv[1]).getroot().find("testsuite").attrib
+          print(s)
+          bad = int(s["skipped"]) + int(s["errors"]) + int(s["failures"])
+          sys.exit(f"::error::{bad} skipped/errored/failed" if bad or int(s["tests"]) == 0 else 0)
+          EOF
+      - name: Reference scenarios (exit 1 on mismatch)
+        working-directory: fixtures/wire
+        run: uv run --locked --offline telelem-wire scenarios > "$RUNNER_TEMP/scenarios.json"
+
+  m1:
+    name: integration/m1/run (real SDK, loopback)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          checksum: ${{ env.UV_SHA256 }}
+          enable-cache: false
+      - name: Require a Docker daemon (no local-mix fallback)
+        run: docker info --format 'docker {{.ServerVersion}}'
+      - name: "[online] scripts/setup and uv sync --locked"
+        run: |
+          scripts/setup
+          (cd fixtures/wire && uv sync --locked)
+      - name: integration/m1/run (every case must run; skips fail)
+        run: |
+          integration/m1/run
+          runs=(integration/m1/_run/*/)
+          [[ ${#runs[@]} -eq 1 && -d "${runs[0]}" ]] || { echo "::error::expected exactly one M1 run directory"; exit 1; }
+          log="${runs[0]}mix-test.log"
+          result="$(grep -E '^Result: ' "$log" | tail -n 1)"
+          echo "$result"
+          [[ "$result" =~ ^Result:\ [1-9][0-9]*\ passed(\ \([^\)]*\))?$ ]] || { echo "::error::M1 cases skipped, excluded, invalid or failed"; exit 1; }

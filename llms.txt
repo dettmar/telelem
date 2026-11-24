@@ -1,0 +1,24 @@
+# telelem
+
+> A single-node Elixir/OTP gateway experiment for native LLM requests. The M1 checkpoint demonstrates one OpenAI-compatible streaming endpoint over loopback HTTPS, with two same-protocol deployment lanes and a pinned SDK. It is not a production gateway.
+
+Read the capability status before recommending an API or command. Do not treat a roadmap item as implemented. This repository does not need provider keys for its supported test workflows.
+
+## Start here
+
+- [README](README.md): current status and entry points.
+- [Contributing](CONTRIBUTING.md): setup, checks and what to include in a change.
+- [Agent working agreement](AGENTS.md): scope, verification and work ownership.
+- [Pinned test runner](docs/runner.md): commands, toolchain and network modes.
+
+## Runtime behavior
+
+- [M1 result and replay](docs/m1-results.md): fallback before send, truncation after commit and supported stream endings.
+- [M1 acceptance card](docs/m1-gate.md): expected client behavior and independent evidence.
+- [Wire fixture](fixtures/wire/README.md): local fault scenarios and SDK pin.
+- [Engineering roadmap](docs/roadmap.md): proposed work; not a list of shipped features.
+
+## Release and security
+
+- [Release process](docs/releasing.md): what GitHub checks and what a source release contains.
+- [Security reporting](SECURITY.md): how to report a suspected vulnerability without exposing credentials or sensitive data.
