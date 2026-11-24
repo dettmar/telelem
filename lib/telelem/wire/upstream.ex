@@ -44,7 +44,10 @@ defmodule Telelem.Wire.Upstream do
       left when the stream ends or breaks is discarded and counted.
     * The exact `data: [DONE]` event is **held**, not forwarded, until Mint
       reports the HTTP body complete (`{:done, ref}`: the chunked terminator
-      arrived). It is forwarded, followed by `Handoff.finish/2`, only if:
+      arrived). It is never `transfer/2`ed. It goes downstream only as the
+      marker of `Handoff.finish/3` (terminal authorization: the coordinator
+      checks the pinned authority and hands the marker over in one step; if
+      it refuses, the marker is dropped), and only if:
       the attempt was released, every earlier event was transferred, a
       `finish_reason` in `#{inspect(["stop", "tool_calls"])}` was seen (and no other), no
       error event and no protocol violation. Otherwise the held `[DONE]` is
@@ -131,7 +134,6 @@ defmodule Telelem.Wire.Upstream do
       pending_bytes: 0,
       credit: limits.window,
       ended: nil,
-      saw_done: false,
       held_done: nil,
       terminal: nil,
       paused: nil,
@@ -464,7 +466,7 @@ defmodule Telelem.Wire.Upstream do
 
   defp forward(%{role: :winner} = s) do
     case :queue.peek(s.pending) do
-      {:value, {kind, ev}} when byte_size(ev) <= s.credit ->
+      {:value, {_kind, ev}} when byte_size(ev) <= s.credit ->
         case Handoff.transfer(s.h, ev) do
           :ok ->
             {_, q} = :queue.out(s.pending)
@@ -475,7 +477,6 @@ defmodule Telelem.Wire.Upstream do
               | pending: q,
                 pending_bytes: s.pending_bytes - byte_size(ev),
                 credit: s.credit - byte_size(ev),
-                saw_done: s.saw_done or kind == :done,
                 starved: false,
                 stats: %{
                   st
@@ -508,23 +509,13 @@ defmodule Telelem.Wire.Upstream do
   defp maybe_end(%{ended: nil} = s), do: s
 
   defp maybe_end(%{role: :winner} = s) do
-    {:ok, reason} = if s.saw_done, do: s.terminal, else: {:ok, nil}
-
     cond do
       # Flush complete events already received (credit permitting) first.
       not :queue.is_empty(s.pending) ->
         s
 
-      # The held [DONE] has been transferred: complete HTTP evidence is in.
-      s.saw_done ->
-        case Handoff.finish(s.h, {:upstream_done, reason}) do
-          :ok -> stop(s, :finished)
-          {:error, r} -> stop(s, {:finish_refused, r})
-        end
-
       success?(s) ->
-        note(s, {:done_released, %{terminal: s.terminal}})
-        %{push(s, :done, s.held_done) | held_done: :released} |> forward() |> maybe_end()
+        authorize_done(s)
 
       # End without finish: the coordinator reports incomplete.
       true ->
@@ -536,6 +527,45 @@ defmodule Telelem.Wire.Upstream do
     do: stop(s, {:upstream_status, s.status, s.err_body})
 
   defp maybe_end(s), do: stop(s, end_reason(s))
+
+  # Complete HTTP evidence is in. The held [DONE] is never transferred as
+  # ordinary data: it travels only inside the coordinator's terminal
+  # authorization (Handoff.finish/3), which checks the pinned authority and
+  # hands it downstream in the same serialized step. Refused => never sent.
+  defp authorize_done(%{held_done: done, credit: credit} = s) when byte_size(done) > credit do
+    if s.starved do
+      s
+    else
+      note(s, {:credit_wait, %{credit: credit, head: byte_size(done), retained: retained(s)}})
+      %{s | starved: true, stats: %{s.stats | credit_waits: s.stats.credit_waits + 1}}
+    end
+  end
+
+  defp authorize_done(%{held_done: done, terminal: {:ok, reason}} = s) do
+    note(s, {:done_released, %{terminal: s.terminal}})
+
+    case Handoff.finish(s.h, {:upstream_done, reason}, done) do
+      :ok ->
+        st = s.stats
+
+        stop(
+          %{
+            s
+            | held_done: :released,
+              credit: s.credit - byte_size(done),
+              stats: %{
+                st
+                | events_forwarded: st.events_forwarded + 1,
+                  bytes_forwarded: st.bytes_forwarded + byte_size(done)
+              }
+          },
+          :finished
+        )
+
+      {:error, r} ->
+        stop(%{s | held_done: :refused}, {:finish_refused, r})
+    end
+  end
 
   defp success?(s),
     do: s.ended == :done and is_binary(s.held_done) and match?({:ok, _}, s.terminal)

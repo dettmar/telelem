@@ -91,14 +91,15 @@ defmodule Telelem.WireUpstreamTest do
     cleanup_timeout_ms: 300
   ]
 
-  defp start(ctx, limits_kw \\ @small, lane_kw \\ []) do
+  defp start(ctx, limits_kw \\ @small, lane_kw \\ [], handoff_kw \\ []) do
     limits = Limits.new(limits_kw)
 
     {:ok, h} =
       DynamicSupervisor.start_child(
         ctx.sup,
         {Handoff,
-         requester: self(), attempts: [:primary], cleanup_timeout: limits.cleanup_timeout_ms}
+         [requester: self(), attempts: [:primary], cleanup_timeout: limits.cleanup_timeout_ms] ++
+           handoff_kw}
       )
 
     lane =
@@ -423,5 +424,121 @@ defmodule Telelem.WireUpstreamTest do
     assert {:failed, _} = r.outcome
     assert r.reason == {:upstream_error_event, "boom"}
     assert r.data == []
+  end
+
+  # ── terminal authorization vs. pinned authority (M2a day two) ──
+  #
+  # The coordinator is suspended while the attempt's terminal call is queued, so
+  # the authority's :DOWN lands in a known mailbox position. Only wait: a bounded
+  # spin on message_queue_len; no sleeps decide the order.
+
+  defp idle do
+    pid = spawn(fn -> receive do: (:never -> :ok) end)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  defp wait_q(h, n, until \\ System.monotonic_time(:millisecond) + 5_000) do
+    cond do
+      elem(Process.info(h, :message_queue_len), 1) >= n ->
+        :ok
+
+      System.monotonic_time(:millisecond) > until ->
+        flunk("queue of #{inspect(h)} never reached #{n}")
+
+      true ->
+        wait_q(h, n, until)
+    end
+  end
+
+  defp kill!(p) do
+    m = Process.monitor(p)
+    Process.exit(p, :kill)
+    assert_receive {:DOWN, ^m, _, _, _}, 1_000
+  end
+
+  # Released, everything before [DONE] transferred; returns the live pieces.
+  defp streaming_to_done(ctx, handoff_kw) do
+    auth = idle()
+    a = start(ctx, @small, [], [authority: auth] ++ handoff_kw)
+    up = upstream!()
+    send(a.pid, {:telelem_wire_credit, a.h, 1_000_000})
+    ev = event(1)
+    push(up, ev)
+    push(up, @stop)
+    h = a.h
+    assert_receive {@tag_h, ^h, {:elected, :primary}}, 2_000
+    assert_receive {@tag_h, ^h, {:data, ^ev}}, 2_000
+    assert_receive {@tag_h, ^h, {:data, @stop}}, 2_000
+    Map.merge(a, %{auth: auth, up: up})
+  end
+
+  test "authority :DOWN queued behind the terminal call: no [DONE] reaches the requester, incomplete",
+       ctx do
+    a = streaming_to_done(ctx, [])
+    :sys.suspend(a.h)
+    push(a.up, @done)
+    send(a.up, :finish)
+    # The attempt's terminal call is now queued at the coordinator...
+    wait_q(a.h, 1)
+    # ...and the pinned authority dies behind it.
+    kill!(a.auth)
+    wait_q(a.h, 2)
+    :sys.resume(a.h)
+
+    {msgs, report} = collect(a.h)
+
+    refute {:data, @done} in msgs,
+           "marker delivered although the authority was dead: #{inspect(msgs)}"
+
+    assert {:incomplete, {:authority_down, :killed}} in msgs
+    refute Enum.any?(msgs, &match?({:done, _}, &1))
+    assert report.authority == :lost and report.committed
+    assert_receive {:telelem_wire, _, :primary, {:ended, {:finish_refused, :cancelled}, _}}, 2_000
+  end
+
+  test "authority killed before the body completes: winner cancelled, [DONE] never forwarded",
+       ctx do
+    a = streaming_to_done(ctx, [])
+    kill!(a.auth)
+    {msgs, report} = collect(a.h)
+    assert msgs == [{:incomplete, {:authority_down, :killed}}]
+    assert report.authority == :lost
+
+    assert_receive {:telelem_wire, _, :primary,
+                    {:ended, {:cancelled, {:authority_down, :killed}}, _}},
+                   2_000
+  end
+
+  test "terminal_ack: [DONE] handed over as {:terminal, _}; done only after the confirmed write, even if the authority dies first",
+       ctx do
+    a = streaming_to_done(ctx, terminal_ack: true)
+    h = a.h
+    push(a.up, @done)
+    send(a.up, :finish)
+    assert_receive {@tag_h, ^h, {:terminal, @done}}, 2_000
+    assert_receive {:telelem_wire, _, :primary, {:ended, :finished, stats}}, 2_000
+    assert stats.events_forwarded == 3
+    # Upstream complete and the attempt closed; still no outcome.
+    assert Handoff.status(h).outcome == nil
+    kill!(a.auth)
+    assert Handoff.status(h).authority == :lost
+    refute_received {@tag_h, ^h, {_, _}}
+    assert :ok = Handoff.terminal_written(h, :ok)
+    {msgs, report} = collect(h)
+    assert msgs == [{:done, {:upstream_done, "stop"}}]
+    assert report.terminal == %{upstream: :complete, downstream: :written}
+  end
+
+  test "terminal_ack: a failed downstream write of [DONE] is incomplete, never done", ctx do
+    a = streaming_to_done(ctx, terminal_ack: true)
+    h = a.h
+    push(a.up, @done)
+    send(a.up, :finish)
+    assert_receive {@tag_h, ^h, {:terminal, @done}}, 2_000
+    assert :ok = Handoff.terminal_written(h, {:error, :closed})
+    {msgs, report} = collect(h)
+    assert msgs == [{:incomplete, {:downstream_write, :closed}}]
+    assert report.terminal.downstream == {:error, :closed}
   end
 end

@@ -11,7 +11,7 @@ defmodule Telelem.Handoff do
     * **attempts**: a fixed set of attempt ids given at start. An attempt
       process calls `attach/2`, then `begin_dispatch/2` *before* any upstream
       bytes can leave, `ready/2` once it holds semantic content, then
-      `transfer/2` / `finish/2` if released, and always `cleaned/3` after its
+      `transfer/2` / `finish/3` if released, and always `cleaned/3` after its
       transport is closed.
     * **authority**: the instance's foundational admission authority PID
       (`Telelem.Instance.authority/1`). It is monitored. Its death fences the
@@ -43,7 +43,7 @@ defmodule Telelem.Handoff do
       downstream write fails, or the authority dies, the handoff ends
       `{:failed, _}` (nothing committed) or `{:incomplete, _}` (after commit).
       No other attempt is ever released.
-    * **Commit** is the first `transfer/2` or `finish/2` that the coordinator
+    * **Commit** is the first `transfer/2` or `finish/3` that the coordinator
       accepts. The coordinator marks the handoff committed *before* it forwards
       the bytes. Whether the downstream write then succeeds has no effect on
       selection. Data goes winner → coordinator → requester, so the requester
@@ -51,9 +51,30 @@ defmodule Telelem.Handoff do
     * **Authority death** (observed `:DOWN`) while the stream is open ends it:
       `{:failed, {:authority_down, r}}` before commit,
       `{:incomplete, {:authority_down, r}}` after commit. The winner is
-      cancelled; later `transfer/2`/`finish/2` get `{:error, :cancelled}`.
-      No completion is synthesized. An outcome already reached (for example
-      `{:done, _}`) is never changed afterwards.
+      cancelled; later `transfer/2`/`finish/3` get `{:error, :cancelled}`.
+      No completion is synthesized. An authorized terminal or an outcome
+      already reached (for example `{:done, _}`) is never changed afterwards.
+    * **Terminal authorization** (`finish/3`) is one serialized step. It
+      first checks the pinned authority itself rather than trusting mailbox
+      order: a `:DOWN` already queued (even behind the call) or a dead local
+      PID refuses it (`{:error, :cancelled}`, the stream ends as above, and
+      the marker is never handed out). Otherwise, in the same step, it
+      records **upstream completion** and hands the `marker` (the bytes that
+      declare success to the client, e.g. `data: [DONE]`) to the requester.
+      There is no point between "marker queued" and "terminal recorded" where
+      a fence can land. Upstream completion is not downstream success:
+        - `terminal_ack: true`: the requester gets `{:terminal, marker}` and
+          **no outcome yet**. Only `terminal_written(h, :ok)` (the local
+          downstream write returned success) gives `{:done, terminal}`.
+          `terminal_written(h, {:error, r})` gives
+          `{:incomplete, {:downstream_write, r}}`; requester cancel/death or
+          coordinator exit before the ack give `{:incomplete, _}`. Authority
+          death after authorization changes nothing (the terminal was valid
+          when recorded); it is only reported (`authority: :lost`). The
+          winner's cleanup after authorization does not end the stream.
+        - default (M1 compatibility): `{:data, marker}` and `{:done, terminal}`
+          are sent back to back in that step. `{:done, _}` then means
+          "upstream complete, marker handed to the requester", not "written".
     * **Cleanup.** Each expected attempt is closed exactly once, by whichever
       happens first: an explicit `cleaned/3` acknowledgement, the attempt's
       `:DOWN`, a forced kill after `:cleanup_timeout` from its cancel or
@@ -81,8 +102,13 @@ defmodule Telelem.Handoff do
 
       {:elected, attempt_id}                 # informational; write nothing yet
       {:data, chunk}                         # committed semantic bytes, in order
+      {:terminal, marker | nil}              # terminal_ack only: write it, then
+                                             #   call terminal_written/2
       {:done, terminal} | {:incomplete, reason} | {:failed, reason}   # exactly one
       {:closed, report}                      # after every attempt is closed
+
+  The report's `terminal` is `nil` or `%{upstream: :complete, downstream:
+  :unconfirmed | :written | {:error, r} | :not_tracked}`.
 
   The requester must not write anything downstream (including status and
   headers) before the first `{:data, _}` or `{:done, _}`.
@@ -96,12 +122,14 @@ defmodule Telelem.Handoff do
 
   ## Observer events
 
-      {:elected, id} | {:committed, id} | {:outcome, outcome}
+      {:elected, id} | {:committed, id} | {:upstream_complete, id} | {:outcome, outcome}
       {:attempt_closed, id, %{cleanup: cleanup, charge: :none | :possible}}
       {:closed, report}
       {:terminated, reason, unclosed_ids}    # coordinator stopped abnormally
 
-  Events are at-most-once and carry no authority.
+  Events are at-most-once and carry no authority. `{:upstream_complete, _}`
+  (`terminal_ack: true` only) is not a success: `{:outcome, {:done, _}}` is
+  emitted only after the requester's confirmed write.
 
   ## Limits
 
@@ -141,6 +169,8 @@ defmodule Telelem.Handoff do
       for tests and evidence.
     * `:cleanup_timeout`. Default 5000 ms. The time from a cancel or finish
       until the coordinator force-kills an attempt that has not closed.
+    * `:terminal_ack`. Default `false`. When `true` the requester must
+      confirm the terminal write with `terminal_written/2` before `{:done, _}`.
     * `:register_timeout`. Default 5000 ms. While the selection is open,
       attempts that have not attached by then are closed as
       `:never_registered`.
@@ -196,8 +226,29 @@ defmodule Telelem.Handoff do
   @doc "Winner only. Forwards one semantic chunk. The first accepted chunk commits."
   def transfer(h, chunk), do: call(h, {:transfer, chunk})
 
-  @doc "Winner only. Ends the stream with a terminal event and commits if no data was sent."
-  def finish(h, terminal), do: call(h, {:finish, terminal})
+  @doc """
+  Winner only. **Terminal authorization**: the upstream is complete. `marker`
+  (for example the exact `data: [DONE]` event) is the last downstream bytes,
+  or `nil`. Commits if nothing was sent yet. See "Terminal authorization".
+
+  `:ok` means the terminal was authorized and `marker` was handed to the
+  requester. `{:error, :cancelled}` means it was refused (outcome already
+  reached, winner cancelled, or the pinned authority is dead): `marker` was
+  **not** handed to anyone and must never be forwarded.
+  """
+  def finish(h, terminal, marker \\ nil) when is_nil(marker) or is_binary(marker),
+    do: call(h, {:finish, terminal, marker})
+
+  @doc """
+  Requester only, `terminal_ack: true` only. The local result of writing the
+  `{:terminal, marker}` downstream: `:ok` once the write returned success, or
+  `{:error, reason}`. Ends the handoff `{:done, terminal}` or
+  `{:incomplete, {:downstream_write, reason}}`.
+  """
+  def terminal_written(h, result)
+      when result == :ok or
+             (is_tuple(result) and tuple_size(result) == 2 and elem(result, 0) == :error),
+      do: call(h, {:terminal_written, result})
 
   @doc """
   Explicit cleanup acknowledgement: the transport of `id` is closed. `charge`
@@ -285,6 +336,7 @@ defmodule Telelem.Handoff do
            parent: List.first(links),
            requester: requester,
            requester_mon: Process.monitor(requester),
+           authority: authority,
            authority_mon: authority && Process.monitor(authority),
            authority_state: if(authority, do: :up, else: :none),
            observer_mon: observer && Process.monitor(observer),
@@ -298,6 +350,10 @@ defmodule Telelem.Handoff do
            attempts: Map.new(ids, &{&1, blank}),
            phase: :open,
            winner: nil,
+           terminal_ack: Keyword.get(opts, :terminal_ack, false) == true,
+           # nil | {:authorized, terminal}: upstream complete, downstream unconfirmed
+           terminal: nil,
+           downstream: nil,
            outcome: nil,
            unreported: []
          }}
@@ -319,7 +375,7 @@ defmodule Telelem.Handoff do
       {:ok, %{pid: ^pid, cancelled: reason}} when reason != nil ->
         {:reply, {:cancel, reason}, s}
 
-      {:ok, %{pid: ^pid}} when s.outcome != nil ->
+      {:ok, %{pid: ^pid}} when s.outcome != nil or s.terminal != nil ->
         {:reply, {:cancel, :ended}, s}
 
       {:ok, %{pid: ^pid}} ->
@@ -347,7 +403,7 @@ defmodule Telelem.Handoff do
       {:ok, %{cancelled: reason}} when reason != nil ->
         {:reply, {:cancel, reason}, s}
 
-      {:ok, _} when s.outcome != nil ->
+      {:ok, _} when s.outcome != nil or s.terminal != nil ->
         # Even the winner of a finished stream gets no new dispatch permission.
         {:reply, {:cancel, :ended}, s}
 
@@ -370,7 +426,7 @@ defmodule Telelem.Handoff do
 
         cond do
           a.cancelled != nil -> {:reply, {:cancel, a.cancelled}, s}
-          s.outcome != nil -> {:reply, {:cancel, :ended}, s}
+          s.outcome != nil or s.terminal != nil -> {:reply, {:cancel, :ended}, s}
           s.winner == id -> {:reply, :release, s}
           s.phase == :open -> {:reply, :release, elect(s, id)}
           true -> {:reply, {:cancel, {:lost_to, s.winner}}, s}
@@ -388,12 +444,55 @@ defmodule Telelem.Handoff do
     end
   end
 
-  def handle_call({:finish, terminal}, {pid, _}, s) do
+  def handle_call({:finish, terminal, marker}, {pid, _}, s) do
     with {:ok, id} <- accepting_winner(s, pid) do
-      s = s |> commit(id) |> set_outcome({:done, terminal})
-      reply_finalize(:ok, s)
+      case fence(s) do
+        :ok ->
+          s
+          |> commit(id)
+          |> authorize_terminal(id, terminal, marker)
+          |> then(&reply_finalize(:ok, &1))
+
+        {:down, reason} ->
+          # The pinned authority is dead though its :DOWN was not handled yet:
+          # handle it now, ahead of this call. Nothing is handed downstream.
+          s
+          |> authority_lost(reason, :terminal)
+          |> then(&reply_finalize({:error, :cancelled}, &1))
+      end
     else
       e -> {:reply, e, s}
+    end
+  end
+
+  def handle_call({:terminal_written, result}, {pid, _}, s) do
+    cond do
+      pid != s.requester ->
+        {:reply, {:error, :not_requester}, s}
+
+      not s.terminal_ack or s.terminal == nil ->
+        {:reply, {:error, :no_terminal}, s}
+
+      s.outcome != nil ->
+        {:reply, {:error, :ended}, s}
+
+      true ->
+        {:authorized, terminal} = s.terminal
+
+        s =
+          case result do
+            :ok ->
+              %{s | downstream: :written}
+              |> trace({:terminal_written, :ok})
+              |> set_outcome({:done, terminal})
+
+            {:error, reason} ->
+              %{s | downstream: {:error, reason}}
+              |> trace({:terminal_written, {:error, reason}})
+              |> set_outcome({:incomplete, {:downstream_write, reason}})
+          end
+
+        reply_finalize(:ok, s)
     end
   end
 
@@ -433,6 +532,7 @@ defmodule Telelem.Handoff do
        phase: s.phase,
        winner: s.winner,
        outcome: s.outcome,
+       terminal: terminal_state(s),
        authority: s.authority_state,
        observer: s.observer_state,
        attempts:
@@ -449,10 +549,7 @@ defmodule Telelem.Handoff do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{authority_mon: ref} = s) do
-    # The instance is fenced: end an open stream, never extend or reselect.
-    # set_outcome/2 is a no-op if an outcome was already reached.
-    s = trace(%{s | authority_state: :lost}, {:authority_down, s.phase, reason})
-    finalize(set_outcome(s, ended(s, {:authority_down, reason})))
+    finalize(authority_lost(s, reason, s.phase))
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{observer_mon: ref} = s) do
@@ -535,6 +632,58 @@ defmodule Telelem.Handoff do
 
   defp commit(s, _id), do: s
 
+  # One serialized decision: the marker is handed to the requester in the same
+  # step that records the upstream terminal, so no fence can fall between them.
+  defp authorize_terminal(s, id, terminal, marker) do
+    s = %{s | terminal: {:authorized, terminal}} |> trace({:terminal_authorized, id, terminal})
+
+    if s.terminal_ack do
+      # Upstream complete only. {:done, _} waits for the local write result.
+      send(s.requester, {@tag, self(), {:terminal, marker}})
+      %{s | downstream: :unconfirmed} |> emit({:upstream_complete, id}) |> arm_deadline(id)
+    else
+      # M1 compatibility: marker and outcome are adjacent, nothing in between.
+      if marker, do: send(s.requester, {@tag, self(), {:data, marker}})
+      %{s | downstream: :not_tracked} |> set_outcome({:done, terminal})
+    end
+  end
+
+  # The instance is fenced: end an open stream, never extend or reselect. An
+  # authorized terminal (or any reached outcome) is never rewritten.
+  defp authority_lost(s, reason, at) do
+    s = trace(%{s | authority_state: :lost}, {:authority_down, at, reason})
+    if s.terminal == nil, do: set_outcome(s, ended(s, {:authority_down, reason})), else: s
+  end
+
+  # Terminal authorization checks the pinned authority directly instead of
+  # trusting mailbox order: a :DOWN already queued (even behind this call) or
+  # a dead local PID whose :DOWN is still on its way both refuse.
+  defp fence(%{authority: nil}), do: :ok
+  defp fence(%{authority_state: :lost}), do: {:down, :lost}
+
+  defp fence(%{authority: pid, authority_mon: mon}) do
+    receive do
+      {:DOWN, ^mon, :process, _, reason} -> {:down, reason}
+    after
+      0 ->
+        if node(pid) != node() or Process.alive?(pid) do
+          :ok
+        else
+          # A monitored local process that is not alive always delivers :DOWN.
+          receive do
+            {:DOWN, ^mon, :process, _, reason} -> {:down, reason}
+          after
+            1_000 -> {:down, :noproc}
+          end
+        end
+    end
+  end
+
+  defp terminal_state(%{terminal: nil}), do: nil
+
+  defp terminal_state(%{terminal: {:authorized, _}, downstream: d}),
+    do: %{upstream: :complete, downstream: d}
+
   defp set_outcome(%{outcome: o} = s, _) when o != nil, do: s
 
   defp set_outcome(s, outcome) do
@@ -601,7 +750,13 @@ defmodule Telelem.Handoff do
   end
 
   defp after_close(s, id, winner_reason) do
-    s = if id == s.winner, do: set_outcome(s, ended(s, winner_reason)), else: s
+    # After terminal authorization the winner is expected to close; only the
+    # requester's write result (or its loss) decides the outcome then.
+    s =
+      if id == s.winner and s.terminal == nil,
+        do: set_outcome(s, ended(s, winner_reason)),
+        else: s
+
     check_no_winner(s)
   end
 
@@ -639,6 +794,7 @@ defmodule Telelem.Handoff do
       outcome: s.outcome,
       winner: s.winner,
       committed: s.phase == :committed,
+      terminal: terminal_state(s),
       authority: s.authority_state,
       observer: s.observer_state,
       attempts:
@@ -664,9 +820,14 @@ defmodule Telelem.Handoff do
     w = s.winner && s.attempts[s.winner]
 
     cond do
-      w == nil or w.pid != pid -> {:error, :not_winner}
-      s.outcome != nil or w.cancelled != nil or w.cleanup != nil -> {:error, :cancelled}
-      true -> {:ok, s.winner}
+      w == nil or w.pid != pid ->
+        {:error, :not_winner}
+
+      s.outcome != nil or s.terminal != nil or w.cancelled != nil or w.cleanup != nil ->
+        {:error, :cancelled}
+
+      true ->
+        {:ok, s.winner}
     end
   end
 
