@@ -42,12 +42,20 @@ defmodule Telelem.Wire.Upstream do
 
     * Only complete SSE events are forwarded, byte for byte. A partial frame
       left when the stream ends or breaks is discarded and counted.
+    * **Supported framing only.** A `200 text/event-stream` response is read
+      only if its status line on the wire is `HTTP/1.1` and its body is
+      framed by exactly `transfer-encoding: chunked` with no
+      `content-length`. Mint reports `{:done, ref}` for a close-delimited (or
+      length-delimited) body too; such a response, an HTTP/1.0 status line or
+      any other coding is a protocol violation
+      (`{:unsupported_framing, framing}`) before anything is forwarded.
     * The exact `data: [DONE]` event is **held**, not forwarded, until Mint
-      reports the HTTP body complete (`{:done, ref}`: the chunked terminator
-      arrived). It is never `transfer/2`ed. It goes downstream only as the
-      marker of `Handoff.finish/3` (terminal authorization: the coordinator
-      checks the pinned authority and hands the marker over in one step; if
-      it refuses, the marker is dropped), and only if:
+      reports the chunked body complete (`{:done, ref}` with chunked framing:
+      the zero-length terminator chunk arrived). It is never `transfer/2`ed.
+      It goes downstream only as the marker of `Handoff.finish/3` (terminal
+      authorization; if it is refused the marker is dropped; if it is
+      `{:error, :unconfirmed}` the attempt ends `:finish_unconfirmed` and
+      never retries), and only if:
       the attempt was released, every earlier event was transferred, a
       `finish_reason` in `#{inspect(["stop", "tool_calls"])}` was seen (and no other), no
       error event and no protocol violation. Otherwise the held `[DONE]` is
@@ -127,6 +135,10 @@ defmodule Telelem.Wire.Upstream do
       dispatched: false,
       status: nil,
       phase: :awaiting_status,
+      # {:pending, first_bytes} until the status line is seen on the wire,
+      # then {:http, {major, minor}} or :unparsed.
+      wire: {:pending, ""},
+      framing: nil,
       role: :candidate,
       err_body: "",
       rest: "",
@@ -271,7 +283,7 @@ defmodule Telelem.Wire.Upstream do
             max_delivery: max(st.max_delivery, n)
         }
 
-        on_socket(%{s | stats: st, armed: false}, msg)
+        on_socket(%{s | stats: st, armed: false} |> sniff_status_line(data), msg)
 
       {:ssl_closed, ^sock} = msg ->
         on_socket(%{s | armed: false}, msg)
@@ -324,11 +336,22 @@ defmodule Telelem.Wire.Upstream do
 
   defp response({:headers, ref, hs}, %{ref: ref, phase: :awaiting_status} = s) do
     ct = for({"content-type", v} <- hs, do: v) |> List.first()
-    note(s, {:upstream_headers, s.status, ct})
+    framing = framing(s.wire, hs)
+    note(s, {:upstream_headers, s.status, ct, framing})
 
-    if s.status == 200 and is_binary(ct) and String.starts_with?(ct, "text/event-stream"),
-      do: %{s | phase: :streaming},
-      else: %{s | phase: :error_body}
+    cond do
+      not (s.status == 200 and is_binary(ct) and String.starts_with?(ct, "text/event-stream")) ->
+        %{s | phase: :error_body, framing: framing}
+
+      framing == :chunked ->
+        %{s | phase: :streaming, framing: :chunked}
+
+      true ->
+        # Mint also reports {:done, ref} for a close-delimited (or
+        # content-length) body; neither is the chunked terminator this slice
+        # accepts as completion. Nothing of this response is forwarded.
+        violation(%{s | phase: :unsupported_framing, framing: framing}, {:unsupported_framing, framing})
+    end
   end
 
   defp response({:headers, ref, _trailers}, %{ref: ref} = s), do: s
@@ -562,13 +585,64 @@ defmodule Telelem.Wire.Upstream do
           :finished
         )
 
+      {:error, :unconfirmed} ->
+        # The coordinator is gone (or was fenced by us): the marker may have
+        # been handed out. Not a refusal; never retried.
+        stop(%{s | held_done: :unconfirmed}, :finish_unconfirmed)
+
       {:error, r} ->
         stop(%{s | held_done: :refused}, {:finish_refused, r})
     end
   end
 
   defp success?(s),
-    do: s.ended == :done and is_binary(s.held_done) and match?({:ok, _}, s.terminal)
+    do:
+      s.ended == :done and s.framing == :chunked and is_binary(s.held_done) and
+        match?({:ok, _}, s.terminal)
+
+  # The response's own status line, read from the plaintext we hand to Mint
+  # (Mint does not report the HTTP version). Only the first line matters: a
+  # 1xx or anything else before the final response already fails closed.
+  @max_status_line 256
+  defp sniff_status_line(%{wire: {:pending, buf}} = s, data) do
+    buf = buf <> data
+
+    case :binary.match(buf, "\r\n") do
+      {pos, _} ->
+        %{s | wire: parse_status_line(binary_part(buf, 0, pos))}
+
+      :nomatch when byte_size(buf) > @max_status_line ->
+        %{s | wire: :unparsed}
+
+      :nomatch ->
+        %{s | wire: {:pending, buf}}
+    end
+  end
+
+  defp sniff_status_line(s, _data), do: s
+
+  defp parse_status_line(<<"HTTP/", ma, ".", mi, " ", _::binary>>)
+       when ma in ?0..?9 and mi in ?0..?9,
+       do: {:http, {ma - ?0, mi - ?0}}
+
+  defp parse_status_line(_), do: :unparsed
+
+  # Supported framing in this slice: HTTP/1.1, exactly `transfer-encoding:
+  # chunked`, no content-length. Everything else is named, never accepted.
+  defp framing(wire, hs) do
+    te =
+      for({"transfer-encoding", v} <- hs, t <- String.split(v, ","), do: t)
+      |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+      |> Enum.reject(&(&1 == ""))
+
+    cond do
+      wire != {:http, {1, 1}} -> {:http_version, wire}
+      Enum.any?(hs, &match?({"content-length", _}, &1)) -> :content_length
+      te == ["chunked"] -> :chunked
+      te == [] -> :close_delimited
+      true -> {:transfer_encoding, te}
+    end
+  end
 
   defp end_reason(%{ended: :done, held_done: nil}), do: :upstream_ended_without_done
   defp end_reason(%{ended: :done, terminal: nil}), do: {:done_without_finish_reason, :no_finish}
