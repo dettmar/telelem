@@ -19,6 +19,33 @@ defmodule Telelem.Serve.IngressTest.CountingStore do
     do: mod.compare_and_write(arg, tenant, route, expected, new, digest)
 end
 
+defmodule Telelem.Serve.IngressTest.ScriptedClock do
+  @moduledoc false
+  # `Instance.Clock` over a `ManualClock`, with a per-reading script held in
+  # an Agent: reading N (1-based) runs `script[N]` if present, else reads the
+  # manual clock. Each reading is reported to the test process.
+  @behaviour Telelem.Instance.Clock
+
+  alias Telelem.Instance.ManualClock
+
+  @impl true
+  def send_after(_arg, _dest, _msg, _ms), do: raise("not used")
+
+  @impl true
+  def now({manual, agent, pid}) do
+    n = Agent.get_and_update(agent, fn {i, script} -> {i + 1, {i + 1, script}} end)
+    send(pid, {:clock_read, n})
+
+    case Agent.get(agent, fn {_, script} -> Map.get(script, n, :pass) end) do
+      :pass -> ManualClock.now(manual)
+      {:return, v} -> v
+      :raise -> raise "clock fault"
+      :throw -> throw(:clock_fault)
+      :exit -> exit(:clock_fault)
+    end
+  end
+end
+
 defmodule Telelem.Serve.IngressTest do
   @moduledoc """
   Offline contract tests for `Telelem.Serve.Ingress.prepare/3`: a real temp
@@ -39,7 +66,7 @@ defmodule Telelem.Serve.IngressTest do
   alias Telelem.Sandbox.{Bootstrap, Id, Principal, VerifiedTarget}
   alias Telelem.Serve.Ingress
   alias Telelem.Serve.Ingress.Prepared
-  alias Telelem.Serve.IngressTest.CountingStore
+  alias Telelem.Serve.IngressTest.{CountingStore, ScriptedClock}
 
   @moduletag :tmp_dir
   @max_body 4096
@@ -236,6 +263,13 @@ defmodule Telelem.Serve.IngressTest do
           ),
         tampered_struct:
           quote(do: fn -> {:ok, %{principal() | permissions: MapSet.new([:root])}} end),
+        # `Principal.check/1` raises on these; that must stay contained.
+        malformed_mapset:
+          quote(
+            do: fn -> {:ok, %{principal() | permissions: Map.put(MapSet.new(), :map, :bad)}} end
+          ),
+        list_permissions: quote(do: fn -> {:ok, %{principal() | permissions: [:dispatch]}} end),
+        non_binary_tenant: quote(do: fn -> {:ok, %{principal() | tenant_id: {:t, "local"}}} end),
         raises: quote(do: fn -> raise "boom" end),
         throws: quote(do: fn -> throw(:boom) end),
         exits: quote(do: fn -> exit(:boom) end)
@@ -289,6 +323,15 @@ defmodule Telelem.Serve.IngressTest do
              {:error, :store_integrity}
   end
 
+  test "the malformed-MapSet principal really makes Principal.check/1 raise", t do
+    bad = %{principal() | permissions: Map.put(MapSet.new(), :map, :bad)}
+    assert_raise FunctionClauseError, fn -> Telelem.Sandbox.Principal.check(bad) end
+
+    c = cfg(t, authenticate: auth_returning(t, fn -> {:ok, bad} end))
+    assert Ingress.prepare(c, :cred, reader(t, "x")) == {:error, :unauthenticated}
+    refute_side_effects([:store, :body, :id])
+  end
+
   ## Pinned revision
 
   test "the revision is fetched once and stays pinned while the route changes", t do
@@ -329,6 +372,59 @@ defmodule Telelem.Serve.IngressTest do
                   r = Map.put(Map.from_struct(rev1()), :model, "b")
                   {:reply, {:ok, %{revision: r, last_plan_digest: nil}}}
                 end
+              ),
+            # The stored digest is required; it must never be recomputed.
+            missing_digest:
+              quote(
+                do: fn ->
+                  r = Map.delete(Map.from_struct(rev1()), :digest)
+                  {:reply, {:ok, %{revision: r, last_plan_digest: nil}}}
+                end
+              ),
+            missing_digest_tampered:
+              quote(
+                do: fn ->
+                  r = Map.from_struct(rev1()) |> Map.delete(:digest) |> Map.put(:preferred, "b")
+                  {:reply, {:ok, %{revision: r, last_plan_digest: nil}}}
+                end
+              ),
+            nil_digest:
+              quote(
+                do: fn ->
+                  {:reply, {:ok, %{revision: %{rev1() | digest: nil}, last_plan_digest: nil}}}
+                end
+              ),
+            uppercase_digest:
+              quote(
+                do: fn ->
+                  r = rev1()
+
+                  {:reply,
+                   {:ok,
+                    %{revision: %{r | digest: String.upcase(r.digest)}, last_plan_digest: nil}}}
+                end
+              ),
+            missing_last_plan_digest: quote(do: fn -> {:reply, {:ok, %{revision: rev1()}}} end),
+            bad_last_plan_digest:
+              quote(do: fn -> {:reply, {:ok, %{revision: rev1(), last_plan_digest: "nope"}}} end),
+            uppercase_last_plan_digest:
+              quote(
+                do: fn ->
+                  {:reply,
+                   {:ok, %{revision: rev1(), last_plan_digest: String.duplicate("A", 64)}}}
+                end
+              ),
+            integer_last_plan_digest:
+              quote(do: fn -> {:reply, {:ok, %{revision: rev1(), last_plan_digest: 7}}} end),
+            bare_revision: quote(do: fn -> {:reply, {:ok, rev1()}} end),
+            non_map_revision:
+              quote(do: fn -> {:reply, {:ok, %{revision: [1], last_plan_digest: nil}}} end),
+            foreign_struct_revision:
+              quote(
+                do: fn ->
+                  r = Map.put(rev1(), :__struct__, URI)
+                  {:reply, {:ok, %{revision: r, last_plan_digest: nil}}}
+                end
               )
           ]
           |> Enum.map(fn {l, h} ->
@@ -341,6 +437,18 @@ defmodule Telelem.Serve.IngressTest do
         refute_side_effects([:body, :id])
       end
     end
+  end
+
+  test "a well-formed envelope with a plain-map revision and a plan digest is accepted", t do
+    hook = fn ->
+      r = Map.from_struct(rev1())
+      {:reply, {:ok, %{revision: r, last_plan_digest: String.duplicate("0a", 32)}}}
+    end
+
+    store = {CountingStore, {FileStore, t.fs, t.me, hook}}
+    assert {:ok, p} = Ingress.prepare(cfg(t, context: ctx(store)), :c, reader(t, "x"))
+    assert %Revision{} = p.revision
+    assert p.revision.digest == rev1().digest
   end
 
   ## Attempt policy
@@ -444,6 +552,47 @@ defmodule Telelem.Serve.IngressTest do
     refute_side_effects([:id])
   end
 
+  test "deadline crossed while the ID is generated: no prepared request", t do
+    me = t.me
+
+    late_id = fn ->
+      send(me, :gateway_id)
+      ManualClock.advance(t.clock, 1000)
+      Ingress.random_id()
+    end
+
+    c = cfg(t, deadline_ceiling_ms: 1000, new_gateway_id: late_id)
+    assert Ingress.prepare(c, :c, reader(t, "x")) == {:error, {:deadline_exceeded, :gateway_id}}
+    assert_received {:read_body, _, 1000}
+    assert_received :gateway_id
+
+    # One millisecond before the pinned deadline still prepares.
+    almost = fn ->
+      ManualClock.advance(t.clock, 999)
+      Ingress.random_id()
+    end
+
+    assert {:ok, %Prepared{deadline_ms: 2000}} =
+             Ingress.prepare(
+               cfg(t, deadline_ceiling_ms: 1000, new_gateway_id: almost),
+               :c,
+               reader(t, "x")
+             )
+  end
+
+  test "the route deadline also applies after ID generation", t do
+    {:ok, mem} = MemoryStore.start_link()
+    :ok = MemoryStore.seed(mem, "local", rev1(deadline_ms: 300))
+
+    late_id = fn ->
+      :pass = tick(t, 300)
+      Ingress.random_id()
+    end
+
+    c = cfg(t, context: ctx({MemoryStore, mem}), new_gateway_id: late_id)
+    assert Ingress.prepare(c, :c, reader(t, "x")) == {:error, {:deadline_exceeded, :gateway_id}}
+  end
+
   test "ceiling is bounded and required", t do
     base = Map.from_struct(cfg(t)) |> Map.drop([:__struct__])
 
@@ -459,6 +608,94 @@ defmodule Telelem.Serve.IngressTest do
   defp tick(t, ms) do
     ManualClock.advance(t.clock, ms)
     :pass
+  end
+
+  ## Clock faults
+
+  # Readings in a full run: 1 t0, 2 after auth, 3 after route, 4 after
+  # select, 5 body budget, 6 after body, 7 after ID. A fault at reading N
+  # stops there: only the steps before it ran.
+  @clock_faults [
+    :raise,
+    :throw,
+    :exit,
+    {:return, nil},
+    {:return, 1.5},
+    {:return, "0"},
+    {:return, {:ok, 0}}
+  ]
+
+  for {n, ran} <- [
+        {1, []},
+        {2, [:auth]},
+        {3, [:auth, :store]},
+        {4, [:auth, :store]},
+        {5, [:auth, :store]},
+        {6, [:auth, :store, :body]},
+        {7, [:auth, :store, :body, :id]}
+      ] do
+    test "clock fault at reading #{n} is :clock_unavailable and nothing later runs", t do
+      for fault <- @clock_faults do
+        {:ok, agent} = Agent.start_link(fn -> {0, %{unquote(n) => fault}} end)
+        c = cfg(t, clock: {ScriptedClock, {t.clock, agent, t.me}})
+        log = capture_log(fn -> send(self(), {:res, Ingress.prepare(c, :c, reader(t, "x"))}) end)
+        assert_received {:res, {:error, :clock_unavailable}}, inspect(fault)
+        assert log == ""
+
+        for i <- 1..unquote(n), do: assert_received({:clock_read, ^i})
+        refute_received {:clock_read, _}, "read the clock again after #{inspect(fault)}"
+
+        ran = unquote(ran)
+
+        if :auth in ran,
+          do: assert_received({:authenticate, :c}),
+          else: refute_received({:authenticate, _})
+
+        if :store in ran,
+          do: assert_received({:store_fetch, _, _}),
+          else: refute_side_effects([:store])
+
+        if :body in ran,
+          do: assert_received({:read_body, _, _}),
+          else: refute_side_effects([:body])
+
+        if :id in ran, do: assert_received(:gateway_id), else: refute_side_effects([:id])
+        Agent.stop(agent)
+      end
+    end
+  end
+
+  test "an unscripted ScriptedClock run takes exactly seven readings", t do
+    {:ok, agent} = Agent.start_link(fn -> {0, %{}} end)
+    c = cfg(t, clock: {ScriptedClock, {t.clock, agent, t.me}})
+    assert {:ok, %Prepared{}} = Ingress.prepare(c, :c, reader(t, "x"))
+    for i <- 1..7, do: assert_received({:clock_read, ^i})
+    refute_received {:clock_read, _}
+  end
+
+  test "a dead clock process is :clock_unavailable before authentication", t do
+    {:ok, manual} = ManualClock.start_link()
+    Process.unlink(manual)
+    c = cfg(t, clock: {ManualClock, manual})
+    GenServer.stop(manual)
+    assert Ingress.prepare(c, :c, reader(t, "x")) == {:error, :clock_unavailable}
+    refute_received {:authenticate, _}
+    refute_side_effects([:store, :body, :id])
+  end
+
+  test "a clock module that is missing or lacks now/1 is refused", t do
+    good = cfg(t)
+    base = Map.from_struct(good) |> Map.drop([:__struct__])
+
+    for bad <- [{Telelem.NoSuchClock, nil}, {Enum, nil}, {:"", nil}, {nil, nil}] do
+      assert Ingress.config(%{base | clock: bad}) == {:error, {:invalid, :clock}}
+
+      assert Ingress.prepare(%{good | clock: bad}, :c, reader(t, "x")) ==
+               {:error, :invalid_config}
+    end
+
+    refute_received {:authenticate, _}
+    refute_side_effects([:store, :body, :id])
   end
 
   ## Body reader

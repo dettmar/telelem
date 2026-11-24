@@ -120,14 +120,20 @@ defmodule Telelem.Serve.Ingress do
    1. `t0` = one clock reading. The ingress deadline is `t0 + deadline_ceiling_ms`.
    2. Authentication callback with `auth_input`; result must be `{:ok,
       %Principal{}}` that passes `Principal.check/1`. Anything else, a raise,
-      throw or exit included, is `:unauthenticated`.
+      throw or exit included (from the callback or from checking a malformed
+      principal it returned), is `:unauthenticated`.
    3. Principal mode must equal the configured mode; the principal must hold
       `:dispatch`; its tenant must be the bindings' tenant. A foreign tenant
       gets `:no_route`, the same reply as a missing route, and the store is
       not touched for it.
    4. One `fetch/3` on the context store, for `principal.tenant_id` and the
-      configured `route_id`. The record must hold a revision of that route
-      that `Telelem.Route.Revision.new/1` accepts with its §1 digest. That
+      configured `route_id`. The reply must be the shared
+      `Telelem.Ops.RevisionStore` record envelope that `Telelem.Ops.Route`
+      accepts (`%{revision: r, last_plan_digest: nil | hex64}`), and `r` must
+      carry its stored §1 `digest` (64 lowercase hex), be a `%Revision{}` or a
+      plain map of exactly the §1 fields, and be accepted by
+      `Telelem.Route.Revision.new/1` *with that digest* for this route. A
+      missing digest is never recomputed: it is `:store_integrity`. That
       revision is pinned: it is never fetched again for this request.
    5. Attempt policy: the configuration must say `max_attempts: 1` and the
       pinned revision must have `max_attempts == 1` and `fallback_on_refusal
@@ -138,11 +144,22 @@ defmodule Telelem.Serve.Ingress do
       with `t0`. The primary target is resolved again (it must verify) and
       pinned. The plan must have `backup: :none` and `max_attempts: 1`.
    7. The bounded body reader runs once with `(max_body_bytes, remaining_ms)`.
-   8. The gateway ID is generated, and `Prepared` is returned.
+   8. The gateway ID is generated.
+   9. The pinned deadline is checked once more; only then is `Prepared`
+      returned.
 
-  The deadline is rechecked after steps 2, 4, 6 and 7 and before 8, against
-  the clock. Crossing it gives `{:error, {:deadline_exceeded, stage}}` with
-  `stage` in `:authenticate | :route | :select | :body`.
+  The deadline is rechecked after steps 2, 4, 6, 7 and 8, against the clock.
+  Crossing it gives `{:error, {:deadline_exceeded, stage}}` with `stage` in
+  `:authenticate | :route | :select | :body | :gateway_id`. A request whose
+  deadline passes while its ID is generated is not returned.
+
+  ## Clock
+
+  Every clock reading is contained. A clock that raises, throws, exits or
+  returns a non-integer gives `{:error, :clock_unavailable}` at that reading,
+  and nothing after it runs: no authentication (if `t0` failed), no store
+  read, no body read, no ID, no `Prepared`. `config/1` also requires the
+  clock module to be loadable and to export `now/1`.
 
   ## Deadline semantics (day-two review point)
 
@@ -182,12 +199,13 @@ defmodule Telelem.Serve.Ingress do
   | Reason                            | Meaning                                      |
   | --------------------------------- | -------------------------------------------- |
   | `:invalid_config`                 | not a `Config` from `config/1`               |
+  | `:clock_unavailable`              | a clock reading failed or was not an integer |
   | `:unauthenticated`                | callback did not return a valid principal    |
   | `:mode_mismatch`                  | principal mode ≠ configured mode             |
   | `:permission_denied`              | principal lacks `:dispatch`                  |
   | `:no_route`                       | route missing, or principal's tenant not bound |
   | `:store_unavailable`              | `fetch/3` raised, threw or exited            |
-  | `:store_integrity`                | malformed record or revision refused by §1   |
+  | `:store_integrity`                | malformed record, missing digest, or §1 refusal |
   | `:unsupported_attempt_policy`     | pinned revision allows two attempts/fallback |
   | `:no_eligible_deployment`         | no deployment of the revision is bound       |
   | `{:target_denied, denial}`        | sandbox resolve denied the request outright  |
@@ -219,9 +237,10 @@ defmodule Telelem.Serve.Ingress do
   @max_ceiling_ms 600_000
   @max_body_limit 16 * 1024 * 1024
 
-  @type stage :: :authenticate | :route | :select | :body
+  @type stage :: :authenticate | :route | :select | :body | :gateway_id
   @type reason ::
           :invalid_config
+          | :clock_unavailable
           | :unauthenticated
           | :mode_mismatch
           | :permission_denied
@@ -259,7 +278,8 @@ defmodule Telelem.Serve.Ingress do
   `1`; anything else is `{:error, {:unsupported, :max_attempts}}`),
   `:deadline_ceiling_ms` (`1..max_ceiling_ms/0`), `:max_body_bytes`
   (`1..max_body_limit/0`), `:clock` (`{module, arg}` implementing
-  `Telelem.Instance.Clock.now/1`, monotonic milliseconds).
+  `Telelem.Instance.Clock.now/1`, monotonic milliseconds; the module must be
+  loadable and export `now/1`).
 
   Optional: `:new_gateway_id` (0-arity fun returning an ID; default 16 random
   bytes, URL-safe base64 without padding). It is trusted gateway code, never
@@ -315,13 +335,20 @@ defmodule Telelem.Serve.Ingress do
   @doc "Prepares one request. See the moduledoc for order, deadline and errors."
   @spec prepare(Config.t(), term(), body_reader()) :: {:ok, Prepared.t()} | {:error, reason()}
   def prepare(%Config{} = cfg, auth_input, body_reader) when is_function(body_reader, 2) do
-    if config_intact?(cfg), do: run(cfg, auth_input, body_reader), else: {:error, :invalid_config}
+    if contained(fn -> config_intact?(cfg) end) == {:returned, true},
+      do: run(cfg, auth_input, body_reader),
+      else: {:error, :invalid_config}
   end
 
   def prepare(_cfg, _auth_input, _body_reader), do: {:error, :invalid_config}
 
   defp run(cfg, auth_input, body_reader) do
-    t0 = now(cfg)
+    with {:ok, t0} <- now(cfg) do
+      run(cfg, auth_input, body_reader, t0)
+    end
+  end
+
+  defp run(cfg, auth_input, body_reader, t0) do
     ceiling_deadline = t0 + cfg.deadline_ceiling_ms
 
     with {:ok, principal} <- authenticate(cfg, auth_input),
@@ -335,7 +362,8 @@ defmodule Telelem.Serve.Ingress do
          :ok <- in_time(cfg, deadline, :select),
          {:ok, body} <- read_body(cfg, body_reader, deadline),
          :ok <- in_time(cfg, deadline, :body),
-         {:ok, gateway_id} <- gateway_id(cfg) do
+         {:ok, gateway_id} <- gateway_id(cfg),
+         :ok <- in_time(cfg, deadline, :gateway_id) do
       {:ok,
        %Prepared{
          gateway_id: gateway_id,
@@ -358,14 +386,20 @@ defmodule Telelem.Serve.Ingress do
 
   defp authenticate(cfg, auth_input) do
     case contained(fn -> cfg.authenticate.(auth_input) end) do
+      # `check/1` itself may raise on a malformed struct (e.g. a bogus
+      # `MapSet`); that is contained too.
       {:returned, {:ok, %Principal{} = p}} ->
-        if Principal.check(p) == :ok, do: {:ok, p}, else: {:error, :unauthenticated}
+        if contained(fn -> Principal.check(p) end) == {:returned, :ok},
+          do: {:ok, p},
+          else: {:error, :unauthenticated}
 
       _ ->
         {:error, :unauthenticated}
     end
   end
 
+  # The principal already passed `Principal.check/1`, so these field reads
+  # and `permitted?/2` cannot fail on its shape.
   defp authorize(cfg, principal) do
     cond do
       principal.mode != cfg.context.mode -> {:error, :mode_mismatch}
@@ -382,29 +416,56 @@ defmodule Telelem.Serve.Ingress do
 
     case contained(fn -> mod.fetch(arg, principal.tenant_id, cfg.route_id) end) do
       {:returned, :not_found} -> {:error, :no_route}
-      {:returned, {:ok, %{revision: revision}}} -> pin_revision(revision, cfg.route_id)
+      {:returned, {:ok, record}} -> pin_record(record, cfg.route_id)
       {:returned, _malformed} -> {:error, :store_integrity}
       :failed -> {:error, :store_unavailable}
     end
   end
 
-  # Rebuild through `Revision.new/1` so the pinned value is a fresh, fully
-  # re-validated `%Revision{}` (digest included) of exactly the §1 fields,
-  # whatever struct or map the store handed back.
-  defp pin_revision(%{} = stored, route_id) do
-    extra = Map.keys(stored) -- [:__struct__ | @revision_fields]
-    struct_ok = Map.get(stored, :__struct__, Revision) == Revision
-
-    with true <- extra == [] and struct_ok,
-         {:ok, %Revision{route_id: ^route_id} = r} <-
-           Revision.new(Map.take(stored, @revision_fields)) do
-      {:ok, r}
-    else
+  # The shared `RevisionStore` record envelope, checked as `Ops.Route` does:
+  # both keys present, `last_plan_digest` nil or 64 lowercase hex. Then the
+  # revision is pinned. Contained, so a pathological record is an integrity
+  # fault, never a crash.
+  defp pin_record(record, route_id) do
+    case contained(fn -> pin(record, route_id) end) do
+      {:returned, {:ok, %Revision{}} = ok} -> ok
       _ -> {:error, :store_integrity}
     end
   end
 
-  defp pin_revision(_, _), do: {:error, :store_integrity}
+  defp pin(%{revision: revision, last_plan_digest: last}, route_id)
+       when is_nil(last) or is_binary(last) do
+    if is_nil(last) or hex_digest?(last), do: pin_revision(revision, route_id), else: :error
+  end
+
+  defp pin(_, _), do: :error
+
+  # Rebuild through `Revision.new/1` so the pinned value is a fresh, fully
+  # re-validated `%Revision{}` of exactly the §1 fields, whatever struct or map
+  # the store handed back. The stored digest is required and must match: it
+  # is never reconstructed from the other fields (`Revision.new/1` would
+  # compute one if `:digest` were absent).
+  defp pin_revision(%{digest: digest} = stored, route_id) when is_binary(digest) do
+    extra = Map.keys(stored) -- [:__struct__ | @revision_fields]
+    struct_ok = Map.get(stored, :__struct__, Revision) == Revision
+
+    with true <- extra == [] and struct_ok and hex_digest?(digest),
+         {:ok, %Revision{route_id: ^route_id, digest: ^digest} = r} <-
+           Revision.new(Map.take(stored, @revision_fields)) do
+      {:ok, r}
+    else
+      _ -> :error
+    end
+  end
+
+  defp pin_revision(_, _), do: :error
+
+  defp hex_digest?(d) when byte_size(d) == 64, do: hex?(d)
+  defp hex_digest?(_), do: false
+
+  defp hex?(<<>>), do: true
+  defp hex?(<<c, rest::binary>>) when c in ?0..?9 or c in ?a..?f, do: hex?(rest)
+  defp hex?(_), do: false
 
   defp attempt_policy(%Revision{max_attempts: 1, fallback_on_refusal: false}), do: :ok
   defp attempt_policy(%Revision{}), do: {:error, :unsupported_attempt_policy}
@@ -439,7 +500,10 @@ defmodule Telelem.Serve.Ingress do
   end
 
   defp read_body(cfg, reader, deadline) do
-    remaining = deadline - now(cfg)
+    with {:ok, n} <- now(cfg), do: read_bounded(cfg, reader, deadline - n)
+  end
+
+  defp read_bounded(cfg, reader, remaining) do
     max = cfg.max_body_bytes
 
     if remaining <= 0 do
@@ -471,13 +535,19 @@ defmodule Telelem.Serve.Ingress do
   ## Deadline
 
   defp in_time(cfg, deadline, stage) do
-    if now(cfg) < deadline, do: :ok, else: {:error, {:deadline_exceeded, stage}}
+    case now(cfg) do
+      {:ok, n} when n < deadline -> :ok
+      {:ok, _} -> {:error, {:deadline_exceeded, stage}}
+      {:error, _} = err -> err
+    end
   end
 
+  # Every reading is contained: a raise, throw, exit or non-integer reply is
+  # one stable, payload-free error, and the caller stops at it.
   defp now(%Config{clock: {mod, arg}}) do
-    case mod.now(arg) do
-      n when is_integer(n) -> n
-      _ -> raise ArgumentError, "ingress clock returned a non-integer"
+    case contained(fn -> mod.now(arg) end) do
+      {:returned, n} when is_integer(n) -> {:ok, n}
+      _ -> {:error, :clock_unavailable}
     end
   end
 
@@ -513,7 +583,9 @@ defmodule Telelem.Serve.Ingress do
   defp attempts_ok(nil), do: {:error, {:invalid, :max_attempts}}
   defp attempts_ok(_), do: {:error, {:unsupported, :max_attempts}}
 
-  defp clock?({mod, _arg}) when is_atom(mod), do: true
+  defp clock?({mod, _arg}) when is_atom(mod),
+    do: Code.ensure_loaded?(mod) and function_exported?(mod, :now, 1)
+
   defp clock?(_), do: false
 
   defp in_range?(n, max), do: is_integer(n) and n > 0 and n <= max
