@@ -23,6 +23,10 @@ defmodule Telelem.HandoffTerminalTest do
     * P4/P5 deadline: grant still pending at the deadline → refused, a later
       grant is stale; coordinator wedged past deadline + grace → the winner
       kills it and gets `:unconfirmed`, and the queued grant never releases.
+    * P5b finish/4 with `deadline:`: a coordinator that never sends the
+      initial reply, or replies late and then goes silent, is fenced at one
+      absolute deadline + grace across both waits; legacy finish/3 keeps its
+      5s initial-reply wait.
     * P6 write result pending at the deadline (requester alive, silent) →
       `{:incomplete, {:terminal_unconfirmed, :deadline}}`, never done.
     * P7 nil/empty marker; legacy fence-only fakes cannot be terminal
@@ -302,6 +306,77 @@ defmodule Telelem.HandoffTerminalTest do
     assert_receive {:res, :a, {:error, :unconfirmed}}, 3_000
     assert_receive {:DOWN, ref, :process, ^h, :killed} when ref == c.hm, @t
     refute Process.alive?(h)
+    assert marker_msgs(drain(:req)) == []
+  end
+
+  # finish/4 with the shared deadline: the caller times both waits against one
+  # absolute bound, deadline + grace (1_000 ms in Handoff).
+  @grace 1_000
+
+  defp timed_finish(c, d) do
+    run(c.p.a, fn ->
+      r = Handoff.finish(c.h, {:upstream_done, "stop"}, @marker, deadline: d)
+      {r, System.monotonic_time(:millisecond)}
+    end)
+  end
+
+  test "P5b coordinator never sends the initial reply: finish/4 fences at deadline + grace, not the 5s call timeout",
+       ctx do
+    d = in_ms(200)
+    c = start(ctx, terminal_deadline: d)
+    h = c.h
+    # Wedged before it can even see the finish call.
+    :sys.suspend(h)
+    timed_finish(c, d)
+    wait_q(h, 1)
+
+    assert_receive {:res, :a, {{:error, :unconfirmed}, t}}, 3_000
+    assert t >= d + @grace
+    assert t < d + @grace + 1_000
+    assert_receive {:DOWN, ref, :process, ^h, :killed} when ref == c.hm, @t
+    refute Enum.any?(traces(h), &match?({:terminal_requested, _}, &1))
+    assert marker_msgs(drain(:req)) == []
+  end
+
+  test "P5b late initial reply then silence: the decision wait shares the same absolute bound",
+       ctx do
+    d = in_ms(700)
+    c = start(ctx, terminal_deadline: d)
+    h = c.h
+    :sys.suspend(c.auth)
+    :sys.suspend(h)
+    timed_finish(c, d)
+    wait_q(h, 1)
+    # Phase one consumes most of the time before the deadline...
+    Process.sleep(max(d - 250 - System.monotonic_time(:millisecond), 0))
+    :sys.resume(h)
+    # ...then the coordinator replies {:pending, d} (grant request stuck at
+    # the suspended authority) and wedges before its deadline timer fires.
+    assert_receive {:telelem_handoff_trace, ^h, {:terminal_requested, :a}}, @t
+    :sys.suspend(h)
+    assert System.monotonic_time(:millisecond) < d
+
+    assert_receive {:res, :a, {{:error, :unconfirmed}, t}}, 3_000
+    assert t >= d + @grace
+    assert t < d + @grace + 500
+    assert_receive {:DOWN, ref, :process, ^h, :killed} when ref == c.hm, @t
+    :sys.resume(c.auth)
+    assert marker_msgs(drain(:req)) == []
+  end
+
+  test "P5b legacy finish/3 (no caller deadline) keeps the 5s initial-reply wait", ctx do
+    d = in_ms(100)
+    c = start(ctx, terminal_deadline: d)
+    h = c.h
+    :sys.suspend(h)
+    run(c.p.a, fn -> Handoff.finish(h, :t, @marker) end)
+    wait_q(h, 1)
+    # Well past deadline + grace the legacy caller is still waiting...
+    refute_receive {:res, :a, _}, d + @grace + 300 - System.monotonic_time(:millisecond)
+    # ...so the reply still reaches it: refused at the deadline, no fence.
+    :sys.resume(h)
+    assert_receive {:res, :a, {:error, :cancelled}}, @t
+    assert Process.alive?(h)
     assert marker_msgs(drain(:req)) == []
   end
 

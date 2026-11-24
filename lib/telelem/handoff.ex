@@ -83,18 +83,22 @@ defmodule Telelem.Handoff do
       the marker must be a non-empty binary.
     * **Terminal deadline.** `:terminal_deadline` is one absolute instant of
       `System.monotonic_time(:millisecond)`, shared by the coordinator, the
-      winner (`finish/3` learns it from the coordinator) and the requester
+      winner (`finish/4` takes it as `deadline:` before its first wait;
+      legacy `finish/3` learns it from the coordinator) and the requester
       (`{:terminal, marker, deadline}`). The coordinator enforces it with one
       timer of its own, independent of the requester: a `finish/3` at or
       after it, or a grant still pending at it, is refused; a write result
       still pending at it ends `{:incomplete, {:terminal_unconfirmed,
       :deadline}}` with `downstream: :unconfirmed`. It does not end an open
       stream that has not finished yet (no finish can succeed after it).
-    * **No late side effect after a caller gives up.** `finish/3` and
+    * **No late side effect after a caller gives up.** `finish/4` and
       `terminal_written/2` never return a local timeout while the coordinator
-      can still act on the call: when their bound expires (`finish/3`: the
-      deadline plus a grace period; otherwise the call timeout) they kill the
-      coordinator, wait for its `:DOWN` and only then return. A decision
+      can still act on the call: when their bound expires (`finish/4` with
+      `deadline:`: one absolute `deadline + grace` across its initial reply
+      and the decision; legacy `finish/3`: the call timeout for the reply,
+      then the reported deadline plus a grace; otherwise the call timeout)
+      they kill the coordinator, wait for its `:DOWN` and only then return.
+      A decision
       already sent before the kill is returned; otherwise the result is
       `{:error, :unconfirmed}` (the marker may or may not have been handed
       out). Coordinator loss is never a refusal: no retry, replay or refund.
@@ -320,17 +324,46 @@ defmodule Telelem.Handoff do
       within the bound (then it was killed first, see "No late side effect").
       The marker may have been handed out. Never retry or replay.
 
-  Blocks at most until the coordinator's deadline plus a grace period (or the
-  call timeout when there is no deadline), and never returns while the
-  coordinator could still release the marker afterwards.
+  Options:
+
+    * `:deadline`. The shared absolute `:terminal_deadline`
+      (`System.monotonic_time(:millisecond)`), when the caller knows it.
+      Then one absolute bound, `deadline + grace`, covers both waits: the
+      coordinator's initial reply and the decision that follows. Neither wait
+      restarts a timeout or adds its own grace; if the coordinator reports a
+      different deadline, the earlier bound wins. A caller that only arrives
+      after `deadline + grace` fences the coordinator at once (it could not
+      have released the marker anyway: a finish at or after the deadline is
+      refused).
+    * Without `:deadline` (legacy): the initial reply is bounded by the call
+      timeout (5000 ms), then the decision by the deadline the coordinator
+      reports plus the grace (or the call timeout if it reports none).
+
+  Never returns while the coordinator could still release the marker
+  afterwards.
   """
-  def finish(h, terminal, marker \\ nil) when is_nil(marker) or is_binary(marker) do
+  def finish(h, terminal, marker \\ nil, opts \\ [])
+      when (is_nil(marker) or is_binary(marker)) and is_list(opts) do
+    bound =
+      case Keyword.get(opts, :deadline) do
+        nil ->
+          nil
+
+        d when is_integer(d) ->
+          d + @decision_grace
+
+        other ->
+          raise ArgumentError, "finish/4 :deadline must be an integer, got: #{inspect(other)}"
+      end
+
     tag = make_ref()
     mref = Process.monitor(h)
 
     try do
-      case GenServer.call(h, {:finish, terminal, marker, tag}, @call_timeout) do
-        {:pending, deadline} -> await_decision(h, mref, tag, deadline)
+      first_wait = if bound, do: remaining(bound), else: @call_timeout
+
+      case GenServer.call(h, {:finish, terminal, marker, tag}, first_wait) do
+        {:pending, deadline} -> await_decision(h, mref, tag, decision_bound(bound, deadline))
         other -> other
       end
     catch
@@ -368,20 +401,32 @@ defmodule Telelem.Handoff do
     end
   end
 
-  # Client side of finish/3 in admission mode. The coordinator decides by its
-  # deadline; after deadline + grace the caller fences it instead of guessing.
-  defp await_decision(h, mref, tag, deadline) do
-    wait =
-      if is_integer(deadline),
-        do: max(deadline - System.monotonic_time(:millisecond), 0) + @decision_grace,
-        else: @call_timeout
+  # The absolute instant finish/4 stops waiting for the decision. A bound the
+  # caller already holds (its deadline + grace) is never extended; the
+  # coordinator's reported deadline can only tighten it.
+  # Legacy (no caller deadline), unchanged: the grace counts from the later of
+  # the reported deadline and the pending reply's arrival.
+  defp decision_bound(nil, deadline) when is_integer(deadline),
+    do: max(deadline, System.monotonic_time(:millisecond)) + @decision_grace
 
+  defp decision_bound(nil, _), do: System.monotonic_time(:millisecond) + @call_timeout
+
+  defp decision_bound(bound, deadline) when is_integer(deadline),
+    do: min(bound, deadline + @decision_grace)
+
+  defp decision_bound(bound, _), do: bound
+
+  defp remaining(bound), do: max(bound - System.monotonic_time(:millisecond), 0)
+
+  # Client side of finish/4 in admission mode. The coordinator decides by its
+  # deadline; at the absolute bound the caller fences it instead of guessing.
+  defp await_decision(h, mref, tag, bound) do
     receive do
       {@tag, ^h, {:terminal_decision, ^tag, decision}} -> decision
       # A decision sent before the exit would have been matched first.
       {:DOWN, ^mref, :process, _, _} -> {:error, :unconfirmed}
     after
-      wait -> fence_coordinator(h, mref, tag)
+      remaining(bound) -> fence_coordinator(h, mref, tag)
     end
   end
 
