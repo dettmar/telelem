@@ -46,7 +46,30 @@ defmodule Telelem.WireSSETest do
     assert SSE.classify(ev(%{"choices" => [], "usage" => %{"total_tokens" => 1}})) == :semantic
     assert SSE.classify(ev(%{"error" => %{"message" => "boom"}})) == :error_event
     assert SSE.classify("data: [DONE]\n\n") == :done
-    assert SSE.classify("data: not json\n\n") == :preamble
+    assert SSE.classify("data: not json\n\n") == :unsupported
+  end
+
+  test "the success sentinel must be exact; SDK-terminal look-alikes are flagged, not accepted" do
+    # The pinned SDK stops cleanly on any data that *starts with* [DONE].
+    assert SSE.classify("data: [DONE]\n\n") == :done
+    assert SSE.classify("data:[DONE]\n\n") == :done
+    assert SSE.classify("data: [DONE]\r\n\r\n") == :done
+    assert SSE.classify("data: [DONE]x\n\n") == :bad_sentinel
+    assert SSE.classify("data: [DONE] \n\n") == :bad_sentinel
+    assert SSE.classify("data: [DONE]\ndata: more\n\n") == :bad_sentinel
+    assert SSE.classify("data:  [DONE]\n\n") == :unsupported
+    assert SSE.classify("event: done\ndata: [DONE]\n\n") == :unsupported
+    assert SSE.classify(": hb\ndata: [DONE]\n\n") == :unsupported
+  end
+
+  test "error events follow the SDK's truthiness test; finish reasons are extracted" do
+    assert SSE.classify(ev(%{"error" => %{"message" => "x"}})) == :error_event
+    assert SSE.classify(ev(%{"error" => "x"})) == :error_event
+    assert SSE.classify(ev(Map.put(delta(%{"content" => "a"}), "error", nil))) == :semantic
+    assert SSE.classify(ev(Map.put(delta(%{"content" => "a"}), "error", %{}))) == :semantic
+    assert SSE.finish_reasons(ev(delta(%{}, "stop"))) == ["stop"]
+    assert SSE.finish_reasons(ev(delta(%{"content" => "a"}))) == []
+    assert SSE.finish_reasons("data: [DONE]\n\n") == []
   end
 
   test "an event or partial frame over max_event overflows instead of growing" do

@@ -1,20 +1,46 @@
 defmodule Telelem.Wire.SSE do
   @moduledoc """
-  Incremental, size-bounded Server-Sent Events splitter (TEL-005).
+  Incremental, size-checked Server-Sent Events splitter and classifier for the
+  narrow M1 chat-completions grammar (TEL-005).
 
-  It only cuts the byte stream at event boundaries (a blank line: `\\n\\n`,
+  It cuts the byte stream at event boundaries (a blank line: `\\n\\n`,
   `\\r\\n\\r\\n` or `\\r\\r`) and classifies each complete event. It never
   rewrites event bytes: the gateway forwards exactly what the upstream sent.
 
   Bytes after the last boundary stay in `rest`. They are a **partial frame**:
-  if the stream ends or breaks, they are discarded and counted, never forwarded
+  if the stream ends or breaks they are discarded and counted, never forwarded
   and never completed.
 
-  `feed/3` returns `{:overflow, size}` when `rest` would exceed `max_event`
-  bytes, so one event can never grow without bound.
+  `feed/3` returns `{:overflow, size}` when an event, or the partial frame,
+  is larger than `max_event`. The check runs on the concatenated buffer
+  *after* a delivery has been appended. It is an abort threshold, not a cap on
+  memory already held.
+
+  ## Grammar (M1 only, deliberately narrow)
+
+  Lines are parsed the way the pinned OpenAI SDK's SSE decoder does: a line
+  starting with `:` is a comment, otherwise `field:value` with one leading
+  space dropped from the value, and `data` values joined with `\\n`. The SDK
+  stops iterating (a clean end) on **any** event whose data *starts with*
+  `[DONE]`, and raises `APIError` on a JSON object whose `"error"` is truthy.
+  So:
+
+    * `:comment`: only comment lines (heartbeats).
+    * `:done`: data is exactly `[DONE]`. This is the only success sentinel.
+    * `:bad_sentinel`: data starts with `[DONE]` but is not exactly that. The
+      SDK would treat it as a success marker, so it must never be forwarded.
+    * `:error_event`: a JSON object with a truthy top-level `"error"`.
+    * `:semantic`: a `chat.completion.chunk`-shaped object carrying content,
+      tool calls, refusal, a finish reason or usage.
+    * `:preamble`: a JSON object with none of those (e.g. the role-only chunk).
+    * `:unsupported`: anything else: non-data fields (`event:`, `id:`,
+      `retry:`), data that is not a JSON object, or a mix of comment and data
+      lines. This is outside the M1 grammar and is treated as a protocol
+      violation, not forwarded.
   """
 
-  @type kind :: :comment | :done | :semantic | :preamble | :error_event
+  @type kind ::
+          :comment | :done | :bad_sentinel | :error_event | :semantic | :preamble | :unsupported
   @type event :: {kind(), binary()}
 
   @doc """
@@ -52,40 +78,64 @@ defmodule Telelem.Wire.SSE do
     end
   end
 
-  @doc """
-  Classifies one complete event.
-
-    * `:comment`: only comment lines (`:` prefix), such as heartbeats.
-    * `:done`: a `data: [DONE]` event.
-    * `:semantic`: a data event that carries content, tool calls, a finish
-      reason or usage. This is what makes an attempt `ready`.
-    * `:error_event`: a data event with a top-level `"error"` object.
-    * `:preamble`: any other data event (e.g. the role-only first chunk).
-      It is kept and forwarded in order, but it does not make an attempt ready.
-  """
+  @doc "Classifies one complete event (see the moduledoc grammar)."
   @spec classify(binary()) :: kind()
   def classify(ev) do
-    lines = ev |> String.split(["\r\n", "\n", "\r"], trim: true)
-
-    data =
-      for line <- lines, String.starts_with?(line, "data:") do
-        line |> String.replace_prefix("data:", "") |> String.replace_prefix(" ", "")
-      end
+    lines = String.split(ev, ["\r\n", "\n", "\r"], trim: true)
+    {comments, fields} = Enum.split_with(lines, &String.starts_with?(&1, ":"))
+    parsed = Enum.map(fields, &field/1)
 
     cond do
-      data == [] and Enum.all?(lines, &String.starts_with?(&1, ":")) -> :comment
-      data == [] -> :preamble
-      true -> classify_data(Enum.join(data, "\n"))
+      fields == [] and comments != [] -> :comment
+      fields == [] -> :unsupported
+      comments != [] -> :unsupported
+      Enum.any?(parsed, fn {name, _} -> name != "data" end) -> :unsupported
+      true -> classify_data(Enum.map_join(parsed, "\n", &elem(&1, 1)))
     end
   end
 
-  defp classify_data("[DONE]" <> _), do: :done
+  defp field(line) do
+    case String.split(line, ":", parts: 2) do
+      [name, " " <> value] -> {name, value}
+      [name, value] -> {name, value}
+      [name] -> {name, ""}
+    end
+  end
+
+  defp classify_data("[DONE]"), do: :done
+  defp classify_data("[DONE]" <> _), do: :bad_sentinel
 
   defp classify_data(payload) do
     case JSON.decode(payload) do
-      {:ok, %{"error" => e}} when is_map(e) -> :error_event
-      {:ok, %{} = obj} -> if semantic?(obj), do: :semantic, else: :preamble
-      _ -> :preamble
+      {:ok, %{} = obj} ->
+        cond do
+          truthy?(obj["error"]) -> :error_event
+          semantic?(obj) -> :semantic
+          true -> :preamble
+        end
+
+      _ ->
+        :unsupported
+    end
+  end
+
+  @doc """
+  The `finish_reason` values carried by a data event (empty if none or if it
+  is not a JSON object). Used to check the terminal grammar.
+  """
+  @spec finish_reasons(binary()) :: [term()]
+  def finish_reasons(ev) do
+    payload =
+      ev
+      |> String.split(["\r\n", "\n", "\r"], trim: true)
+      |> Enum.map_join("\n", &(&1 |> field() |> elem(1)))
+
+    case JSON.decode(payload) do
+      {:ok, %{"choices" => choices}} when is_list(choices) ->
+        for %{} = ch <- choices, present?(ch["finish_reason"]), do: ch["finish_reason"]
+
+      _ ->
+        []
     end
   end
 
@@ -106,6 +156,9 @@ defmodule Telelem.Wire.SSE do
 
     usage? or choices?
   end
+
+  # Python truthiness, as the SDK's `data.get("error")` test.
+  defp truthy?(v), do: v not in [nil, false, 0, +0.0, "", [], %{}]
 
   defp present?(nil), do: false
   defp present?(""), do: false

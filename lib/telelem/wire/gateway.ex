@@ -25,8 +25,10 @@ defmodule Telelem.Wire.Gateway do
 
   Endings:
 
-    * `{:done, _}` (the upstream sent `[DONE]` and ended its body): the
-      response ends with the chunked terminator.
+    * `{:done, _}`: the attempt forwarded the upstream's exact `[DONE]` only
+      after the complete HTTP body and a supported finish_reason (see
+      `Telelem.Wire.Upstream`). The response then ends with the chunked
+      terminator. The controller never writes `[DONE]` itself.
     * `{:incomplete, _}`, a downstream write error, or a deadline after commit:
       the connection is closed **without** the chunked terminator (the handler
       raises `Telelem.Wire.Gateway.Aborted`; Bandit closes the socket), so the

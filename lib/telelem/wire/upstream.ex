@@ -6,6 +6,12 @@ defmodule Telelem.Wire.Upstream do
 
   ## Reader: credit-driven, one delivery at a time
 
+  (Bounds: `high_water` decides whether to arm. `max_event` and `hard_cap` are
+  abort thresholds checked *after* a delivery has been appended and parsed.
+  They are not a ceiling on memory already held: transiently the attempt
+  holds up to its previous retained bytes plus one delivery, whose size the
+  gateway does not control; see `Telelem.Wire.Limits`.)
+
   Mint runs in `:passive` mode, so `Mint.HTTP.stream/2` never re-arms the
   socket. The attempt itself arms it with `:ssl.setopts(sock, active: :once)`
   **only** while its retained bytes are below `Limits.high_water`, and it does
@@ -28,14 +34,34 @@ defmodule Telelem.Wire.Upstream do
   writes the request only on `:ok`. A refused `connect` is therefore provably
   pre-send (`charge: :none`); anything after the grant is `:possible`.
 
-  ## Truthful termination
+  ## Truthful termination (narrow M1 grammar, see `Telelem.Wire.SSE`)
+
+  The pinned SDK ends iteration *cleanly* at the first event whose data starts
+  with `[DONE]`, whatever follows on the wire. Whoever forwards that event
+  therefore declares success to the client. So:
 
     * Only complete SSE events are forwarded, byte for byte. A partial frame
       left when the stream ends or breaks is discarded and counted.
-    * `Handoff.finish/2` is called only when the upstream sent `data: [DONE]`
-      **and** Mint saw the end of the HTTP body. A clean HTTP end without
-      `[DONE]`, a reset or an overflow ends the attempt without `finish`, so
-      the coordinator reports `incomplete` (after commit) or `failed`.
+    * The exact `data: [DONE]` event is **held**, not forwarded, until Mint
+      reports the HTTP body complete (`{:done, ref}`: the chunked terminator
+      arrived). It is forwarded, followed by `Handoff.finish/2`, only if:
+      the attempt was released, every earlier event was transferred, a
+      `finish_reason` in `#{inspect(["stop", "tool_calls"])}` was seen (and no other), no
+      error event and no protocol violation. Otherwise the held `[DONE]` is
+      dropped and the attempt ends without `finish`: the coordinator reports
+      `incomplete` (after commit) or `failed`. The upstream's own finish
+      chunk is forwarded unchanged when it arrives. The gateway never
+      synthesizes or rewrites a terminal.
+    * A `[DONE]`-prefixed but non-exact sentinel, any event outside the M1
+      grammar, or any non-comment event after `[DONE]` is a protocol
+      violation. It is not forwarded, reading stops, and earlier complete
+      events are still flushed.
+    * A top-level error event stops reading. If the attempt already holds
+      content it is released and the error event is forwarded (the SDK raises
+      `APIError`), then it ends `incomplete`. An error before any content
+      fails the attempt before commit and nothing is forwarded.
+    * A clean HTTP end without `[DONE]`, a reset or an overflow ends the
+      attempt without `finish`.
     * No retry, no reconnect, no fallback inside an attempt.
 
   ## Classification for the controller
@@ -106,6 +132,8 @@ defmodule Telelem.Wire.Upstream do
       credit: limits.window,
       ended: nil,
       saw_done: false,
+      held_done: nil,
+      terminal: nil,
       paused: nil,
       starved: false,
       stats: %{
@@ -119,6 +147,7 @@ defmodule Telelem.Wire.Upstream do
         bytes_forwarded: 0,
         comments_discarded: 0,
         partial_discarded: 0,
+        events_dropped_after_end: 0,
         pauses: 0,
         credit_waits: 0
       }
@@ -314,28 +343,86 @@ defmodule Telelem.Wire.Upstream do
     %{s | err_body: s.err_body <> keep}
   end
 
-  defp response({:done, ref}, %{ref: ref} = s), do: %{s | ended: :done}
+  # A violation or error event already ended the read side; keep that reason.
+  defp response({:done, ref}, %{ref: ref, ended: nil} = s), do: %{s | ended: :done}
   defp response(_other, s), do: s
 
+  @supported_finish ["stop", "tool_calls"]
+
   defp enqueue({kind, ev}, s) do
-    st = %{s.stats | events_in: s.stats.events_in + 1}
+    s = %{s | stats: %{s.stats | events_in: s.stats.events_in + 1}}
 
     cond do
-      kind == :comment and s.role == :candidate ->
-        # Pre-election heartbeats are discardable and never forwarded.
-        %{s | stats: %{st | comments_discarded: st.comments_discarded + 1}}
+      s.ended != nil ->
+        # Read side already ended (violation / error event): never forwarded.
+        bump(s, :events_dropped_after_end)
+
+      kind == :comment and (s.role == :candidate or s.held_done != nil) ->
+        # Pre-election and post-[DONE] heartbeats are discardable.
+        bump(s, :comments_discarded)
+
+      s.held_done != nil ->
+        violation(s, {:event_after_done, kind})
+
+      kind == :done ->
+        note(s, {:done_held, %{terminal: s.terminal}})
+        %{s | held_done: ev}
+
+      kind in [:bad_sentinel, :unsupported] ->
+        violation(s, {kind, byte_size(ev)})
+
+      kind == :error_event ->
+        note(s, {:upstream_error_event, byte_size(ev)})
+        %{push(s, kind, ev) | ended: {:error_event, error_message(ev)}}
+
+      kind == :semantic ->
+        s |> track_finish(SSE.finish_reasons(ev)) |> push(kind, ev)
 
       true ->
-        %{
-          s
-          | pending: :queue.in({kind, ev}, s.pending),
-            pending_bytes: s.pending_bytes + byte_size(ev),
-            stats: st
-        }
+        push(s, kind, ev)
     end
   end
 
-  defp retained(s), do: mint_buffer(s.conn) + byte_size(s.rest) + s.pending_bytes
+  defp push(s, kind, ev) do
+    %{
+      s
+      | pending: :queue.in({kind, ev}, s.pending),
+        pending_bytes: s.pending_bytes + byte_size(ev)
+    }
+  end
+
+  defp bump(s, key), do: put_in(s.stats[key], s.stats[key] + 1)
+
+  defp violation(s, what) do
+    note(s, {:protocol_violation, what})
+    %{s | ended: {:violation, what}}
+  end
+
+  defp track_finish(s, []), do: s
+
+  defp track_finish(s, reasons) do
+    case {s.terminal, Enum.reject(reasons, &(&1 in @supported_finish))} do
+      {{:bad, _}, _} -> s
+      {_, []} -> %{s | terminal: {:ok, hd(reasons)}}
+      {_, [bad | _]} -> %{s | terminal: {:bad, bad}}
+    end
+  end
+
+  defp error_message(ev) do
+    ev
+    |> String.replace_prefix("data: ", "")
+    |> String.trim()
+    |> JSON.decode()
+    |> case do
+      {:ok, %{"error" => %{"message" => m}}} when is_binary(m) -> String.slice(m, 0, 200)
+      _ -> :unparsed
+    end
+  end
+
+  defp retained(s) do
+    held = if is_binary(s.held_done), do: byte_size(s.held_done), else: 0
+    mint_buffer(s.conn) + byte_size(s.rest) + s.pending_bytes + held
+  end
 
   defp mint_buffer(%{buffer: b}) when is_binary(b), do: byte_size(b)
   defp mint_buffer(_), do: 0
@@ -354,7 +441,7 @@ defmodule Telelem.Wire.Upstream do
   # ── election ────────────────────────────────────────────────────────────
 
   defp maybe_ready(%{role: :candidate} = s) do
-    if Enum.any?(:queue.to_list(s.pending), fn {k, _} -> k in [:semantic, :done, :error_event] end) do
+    if Enum.any?(:queue.to_list(s.pending), fn {k, _} -> k == :semantic end) do
       case Handoff.ready(s.h, s.id) do
         :release ->
           note(s, {:released, s.lane.name})
@@ -420,21 +507,29 @@ defmodule Telelem.Wire.Upstream do
 
   defp maybe_end(%{ended: nil} = s), do: s
 
-  defp maybe_end(%{role: :winner, ended: :done, saw_done: true} = s) do
-    if :queue.is_empty(s.pending) do
-      case Handoff.finish(s.h, :upstream_done) do
-        :ok -> stop(s, :finished)
-        {:error, reason} -> stop(s, {:finish_refused, reason})
-      end
-    else
-      s
-    end
-  end
-
   defp maybe_end(%{role: :winner} = s) do
-    # Flush complete events already received (credit permitting), then end
-    # without finish: the coordinator reports incomplete.
-    if :queue.is_empty(s.pending), do: stop(s, end_reason(s)), else: s
+    {:ok, reason} = if s.saw_done, do: s.terminal, else: {:ok, nil}
+
+    cond do
+      # Flush complete events already received (credit permitting) first.
+      not :queue.is_empty(s.pending) ->
+        s
+
+      # The held [DONE] has been transferred: complete HTTP evidence is in.
+      s.saw_done ->
+        case Handoff.finish(s.h, {:upstream_done, reason}) do
+          :ok -> stop(s, :finished)
+          {:error, r} -> stop(s, {:finish_refused, r})
+        end
+
+      success?(s) ->
+        note(s, {:done_released, %{terminal: s.terminal}})
+        %{push(s, :done, s.held_done) | held_done: :released} |> forward() |> maybe_end()
+
+      # End without finish: the coordinator reports incomplete.
+      true ->
+        stop(s, end_reason(s))
+    end
   end
 
   defp maybe_end(%{phase: :error_body, ended: :done} = s),
@@ -442,8 +537,19 @@ defmodule Telelem.Wire.Upstream do
 
   defp maybe_end(s), do: stop(s, end_reason(s))
 
-  defp end_reason(%{ended: :done}), do: :upstream_ended_without_done
-  defp end_reason(%{ended: {:broken, r}}), do: {:upstream_broken, r}
+  defp success?(s),
+    do: s.ended == :done and is_binary(s.held_done) and match?({:ok, _}, s.terminal)
+
+  defp end_reason(%{ended: :done, held_done: nil}), do: :upstream_ended_without_done
+  defp end_reason(%{ended: :done, terminal: nil}), do: {:done_without_finish_reason, :no_finish}
+  defp end_reason(%{ended: :done, terminal: {:bad, r}}), do: {:unsupported_finish_reason, r}
+  defp end_reason(%{ended: :done, role: :candidate}), do: :no_semantic_content
+
+  defp end_reason(%{ended: {:broken, r}} = s),
+    do: {:upstream_broken, r, %{done_held: is_binary(s.held_done)}}
+
+  defp end_reason(%{ended: {:violation, what}}), do: {:protocol_violation, what}
+  defp end_reason(%{ended: {:error_event, m}}), do: {:upstream_error_event, m}
 
   defp broken(s, reason) do
     note(
@@ -452,7 +558,8 @@ defmodule Telelem.Wire.Upstream do
     )
 
     s = put_in(s.stats.partial_discarded, s.stats.partial_discarded + byte_size(s.rest))
-    loop(%{s | rest: "", ended: {:broken, reason}})
+    # An earlier end (complete body, violation, error event) keeps its reason.
+    loop(%{s | rest: "", ended: s.ended || {:broken, reason}})
   end
 
   # ── arming ──────────────────────────────────────────────────────────────

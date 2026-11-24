@@ -5,10 +5,19 @@ defmodule Telelem.Wire.Limits do
   Application bytes the gateway holds for one request:
 
     * **attempt retained**: Mint's undecoded HTTP buffer + the partial SSE frame
-      + complete events not yet transferred. The reader arms the TLS socket for
-      one more delivery (`active: :once`) only while retained < `high_water`.
-      One delivery can overshoot that, so the hard bound is `hard_cap`;
-      exceeding it, or one event larger than `max_event`, triggers `overflow`.
+      + complete events not yet transferred + a held `[DONE]`. The reader arms
+      the TLS socket for one more delivery (`active: :once`) only while
+      retained < `high_water`. That is the only *preventive* control.
+    * `hard_cap` and `max_event` are **abort thresholds checked after** a
+      delivery has been appended to Mint's buffer and split into events. They
+      are not a ceiling on memory: before the check the attempt already holds
+      its previous retained bytes (< `high_water`) plus the delivery, plus
+      transient copies made while parsing. The gateway does not control the
+      size of one TLS delivery (it is measured as `max_delivery`; in practice it
+      tracked the pinned `upstream_recbuf`). If retained exceeds `hard_cap`
+      after a delivery, or an event or partial frame exceeds `max_event`, the
+      attempt aborts. Evidence reports `peak_retained` at those same check
+      points, not a process-memory maximum.
     * **in flight**: bytes accepted by the coordinator but not yet written
       downstream. Bounded by `window` (byte credit). The requester returns
       credit only after `Plug.Conn.chunk/2` returned `:ok`.

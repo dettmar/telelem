@@ -99,7 +99,7 @@ defmodule Telelem.WireM1Test do
     assert sdk["exception"] == nil and sdk["iterator_ended"] == true and sdk["status"] == 200
     assert sdk["finish_reason"] == "stop" and sdk["content"] == "Hello from lane b."
 
-    assert {:done, :upstream_done} = report.outcome
+    assert {:done, {:upstream_done, "stop"}} = report.outcome
     assert report.attempts.primary.charge == :none
     assert report.attempts.backup.charge == :possible
     assert downstream_end(evs) == :terminator
@@ -170,7 +170,7 @@ defmodule Telelem.WireM1Test do
     refute Enum.any?(writes(evs), &String.contains?(&1, "[DONE]"))
     assert downstream_end(evs) == :aborted
 
-    assert [{:upstream_broken, _}] =
+    assert [{:upstream_broken, _, %{done_held: false}}] =
              for(%{ev: {:upstream, :primary, {:ended, r, _}}} <- evs, do: r)
   end
 
@@ -414,7 +414,195 @@ defmodule Telelem.WireM1Test do
              sdk["finish_reason"] == "stop"
 
     assert counts["a"]["chat_completions"] == 1 and counts["b"]["tcp_accepts"] == 0
-    assert {:done, :upstream_done} = report.outcome
+    assert {:done, {:upstream_done, "stop"}} = report.outcome
+  end
+
+  # ── SSE terminal grammar (scripted upstream) ───────────────────────────
+  #
+  # The independent fixture has no fault for these byte sequences, so the primary
+  # lane here is an in-BEAM Bandit TLS upstream that writes exactly the scripted
+  # bytes. The client is still the real SDK through the real gateway; lane b is
+  # the fixture and must stay untouched. Upstream bytes are test-authored, not
+  # independent fixture evidence.
+
+  defmodule ScriptedUpstream do
+    @moduledoc false
+    import Plug.Conn
+
+    def init(opts), do: opts
+
+    def call(conn, %{steps: steps, test: test}) do
+      {:ok, _body, conn} = read_body(conn)
+      send(test, {:scripted_arrival, self()})
+      conn = conn |> put_resp_content_type("text/event-stream") |> send_chunked(200)
+
+      Enum.reduce(steps, conn, fn
+        {:send, bin}, conn ->
+          {:ok, conn} = chunk(conn, bin)
+          conn
+
+        {:sleep, ms}, conn ->
+          Process.sleep(ms)
+          conn
+
+        # Close the TLS connection without the chunked terminator.
+        :abort, _conn ->
+          raise "scripted abort"
+      end)
+    end
+  end
+
+  defmodule Bytes do
+    @moduledoc false
+    def chunk_ev(delta, fin \\ nil) do
+      obj = %{
+        "id" => "chatcmpl-s",
+        "object" => "chat.completion.chunk",
+        "created" => 1_700_000_000,
+        "model" => "telelem-wire-model",
+        "choices" => [
+          %{"index" => 0, "delta" => delta, "logprobs" => nil, "finish_reason" => fin}
+        ]
+      }
+
+      {:send, "data: " <> JSON.encode!(obj) <> "\n\n"}
+    end
+  end
+
+  @role Bytes.chunk_ev(%{"role" => "assistant", "content" => ""}) |> elem(1)
+  @hello Bytes.chunk_ev(%{"content" => "Hello"}) |> elem(1)
+  @stop Bytes.chunk_ev(%{}, "stop") |> elem(1)
+  @done "data: [DONE]\n\n"
+  @error_ev "data: " <>
+              JSON.encode!(%{
+                "error" => %{"message" => "scripted upstream error", "type" => "server_error"}
+              }) <> "\n\n"
+
+  defp scripted_gateway(ctx, name, steps) do
+    opts = [digest: :sha256, key: {:namedCurve, :secp256r1}]
+    san = {:Extension, {2, 5, 29, 17}, false, [iPAddress: <<127, 0, 0, 1>>]}
+
+    %{server_config: server, client_config: client} =
+      :public_key.pkix_test_data(%{
+        server_chain: %{root: opts, peer: [{:extensions, [san]} | opts]},
+        client_chain: %{root: opts, peer: opts}
+      })
+
+    up =
+      start_supervised!(
+        {Bandit,
+         plug: {ScriptedUpstream, %{steps: steps, test: self()}},
+         scheme: :https,
+         ip: {127, 0, 0, 1},
+         port: 0,
+         startup_log: false,
+         http_options: [compress: false, log_exceptions_with_status_codes: []],
+         thousand_island_options: [
+           shutdown_timeout: 200,
+           transport_options: [cert: server[:cert], key: server[:key], cacerts: server[:cacerts]]
+         ]},
+        id: {:scripted, name}
+      )
+
+    {:ok, {_, port}} = ThousandIsland.listener_info(up)
+    lane = %{name: "scripted", host: "127.0.0.1", port: port, cacerts: client[:cacerts]}
+    start_gateway(ctx, name, Limits.new(), primary: lane)
+  end
+
+  defp scripted_case(ctx, name, steps) do
+    gw = scripted_gateway(ctx, name, [{:send, @role} | steps])
+    sdk = sdk_stream(ctx, gw)
+    assert_received {:scripted_arrival, _}
+    {_rid, evs, report} = settled(gw)
+    counts = quiesced_counts(ctx, gw)
+
+    write_evidence(ctx, "grammar_" <> name, %{
+      upstream: "in-BEAM scripted Bandit (test-authored bytes), not the independent fixture",
+      steps: steps,
+      sdk: sdk,
+      fixture_counts_lane_b: counts["b"],
+      gateway_events: evs,
+      handoff_report: report
+    })
+
+    assert counts["b"]["tcp_accepts"] == 0
+    {sdk, evs, report}
+  end
+
+  defp sdk_success?(sdk), do: sdk["exception"] == nil and sdk["iterator_ended"] == true
+
+  test "grammar control: finish chunk + exact [DONE] + complete body is the only success", ctx do
+    {sdk, evs, report} =
+      scripted_case(ctx, "control", [{:send, @hello}, {:send, @stop}, {:send, @done}])
+
+    assert sdk_success?(sdk) and sdk["content"] == "Hello" and sdk["finish_reason"] == "stop"
+    assert {:done, _} = report.outcome
+    assert downstream_end(evs) == :terminator
+  end
+
+  test "grammar: [DONE] then a reset before the chunked terminator is not a success", ctx do
+    {sdk, evs, report} =
+      scripted_case(ctx, "done_then_reset", [
+        {:send, @hello},
+        {:send, @stop},
+        {:send, @done},
+        {:sleep, 50},
+        :abort
+      ])
+
+    refute sdk_success?(sdk), "SDK saw a clean end although the upstream body never completed"
+    assert sdk["exception"]["type"] == "openai.APIConnectionError"
+
+    assert sdk["finish_reason"] == "stop",
+           "the observed upstream finish chunk is forwarded unchanged"
+
+    assert {:incomplete, _} = report.outcome
+    refute Enum.any?(writes(evs), &String.contains?(&1, "[DONE]"))
+    assert downstream_end(evs) == :aborted
+  end
+
+  test "grammar: a non-exact [DONE] sentinel is never forwarded and never success", ctx do
+    {sdk, evs, report} =
+      scripted_case(ctx, "bad_sentinel", [
+        {:send, @hello},
+        {:send, @stop},
+        {:send, "data: [DONE]junk\n\n"}
+      ])
+
+    refute sdk_success?(sdk), "the SDK stops at any data starting with [DONE]"
+    refute match?({:done, _}, report.outcome)
+    refute Enum.any?(writes(evs), &String.contains?(&1, "[DONE]"))
+    assert downstream_end(evs) == :aborted
+  end
+
+  test "grammar: [DONE] without a supported finish_reason is never success", ctx do
+    {sdk, _evs, report} =
+      scripted_case(ctx, "done_without_finish", [{:send, @hello}, {:send, @done}])
+
+    refute sdk_success?(sdk)
+    refute match?({:done, _}, report.outcome)
+  end
+
+  test "grammar: a top-level error event + [DONE] + clean body is an error, never :done", ctx do
+    {sdk, evs, report} =
+      scripted_case(ctx, "error_then_done", [{:send, @hello}, {:send, @error_ev}, {:send, @done}])
+
+    assert sdk["exception"]["type"] == "openai.APIError"
+    assert sdk["exception"]["message"] == "scripted upstream error"
+    assert {:incomplete, _} = report.outcome
+
+    assert [{:upstream_error_event, "scripted upstream error"}] =
+             for(%{ev: {:upstream, :primary, {:ended, r, _}}} <- evs, do: r)
+
+    refute Enum.any?(writes(evs), &String.contains?(&1, "[DONE]"))
+  end
+
+  test "grammar: an error event before any content fails before commit (502), nothing forwarded",
+       ctx do
+    {sdk, evs, report} = scripted_case(ctx, "error_first", [{:send, @error_ev}, {:send, @done}])
+    assert sdk["exception"]["status_code"] == 502
+    assert {:failed, _} = report.outcome
+    assert writes(evs) == []
   end
 
   # ── helpers: gateway ────────────────────────────────────────────────────
@@ -428,9 +616,10 @@ defmodule Telelem.WireM1Test do
     end
 
     primary =
-      case opts[:primary_cacertfile] do
-        :gateway_ca -> %{lane.("a") | cacertfile: ca_work}
-        nil -> lane.("a")
+      case {opts[:primary], opts[:primary_cacertfile]} do
+        {%{} = scripted, _} -> scripted
+        {nil, :gateway_ca} -> %{lane.("a") | cacertfile: ca_work}
+        {nil, nil} -> lane.("a")
       end
 
     sup =

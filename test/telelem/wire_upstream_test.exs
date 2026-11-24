@@ -128,6 +128,19 @@ defmodule Telelem.WireUpstreamTest do
     up
   end
 
+  @stop "data: " <>
+          JSON.encode!(%{
+            "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "stop"}]
+          }) <>
+          "\n\n"
+  @done "data: [DONE]\n\n"
+
+  defp finish_ev(reason),
+    do:
+      "data: " <>
+        JSON.encode!(%{"choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => reason}]}) <>
+        "\n\n"
+
   defp event(i, pad \\ 300) do
     payload = %{
       "choices" => [
@@ -194,9 +207,10 @@ defmodule Telelem.WireUpstreamTest do
 
     # Return credit: everything flows, in order, and finishes only on [DONE] + end.
     send(a.pid, {:telelem_wire_credit, a.h, 1_000_000})
-    push(up, "data: [DONE]\n\n")
+    push(up, @stop)
+    push(up, @done)
     send(up, :finish)
-    assert_receive {@tag_h, _, {:done, :upstream_done}}, 5_000
+    assert_receive {@tag_h, _, {:done, {:upstream_done, "stop"}}}, 5_000
     assert_receive {@tag_h, _, {:closed, report}}, 5_000
     assert report.attempts.primary.cleanup == :ack
     assert eventually(fn -> sockets_to(ctx.port) == [] end)
@@ -258,7 +272,11 @@ defmodule Telelem.WireUpstreamTest do
     assert_receive {@tag_h, _, {:data, ^full}}, 2_000
     assert_receive {@tag_h, _, {:incomplete, :winner_closed}}, 2_000
     refute_received {@tag_h, _, {:data, _}}
-    assert_receive {:telelem_wire, _, :primary, {:ended, {:upstream_broken, _}, stats}}, 2_000
+
+    assert_receive {:telelem_wire, _, :primary,
+                    {:ended, {:upstream_broken, _, %{done_held: false}}, stats}},
+                   2_000
+
     assert stats.partial_discarded > 0
     assert_receive {:DOWN, ref, :process, _, :normal} when ref == a.mon, 1_000
   end
@@ -318,5 +336,92 @@ defmodule Telelem.WireUpstreamTest do
     assert_receive {@tag_h, _, {:failed, :no_winner}}, 2_000
     assert_receive {@tag_h, _, {:closed, report}}, 2_000
     assert report.attempts.primary.charge == :none
+  end
+
+  # ── terminal grammar (offline; the M1 file repeats these through the real SDK) ──
+
+  # Collects everything the requester receives until {:closed, _}.
+  defp collect(h, acc \\ []) do
+    receive do
+      {@tag_h, ^h, {:closed, report}} -> {Enum.reverse(acc), report}
+      {@tag_h, ^h, msg} -> collect(h, [msg | acc])
+    after
+      3_000 -> flunk("no close; got #{inspect(Enum.reverse(acc))}")
+    end
+  end
+
+  defp run_script(ctx, steps) do
+    a = start(ctx)
+    up = upstream!()
+    send(a.pid, {:telelem_wire_credit, a.h, 1_000_000})
+
+    for step <- steps do
+      case step do
+        {:sleep, ms} -> Process.sleep(ms)
+        bin when is_binary(bin) -> push(up, bin)
+        ctl when ctl in [:finish, :abort] -> send(up, ctl)
+      end
+    end
+
+    {msgs, report} = collect(a.h)
+    assert_receive {:telelem_wire, _, :primary, {:ended, reason, stats}}, 2_000
+    data = for {:data, d} <- msgs, do: d
+    outcome = Enum.find(msgs, &match?({k, _} when k in [:done, :incomplete, :failed], &1))
+    %{data: data, outcome: outcome, reason: reason, stats: stats, report: report}
+  end
+
+  test "[DONE] is held until the body completes: [DONE] then abort forwards no [DONE]", ctx do
+    r = run_script(ctx, [event(1), @stop, @done, {:sleep, 30}, :abort])
+    assert {:incomplete, _} = r.outcome
+    assert {:upstream_broken, _, %{done_held: true}} = r.reason
+    assert List.last(r.data) == @stop
+    refute @done in r.data
+  end
+
+  test "only exact [DONE] after a supported finish_reason, with a complete body, is done", ctx do
+    r = run_script(ctx, [event(1), @stop, @done, :finish])
+    assert r.outcome == {:done, {:upstream_done, "stop"}}
+    assert List.last(r.data) == @done
+
+    r = run_script(ctx, [event(1), finish_ev("tool_calls"), @done, :finish])
+    assert r.outcome == {:done, {:upstream_done, "tool_calls"}}
+  end
+
+  test "non-exact sentinels, unsupported finish reasons and missing finish never become done",
+       ctx do
+    for {steps, reason} <- [
+          {[event(1), @stop, "data: [DONE] \n\n", :finish],
+           {:protocol_violation, {:bad_sentinel, 15}}},
+          {[event(1), @stop, "data:[DONE]x\n\n", :finish],
+           {:protocol_violation, {:bad_sentinel, 14}}},
+          {[event(1), finish_ev("length"), @done, :finish],
+           {:unsupported_finish_reason, "length"}},
+          {[event(1), @done, :finish], {:done_without_finish_reason, :no_finish}},
+          {[event(1), @stop, @done, event(2), :finish],
+           {:protocol_violation, {:event_after_done, :semantic}}},
+          {[event(1), "event: x\ndata: {}\n\n", @stop, @done, :finish],
+           {:protocol_violation, {:unsupported, 19}}}
+        ] do
+      r = run_script(ctx, steps)
+      assert {:incomplete, _} = r.outcome, inspect(steps)
+      assert r.reason == reason
+      refute Enum.any?(r.data, &String.starts_with?(&1, "data: [DONE]")), inspect(steps)
+      refute Enum.any?(r.data, &String.starts_with?(&1, "data:[DONE]"))
+    end
+  end
+
+  test "an error event ends the stream: forwarded after content (incomplete), failed before content",
+       ctx do
+    err = "data: " <> JSON.encode!(%{"error" => %{"message" => "boom"}}) <> "\n\n"
+
+    r = run_script(ctx, [event(1), err, @done, :finish])
+    assert {:incomplete, _} = r.outcome
+    assert r.reason == {:upstream_error_event, "boom"}
+    assert List.last(r.data) == err
+
+    r = run_script(ctx, [err, @done, :finish])
+    assert {:failed, _} = r.outcome
+    assert r.reason == {:upstream_error_event, "boom"}
+    assert r.data == []
   end
 end
