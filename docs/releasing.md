@@ -14,7 +14,9 @@ M1 is tagged `m1-experiment`. It is an experiment checkpoint, not a production r
 
 The workflow files are the source of truth for events, pins, commands and permissions. Dependency and action pins should be intentionally reviewed when changed. Keep PR jobs free of credentials and do not add `pull_request_target` jobs that execute contributor code.
 
-Dialyzer (success typing), a style linter such as Credo, and container/base-image vulnerability coverage are distinct checks. If not present in the workflows, they are **not active**. Add them under the existing dependency-pin policy; address actionable warnings or record a narrowly scoped, expiring exception. A report without a working scanner is not a passing check.
+Run `scripts/dialyzer` after setup for offline success-typing diagnostics. The M1 baseline currently reports two warnings in `wire/upstream.ex`: an overflow helper that intentionally does not return, and an error fallback the pinned Mint return type makes unreachable. Dialyzer exits `2` for warnings and `1` for a tool error. It is not a required check yet; review those warnings before making it one.
+
+A style linter such as Credo and container/base-image vulnerability coverage are separate checks. If not present in the workflows, they are **not active**. Add them under the existing dependency-pin policy. A report without a working scanner is not a passing check.
 
 ## Publish deliberately
 
