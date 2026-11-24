@@ -1,0 +1,407 @@
+#!/bin/bash
+# Local lifecycle suite for the route-store commands (M2a, TEL-015 "`up` twice
+# preserves state"). Exercises the REAL scripts/route-store/{provision,start}: the
+# real lock wrapper inside the runner container, the real Telelem.Ops.FileStore, on
+# disposable host directories.
+#
+#   integration/m2a/route-store/run        # exit 0 PASS · 1 FAIL · 2 prerequisite missing
+#
+# Every store is a fresh `mktemp -d` directory (mode 700) that is removed on exit.
+# Readiness and acknowledgements are JSON lines read from the writer's stdout through
+# FIFOs; every wait is a bounded `read -t` and a timeout counts as FAIL. Process exit
+# is observed by a bounded poll of /proc (0.2 s slices, same bound); no step relies on
+# a sleep for ordering. Cleanup signals only processes this run started (PID + kernel start
+# time) and removes only containers this run named (exact name, suite nonce, label).
+# Nothing here uses a network (all containers run --network none), touches host
+# settings or writes outside the temp directory.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+RS="$ROOT/scripts/route-store"
+WRAP="$ROOT/scripts/with-route-store-lock"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+T=60 # bound (s) for one readiness/ack/exit wait; generous for a cold container boot
+
+prereq() { echo "prerequisite missing: $*" >&2; exit 2; }
+[[ $(uname -s) == Linux ]] || prereq "Linux"
+for x in "$RS/provision" "$RS/start" "$RS/launch" "$WRAP"; do [[ -x $x ]] || prereq "executable $x"; done
+command -v docker >/dev/null 2>&1 || prereq "docker CLI"
+docker info >/dev/null 2>&1 || prereq "a reachable docker daemon for the invoking user"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || prereq "runner image $IMAGE (scripts/setup)"
+command -v python3 >/dev/null 2>&1 || prereq "python3 (JSON parsing of writer events)"
+[[ -r /proc/self/fdinfo/0 ]] || prereq "/proc"
+
+BASE=$(mktemp -d "${TMPDIR:-/tmp}/telelem-route-store.XXXXXX") || exit 2
+BASE=$(realpath -e "$BASE")
+chmod 700 "$BASE"
+case $(LC_ALL=C stat -f -c %T "$BASE") in
+  ext2/ext3 | xfs | btrfs | zfs | tmpfs) ;;
+  *) echo "temp dir $BASE is on an unsupported filesystem; set TMPDIR" >&2; rm -rf "$BASE"; exit 2 ;;
+esac
+NONCE=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+PREFIX="telelem-rs-test-$NONCE"
+
+# --- ownership and cleanup ---------------------------------------------------------------
+declare -A OWNED=() # pid -> kernel start time when registered
+NAMES=()            # container names this run passed to the launcher
+proc_start() {
+  local st f
+  { st=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  st=${st##*) }
+  read -ra f <<<"$st"
+  [[ ${f[19]-} =~ ^[0-9]+$ ]] && printf '%s' "${f[19]}"
+}
+proc_state() { # pid -> one-letter state (R, S, Z, ...), or nothing if gone
+  local st
+  { st=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+  st=${st##*) }
+  printf '%s' "${st%% *}"
+}
+track() { local t; t=$(proc_start "$1") && OWNED[$1]=$t; }
+untrack() { unset 'OWNED[$1]'; }
+ours_alive() { local t; t=$(proc_start "$1") && [[ $t == "${OWNED[$1]-x}" ]]; }
+rm_named() { # remove this run's containers: exact name, and only with the launcher's label
+  local n id
+  for n in "${NAMES[@]}"; do
+    id=$(docker ps -aq --filter "name=^${n}\$" --filter "label=telelem.route-store" 2>/dev/null)
+    [[ -n $id ]] && docker rm -f $id >/dev/null 2>&1
+  done
+}
+cleanup() {
+  local p killed=()
+  trap - EXIT INT TERM HUP
+  # Clients first, so none of them goes on to create or start a container; then the
+  # named containers (twice: a create already in flight at the daemon can land after
+  # the first pass). Narrowed, not closed: see README.
+  for p in "${!OWNED[@]}"; do
+    ours_alive "$p" && kill -KILL "$p" 2>/dev/null && killed+=("$p")
+  done
+  for p in "${killed[@]}"; do { wait "$p"; } 2>/dev/null; done
+  rm_named
+  rm_named
+  rm -rf -- "$BASE"
+}
+trap cleanup EXIT
+# Signal traps only record the signal. The run exits at its next checkpoint (every
+# bounded wait slice, every event read, every check), never from inside the trap:
+# bash 5.3 was seen to segfault when a trap's `exit` ran during a $(...) expansion
+# and the EXIT trap then ran more command substitutions, skipping cleanup.
+SIG=0
+trap 'SIG=129' HUP
+trap 'SIG=130' INT
+trap 'SIG=143' TERM
+check_sig() { ((SIG == 0)) || { echo "interrupted (signal exit $SIG); cleaning up" >&2; exit "$SIG"; }; }
+
+PASS=0 FAIL=0
+ok() { printf 'ok   %s\n' "$*"; PASS=$((PASS + 1)); }
+bad() { printf 'FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
+expect() { check_sig; if [[ $2 == "$3" ]]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
+
+# --- helpers ------------------------------------------------------------------------------
+N=0
+new_store() { # -> STORE: fresh, empty, mode 700
+  N=$((N + 1))
+  STORE="$BASE/s$N"
+  mkdir -m 700 "$STORE"
+}
+cname() { CNAME="$PREFIX-$1"; NAMES+=("$CNAME"); } # never in $(...): NAMES must persist
+# Store tree: names, inodes, sizes, mtimes, modes and content hashes.
+snapshot() {
+  (cd "$1" && find . -mindepth 1 -printf '%P|%i|%s|%T@|%m|' -exec sh -c 'sha256sum <"$1" 2>/dev/null | cut -c1-64 || echo dir' _ {} \; | sort)
+}
+jget() { # json-line python-expression-on-d  (e.g. 'd["record"]["rev"]')
+  python3 -I -c 'import json,sys
+d = json.loads(sys.argv[1])
+v = eval(sys.argv[2], {"d": d})
+print("null" if v is None else v)' "$1" "$2" 2>/dev/null || echo "<unparsable>"
+}
+PROV_ARGS=(--tenant local --route chat --deployments a,b --preferred a
+  --fallback-on-refusal true --deadline-ms 5000 --max-attempts 2)
+
+# run_cmd NAME provision|start ARGS... : foreground, synchronous, bounded. Sets RC, OUT
+# (stdout) and ERR (stderr). A run that exceeds the bound is a FAIL; its client and its
+# container (exact name) are killed.
+run_cmd() {
+  local n mode pid
+  cname "$1"
+  n=$CNAME
+  mode=$2
+  shift 2
+  "$RS/$mode" --container-name "$n" "$@" >"$BASE/out" 2>"$BASE/err" </dev/null &
+  pid=$!
+  track "$pid"
+  if ! bounded_wait "$pid"; then
+    bad "$mode ($n) did not exit within ${T}s"
+    docker rm -f "$n" >/dev/null 2>&1
+  fi
+  RC=$WAIT_RC
+  untrack "$pid"
+  OUT=$(<"$BASE/out") ERR=$(<"$BASE/err")
+}
+# bounded_wait PID: wait for our background child with a bound. `wait` has no timeout,
+# so a helper reaps nothing; it only reports when /proc/PID is gone or the bound hits.
+bounded_wait() {
+  local pid=$1 deadline=$((SECONDS + T))
+  # Block on a FIFO read that only times out; recheck between slices (no busy loop).
+  while ours_alive "$pid" && [[ $(proc_state "$pid") != Z ]]; do
+    ((SECONDS < deadline)) || { kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; WAIT_RC=124; return 1; }
+    read -r -t 0.2 -u "$TICK" _ || true
+    check_sig
+  done
+  { wait "$pid"; } 2>/dev/null # no "Killed" job notice for deliberate kills
+  WAIT_RC=$?
+  return 0
+}
+mkfifo "$BASE/tick"
+exec {TICK}<>"$BASE/tick" # never written: `read -t` on it is a bounded pause
+
+# Long-running writer. start_writer NAME STORE [plain]: sets WPID (docker client),
+# WIN/WOUT (fds for the writer's stdin/stdout), WNAME. Default: under harness control
+# (stdin attached). `plain`: the product form, no stdin attached, stopped only by
+# SIGTERM.
+start_writer() {
+  cname "$1"
+  WNAME=$CNAME
+  local d="$BASE/w-$1" ctl=(--harness-control)
+  [[ ${3-} == plain ]] && ctl=()
+  mkdir "$d"
+  mkfifo "$d/in" "$d/out"
+  exec {WIN}<>"$d/in" {WOUT}<>"$d/out"
+  "$RS/start" --container-name "$WNAME" --store "$2" --tenant local --route chat \
+    "${ctl[@]}" <&"$WIN" >&"$WOUT" 2>"$d/err" &
+  WPID=$!
+  track "$WPID"
+  WERR="$d/err"
+}
+end_writer() { exec {WIN}>&- {WOUT}>&-; untrack "$WPID"; }
+event() { # wait (bounded) for the next stdout line of the writer -> LINE
+  LINE=
+  read -r -t "$T" -u "$WOUT" LINE || { check_sig; LINE="<timeout>"; return 1; }
+  check_sig
+}
+send() { printf '%s\n' "$1" >&"$WIN"; }
+
+# Kernel view of the running writer: the container's PID 1 on the host.
+beam_pid() { docker inspect -f '{{.State.Pid}}' "$1" 2>/dev/null; }
+store_key() { # /proc/locks style key for the store inode: MAJ:MIN:INO
+  local ma mi ino
+  read -r ma mi ino < <(LC_ALL=C stat -c '%Hd %Ld %i' -- "$1")
+  printf '%02x:%02x:%d' "$ma" "$mi" "$ino"
+}
+fd_on_store() { # pid store -> fd numbers of pid whose target is the store inode
+  local f want
+  want=$(LC_ALL=C stat -c '%d %i' -- "$2")
+  for f in /proc/"$1"/fd/*; do
+    [[ $(LC_ALL=C stat -L -c '%d %i' -- "$f" 2>/dev/null) == "$want" ]] && printf '%s ' "${f##*/}"
+  done
+}
+holders_of() { # store -> PIDs (any process visible to us) with an fd on the store inode
+  # GNU find keeps its own fd on the -samefile reference; learn find's PID (sh prints
+  # $$, then execs find with that PID) and drop exactly that one.
+  local out self
+  out=$(sh -c 'echo "$$"; exec find -L /proc/[0-9]*/fd -maxdepth 1 -samefile "$1"' _ "$1" 2>/dev/null)
+  self=${out%%$'\n'*}
+  tail -n +2 <<<"$out" | sed -E 's#^/proc/([0-9]+)/fd/.*#\1#' | grep -vx -- "$self" |
+    sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+# =========================================================================================
+echo "# 1. startup never seeds: missing provision"
+new_store
+before=$(snapshot "$STORE")
+run_cmd miss-start start --store "$STORE" --tenant local --route chat
+expect "start on an empty store refuses not_provisioned (exit 3)" "$RC $(jget "$OUT" 'd["reason"]')" "3 not_provisioned"
+expect "empty store left empty" "$(snapshot "$STORE")" "$before"
+run_cmd miss-start2 start --store "$STORE" --tenant local --route chat
+expect "a second start still refuses and still seeds nothing" "$RC $(snapshot "$STORE")" "3 $before"
+
+echo "# 2. interrupted provision is never promoted, removed or reseeded"
+new_store
+SRC_STORE=$STORE
+run_cmd int-src provision --store "$SRC_STORE" "${PROV_ARGS[@]}"
+expect "control: provision of a fresh store succeeds" "$RC" 0
+new_store
+# A rev-1 record that was staged and synced but never renamed: exactly the bytes the
+# real provision writes, under the staging name only.
+cp -- "$SRC_STORE/route.rec" "$STORE/route.rec.tmp" && chmod 600 "$STORE/route.rec.tmp"
+before=$(snapshot "$STORE")
+run_cmd int-start start --store "$STORE" --tenant local --route chat
+expect "start refuses interrupted_provision (exit 3)" "$RC $(jget "$OUT" 'd["reason"]')" "3 interrupted_provision"
+expect "temp untouched, no route.rec created" "$(snapshot "$STORE")" "$before"
+run_cmd int-prov provision --store "$STORE" "${PROV_ARGS[@]}"
+expect "provision refuses interrupted_provision (exit 3)" "$RC $(jget "$OUT" 'd["reason"]')" "3 interrupted_provision"
+expect "temp still untouched after provision attempt" "$(snapshot "$STORE")" "$before"
+
+echo "# 3. contention on an unprovisioned store: refused before any mutation"
+new_store
+mkfifo "$BASE/h-ready" "$BASE/h-release"
+exec {HR}<>"$BASE/h-ready" {HW}<>"$BASE/h-release"
+# A foreign wrapped writer on the host holds the store; the commands' wrapper runs in
+# the container and sees the same inode through the bind mount.
+"$WRAP" "$STORE" -- /bin/bash -c 'echo ready >&"$1"; read -r _ <&"$2"' _ "$HR" "$HW" &
+HPID=$!
+track "$HPID"
+read -r -t "$T" -u "$HR" hl || { check_sig; hl=timeout; }
+expect "host holder acquired the lock" "$hl" ready
+before=$(snapshot "$STORE")
+run_cmd busy-prov provision --store "$STORE" "${PROV_ARGS[@]}"
+expect "provision while held: busy 75 from the wrapper inside the container" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
+expect "provision while held: no writer event, nothing written" "${OUT:-none} $(snapshot "$STORE")" "none $before"
+run_cmd busy-start start --store "$STORE" --tenant local --route chat
+expect "start while held: busy 75, store unchanged" "$RC $(snapshot "$STORE")" "75 $before"
+echo go >&"$HW"
+bounded_wait "$HPID"
+untrack "$HPID"
+exec {HR}>&- {HW}>&-
+run_cmd busy-after provision --store "$STORE" "${PROV_ARGS[@]}"
+expect "control: provision acquires once the holder exits" "$RC $(jget "$OUT" 'd["record"]["rev"]')" "0 1"
+
+echo "# 4. lifecycle: provision, start, contention, acknowledged change, normal stop"
+new_store
+LS=$STORE
+run_cmd life-prov provision --store "$LS" "${PROV_ARGS[@]}"
+expect "provision exit 0, rev 1, no last_plan_digest" "$RC $(jget "$OUT" 'd["record"]["rev"]') $(jget "$OUT" 'd["record"]["last_plan_digest"]')" "0 1 null"
+D1=$(jget "$OUT" 'd["record"]["digest"]')
+rec1=$(snapshot "$LS")
+run_cmd life-prov2 provision --store "$LS" "${PROV_ARGS[@]}"
+expect "second provision refuses already_provisioned, record unchanged" "$RC $(jget "$OUT" 'd["reason"]') $(snapshot "$LS")" "3 already_provisioned $rec1"
+
+start_writer w1 "$LS"
+event
+expect "start #1 ready: rev 1, provisioned digest" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["digest"]')" "ready 1 $D1"
+BP=$(beam_pid "$WNAME")
+expect "writer is beam.smp as the container's PID 1" "$(basename "$(readlink "/proc/$BP/exe" 2>/dev/null)") $(jget "$LINE" 'd["os_pid"]')" "beam.smp 1"
+fds=$(fd_on_store "$BP" "$LS")
+fd=${fds%% *}
+expect "BEAM holds exactly one fd on the store inode" "$(wc -w <<<"$fds")" 1
+expect "exclusive flock attached to that fd (kernel fdinfo)" \
+  "$(grep -cE "^lock:.*FLOCK +ADVISORY +WRITE .* $(store_key "$LS") " "/proc/$BP/fdinfo/$fd" 2>/dev/null)" 1
+expect "no other process holds the store open" "$(holders_of "$LS")" "$BP"
+
+before=$(snapshot "$LS")
+run_cmd life-busy-prov provision --store "$LS" "${PROV_ARGS[@]}"
+expect "provision against the running store: busy 75" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
+run_cmd life-busy-start start --store "$LS" --tenant local --route chat
+expect "second start against the running store: busy 75" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
+expect "store unchanged by both contenders (before any mutation)" "$(snapshot "$LS")" "$before"
+
+send "apply b"
+event
+expect "acknowledged change: rev 2, preferred b" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["preferred"]')" "applied 2 b"
+P2=$(jget "$LINE" 'd["plan_digest"]')
+D2=$(jget "$LINE" 'd["record"]["digest"]')
+expect "ack carries last_plan_digest == plan digest" "$(jget "$LINE" 'd["record"]["last_plan_digest"]')" "$P2"
+expect "on disk: route.rec names rev 2 with the acked digests, no temp left" \
+  "$(grep -c "\"chat\",2,\[\"a\",\"b\"\],\"b\",true,5000,2,\"$D2\"\],\"$P2\"\]" "$LS/route.rec") $(ls "$LS")" "1 route.rec"
+before=$(snapshot "$LS")
+run_cmd life-busy-prov2 provision --store "$LS" "${PROV_ARGS[@]}"
+expect "provision after the change: still busy 75, store unchanged" "$RC $(snapshot "$LS")" "75 $before"
+
+kill -TERM "$WPID" # the launcher's docker client forwards it to the BEAM (--sig-proxy)
+event
+expect "SIGTERM to the start command: orderly stop event" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["reason"]')" "stopped sigterm"
+bounded_wait "$WPID"
+expect "start command exit 0 after normal stop" "$WAIT_RC" 0
+end_writer
+expect "the container is gone" "$(docker ps -aq --filter "name=^${WNAME}\$")" ""
+expect "nothing holds the store any more" "$(holders_of "$LS")" ""
+expect "normal stop left the record as acknowledged" "$(snapshot "$LS")" "$before"
+
+echo "# 5. restart after normal stop: same revision and plan digest; then abrupt BEAM exit"
+start_writer w2 "$LS"
+event
+expect "start #2 ready: rev 2, acked digest, acked plan digest" \
+  "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["digest"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" \
+  "ready 2 $D2 $P2"
+expect "restart did not rewrite the record" "$(snapshot "$LS")" "$before"
+send "apply a"
+event
+expect "acknowledged change: rev 3, preferred a" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["preferred"]')" "applied 3 a"
+P3=$(jget "$LINE" 'd["plan_digest"]')
+D3=$(jget "$LINE" 'd["record"]["digest"]')
+BP=$(beam_pid "$WNAME")
+expect "suite-owned writer is beam.smp holding the store" "$(basename "$(readlink "/proc/$BP/exe" 2>/dev/null)") $(holders_of "$LS")" "beam.smp $BP"
+after3=$(snapshot "$LS")
+# Abrupt exit: SIGKILL exactly this BEAM (host PID of this run's named container, checked
+# to be beam.smp and to hold this store; start time pinned just before the kill).
+track "$BP"
+ours_alive "$BP" && kill -KILL "$BP"
+untrack "$BP"
+bounded_wait "$WPID"
+expect "start command reports the BEAM killed (137)" "$WAIT_RC" 137
+end_writer
+expect "nothing holds the store after SIGKILL" "$(holders_of "$LS")" ""
+expect "SIGKILL left the acknowledged record in place" "$(snapshot "$LS")" "$after3"
+
+start_writer w3 "$LS"
+event
+expect "start #3 after SIGKILL ready: rev 3, acked digest, acked plan digest" \
+  "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["digest"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" \
+  "ready 3 $D3 $P3"
+send "read"
+event
+expect "read back through the store: rev 3, plan digest $P3" "$(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" "3 $P3"
+send "stop"
+event
+expect "harness stop: orderly stop" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["reason"]')" "stopped harness"
+bounded_wait "$WPID"
+expect "exit 0" "$WAIT_RC" 0
+end_writer
+expect "record unchanged by restart and stop" "$(snapshot "$LS")" "$after3"
+
+echo "# 6. lock lifetime when the docker client (not the BEAM) is SIGKILLed"
+# 6a. Product form (no stdin): the container outlives its client and keeps the lock.
+start_writer w4 "$LS" plain
+event
+expect "plain start ready at rev 3" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]')" "ready 3"
+BP=$(beam_pid "$WNAME")
+kill -KILL "$WPID"
+bounded_wait "$WPID"
+end_writer
+expect "client dead; the container still runs and its BEAM still holds the store" \
+  "$(docker inspect -f '{{.State.Running}}' "$WNAME" 2>/dev/null) $(holders_of "$LS")" "true $BP"
+before=$(snapshot "$LS")
+run_cmd orphan-busy start --store "$LS" --tenant local --route chat
+expect "a new start is refused busy (75) while the orphaned writer holds the lock" "$RC" 75
+run_cmd orphan-busy-prov provision --store "$LS" "${PROV_ARGS[@]}"
+expect "so is provision (75); store unchanged" "$RC $(snapshot "$LS")" "75 $before"
+expect "recovery: docker stop of exactly that named container (SIGTERM -> orderly stop)" \
+  "$(timeout -k 5 "$T" docker stop -t 30 "$WNAME" 2>&1)" "$WNAME"
+# 6b. Harness form: losing the harness closes the writer's stdin; it stops in order.
+start_writer w5 "$LS"
+event
+expect "after the orphan stopped: start acquires, still rev 3 / $P3" \
+  "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["record"]["last_plan_digest"]')" "ready 3 $P3"
+kill -KILL "$WPID"
+bounded_wait "$WPID"
+end_writer
+w=$(timeout -k 5 "$T" docker wait "$WNAME" 2>&1)
+# `docker wait` prints the exit code, or the --rm removal already happened.
+case $w in 0 | *"No such container"*) w=stopped ;; esac
+expect "harness client SIGKILLed: the writer sees stdin EOF and stops (0 or already removed)" "$w" stopped
+expect "nothing holds the store; record still rev 3" "$(holders_of "$LS") $(snapshot "$LS")" " $before"
+
+echo "# 7. the writer refuses to touch a store it has not locked"
+new_store
+cp -- "$LS/route.rec" "$STORE/route.rec.tmp" && chmod 600 "$STORE/route.rec.tmp"
+before=$(snapshot "$STORE")
+cname nolock
+n=$CNAME
+out=$(timeout -k 5 "$T" docker run --rm --name "$n" --label telelem.route-store=test --network none --read-only \
+  --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 -e HOME=/tmp -e ERL_INETRC=/opt/route-store/inetrc \
+  -v "$ROOT/lib/telelem:/opt/telelem/lib:ro" -v "$RS:/opt/route-store:ro" -v "$STORE:/sbx/store" \
+  "$IMAGE" /bin/sh -ec 'mkdir /tmp/e && cd /tmp/e &&
+    elixirc /opt/telelem/lib/ops/boundary.ex /opt/telelem/lib/ops/plan_digest.ex \
+      /opt/telelem/lib/ops/file_store.ex /opt/telelem/lib/route/revision.ex \
+      /opt/telelem/lib/sandbox/path_policy.ex >&2 && cd / &&
+    exec elixir -pa /tmp/e /opt/route-store/main.exs start --dir /sbx/store --tenant local --route chat' 2>&1)
+rc=$?
+expect "main.exs without the wrapper's lock exits 4" "$rc $(grep -c 'does not hold the store lock' <<<"$out")" "4 1"
+expect "store untouched (interrupted temp not removed or promoted)" "$(snapshot "$STORE")" "$before"
+
+echo
+echo "passed $PASS, failed $FAIL"
+((FAIL == 0)) || exit 1
+exit 0

@@ -1,0 +1,3 @@
+%% ERL_INETRC for the route-store writer (m2a-contracts §3): hosts file only, so BEAM
+%% boot never resolves the node's own hostname through the native resolver.
+{lookup, [file]}.

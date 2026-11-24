@@ -1,0 +1,116 @@
+#!/bin/bash
+# Foreground route-store provision and start commands (M2a, TEL-015 local slice).
+#
+#   scripts/route-store/provision --store HOST_DIR --tenant T --route R \
+#       --deployments A,B --preferred A --fallback-on-refusal true|false \
+#       --deadline-ms N --max-attempts 1|2
+#   scripts/route-store/start --store HOST_DIR --tenant T --route R
+#
+# Optional on both: --container-name NAME (default: unique telelem-route-store-*).
+# Harness only (start): --harness-control attaches stdin for the lifecycle suite; see
+# scripts/route-store/main.exs. It is not an operations interface.
+#
+# Both run one foreground `docker run --rm` of the pinned runner image. The lock
+# wrapper runs INSIDE that container as the writer's entry point, on the store
+# bind-mounted at /sbx/store, and execs the BEAM that calls Telelem.Ops.FileStore
+# (scripts/with-route-store-lock README, rule 6). The container has no network
+# (--network none), a read-only rootfs, no capabilities, no-new-privileges and the
+# caller's uid/gid. The only writable host path it sees is HOST_DIR (at /sbx/store;
+# /sbx itself is part of the read-only rootfs). The checkout as a whole is not
+# mounted: only the five store sources, this directory and the wrapper, all
+# read-only. Startup never provisions; provisioning is only ever create-only.
+#
+# Exit status: the writer's (see main.exs: 0 ok, 2 usage/contract, 3 store refused,
+# 4 lock not held), the wrapper's (75 busy, 64/69/70/78; stderr
+# "with-route-store-lock:"), docker's (125-127), 128+N for a signal, or 2 from this
+# launcher (stderr "route-store:") for usage, host-side precondition or missing
+# prerequisite, before any container starts.
+#
+# Stopping: SIGTERM or SIGINT to this process is forwarded by the attached docker
+# client (--sig-proxy) to the BEAM, which stops the store cleanly and exits 0. Killing
+# this client with SIGKILL does NOT stop the container: the writer keeps running and
+# keeps the store locked until `docker stop|kill NAME`. Supervise by container name.
+set -euo pipefail
+
+ME=route-store
+die() { printf '%s: %s\n' "$ME" "$*" >&2; exit 2; }
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
+IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
+WRAP="$ROOT/scripts/with-route-store-lock"
+SRC=(ops/boundary.ex ops/plan_digest.ex ops/file_store.ex route/revision.ex sandbox/path_policy.ex)
+
+(($# >= 1)) || die "usage: launch provision|start --store HOST_DIR ..."
+mode=$1
+shift
+case $mode in provision | start) ;; *) die "unknown mode '$mode' (provision|start)" ;; esac
+
+store= name= harness=0 pass=()
+while (($#)); do
+  case $1 in
+    --store) (($# >= 2)) || die "--store needs a value"; store=$2; shift 2 ;;
+    --container-name) (($# >= 2)) || die "--container-name needs a value"; name=$2; shift 2 ;;
+    --harness-control)
+      [[ $mode == start ]] || die "--harness-control is only for start"
+      harness=1 pass+=("$1"); shift ;;
+    --dir | --dir=*) die "--dir is fixed by the launcher; use --store HOST_DIR" ;;
+    --store=* | --container-name=*) die "use '${1%%=*} VALUE', not '${1%%=*}=VALUE'" ;;
+    *) pass+=("$1"); shift ;;
+  esac
+done
+[[ -n $store ]] || die "--store HOST_DIR is required"
+if [[ -z $name ]]; then
+  name="telelem-route-store-$mode-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+fi
+[[ $name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || die "bad --container-name '$name'"
+
+# --- host-side store preconditions (defense in depth; the wrapper and FileStore check
+# again inside the container on /sbx/store) --------------------------------------------
+[[ $store == /* && $store != / ]] || die "--store must be an absolute path other than /: $store"
+[[ -d $store && ! -L $store ]] || die "--store is not an existing directory (or is a symlink): $store"
+canon=$(realpath -e -- "$store") || die "cannot resolve --store: $store"
+[[ $canon == "$store" ]] || die "--store is not canonical (resolves to $canon): $store"
+read -r s_uid s_mode < <(LC_ALL=C stat -c '%u %a' -- "$store")
+[[ $s_uid == "$EUID" ]] || die "--store is owned by uid $s_uid, not $EUID: $store"
+(((8#$s_mode & 8#022) == 0)) || die "--store is group- or other-writable (mode $s_mode): $store"
+# Every ancestor: a real directory, not world-writable unless sticky (PathPolicy rule).
+p=$store
+while [[ $p != / ]]; do
+  p=$(dirname -- "$p")
+  read -r a_mode < <(LC_ALL=C stat -c '%a' -- "$p")
+  if (((8#$a_mode & 8#002) != 0 && (8#$a_mode & 8#1000) == 0)); then
+    die "ancestor $p of --store is world-writable without the sticky bit"
+  fi
+done
+under() { [[ $1 == "$2" || $1 == "$2"/* ]]; }
+for d in /etc/telelem /var/lib/telelem /run/telelem /run/secrets "$ROOT"; do
+  if under "$store" "$d" || under "$d" "$store"; then
+    die "--store must not overlap $d: $store"
+  fi
+done
+
+# --- prerequisites ---------------------------------------------------------------------
+command -v docker >/dev/null 2>&1 || die "docker CLI not found"
+docker image inspect "$IMAGE" >/dev/null 2>&1 || die "runner image $IMAGE not found (scripts/setup)"
+[[ -x $WRAP ]] || die "missing $WRAP"
+mounts=()
+for f in "${SRC[@]}"; do
+  [[ -f $ROOT/lib/telelem/$f ]] || die "missing source lib/telelem/$f"
+  mounts+=(-v "$ROOT/lib/telelem/$f:/opt/telelem/src/$(basename "$f"):ro")
+done
+
+io=()
+((harness)) && io=(-i)
+
+exec docker run --rm --name "$name" --label telelem.route-store="$mode" \
+  "${io[@]}" --sig-proxy=true \
+  --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --user "$(id -u):$(id -g)" \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 -e HOME=/tmp \
+  -e ERL_INETRC=/opt/route-store/inetrc \
+  "${mounts[@]}" \
+  -v "$HERE:/opt/route-store:ro" \
+  -v "$WRAP:/opt/lock/with-route-store-lock:ro" \
+  -v "$store:/sbx/store" \
+  "$IMAGE" /bin/sh /opt/route-store/entry.sh "$mode" "${pass[@]}"

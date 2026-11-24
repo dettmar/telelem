@@ -1,0 +1,3 @@
+#!/bin/bash
+# Foreground route-store startup; never provisions. See scripts/route-store/launch.
+exec "$(dirname "${BASH_SOURCE[0]}")/launch" start "$@"
