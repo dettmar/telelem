@@ -1,0 +1,6 @@
+%% Sandbox launch resolver config for the subject (ERL_INETRC).
+%% Observed without it: BEAM boot resolves the node's own hostname through the
+%% native resolver (glibc: nscd unix-socket connect, then a DNS query), i.e.
+%% gateway-originated DNS before any application code runs. Sandbox targets are
+%% IP literals, so the sandbox runtime needs no resolver: hosts file only.
+{lookup, [file]}.
