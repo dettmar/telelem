@@ -70,7 +70,14 @@ defmodule Telelem.Receipts.Store do
   code holding the handle is trusted in-VM code. The store still re-validates
   every row it takes and discards (and counts as `rejected`) malformed ones.
 
-  The store does not log. `format_status/1` reduces the state to counts.
+  The store does not log. `format_status/1` is a total allowlist that keeps
+  OTP's status keys: `state` becomes `%{mode, retained, receipts}`,
+  `message` its kind (`{:call, :lookup}`, `:sweep`, ...), `reason` a fixed
+  category and each `log` entry its sys tag; unknown keys and values become
+  fixed atoms. It does not cover `:sys.get_state/1`, the raw sys debug state
+  and process dictionary in `:sys.get_status/1`'s outer list, the error
+  report's stacktrace and client info, or proc_lib/supervisor reports and
+  exit reasons.
   """
   use GenServer
 
@@ -207,13 +214,85 @@ defmodule Telelem.Receipts.Store do
 
   def handle_info(_msg, s), do: {:noreply, s}
 
+  @reason_atoms [
+    :normal,
+    :shutdown,
+    :kill,
+    :killed,
+    :noproc,
+    :noconnection,
+    :timeout,
+    :function_clause,
+    :undef,
+    :badarg,
+    :badarith,
+    :system_limit
+  ]
+  @reason_tags [
+    :shutdown,
+    :timeout,
+    :noproc,
+    :badmatch,
+    :case_clause,
+    :try_clause,
+    :with_clause,
+    :badkey,
+    :badmap,
+    :bad_return_value,
+    :nocatch
+  ]
+  @log_tags [:in, :out, :noreply, :continue, :code_change, :postpone, :consume, :enter]
+
   @impl true
-  def format_status(status) do
-    Map.update(status, :state, nil, fn
-      %{retained: n, by_key: m} -> %{retained: n, receipts: map_size(m)}
-      _ -> :redacted
-    end)
+  # Total allowlist projection with exactly the keys OTP passed (gen merges
+  # the result over the raw map, so an omitted key would stay raw, and an
+  # extra key or a crash leaves message/reason/log raw). Unknown keys and
+  # values become fixed atoms; only the mode, counts and kinds are kept.
+  def format_status(status) when is_map(status) do
+    Map.new(status, fn {k, v} -> {k, status_view(k, v)} end)
+  catch
+    _, _ -> Map.new(status, fn {k, _} -> {k, if(k == :log, do: [], else: :redacted)} end)
   end
+
+  def format_status(_status), do: %{}
+
+  defp status_view(:state, %{retained: n, by_key: m} = s)
+       when is_integer(n) and n >= 0 and is_map(m),
+       do: %{
+         mode: if(Map.get(s, :mode) in @modes, do: s.mode, else: :other),
+         retained: n,
+         receipts: map_size(m)
+       }
+
+  defp status_view(:state, _), do: :redacted
+  defp status_view(:message, m), do: message_view(m)
+  defp status_view(:reason, r), do: reason_view(r)
+  defp status_view(:log, l), do: log_view(l)
+  defp status_view(_key, _v), do: :redacted
+
+  defp message_view({:"$gen_call", _from, req}) when req in [:producer, :stats],
+    do: {:call, req}
+
+  defp message_view({:"$gen_call", _from, {:lookup, _, _}}), do: {:call, :lookup}
+  defp message_view({:"$gen_call", _from, _}), do: {:call, :other}
+  defp message_view({:"$gen_cast", _}), do: {:cast, :other}
+  defp message_view({:system, _from, _req}), do: :system
+  defp message_view({:EXIT, _, _}), do: :exit
+  defp message_view(:sweep), do: :sweep
+  defp message_view(_), do: :other
+
+  defp reason_view(r) when r in @reason_atoms, do: r
+  defp reason_view(%{__exception__: true}), do: :exception
+  defp reason_view({tag, _}) when tag in @reason_tags, do: {tag, :redacted}
+  defp reason_view(_), do: :other
+
+  defp log_view(log) when is_list(log), do: Enum.map(log, &log_event/1)
+  defp log_view(_), do: []
+
+  defp log_event(e) when is_tuple(e) and tuple_size(e) > 0 and elem(e, 0) in @log_tags,
+    do: {elem(e, 0), :redacted}
+
+  defp log_event(_), do: :redacted
 
   # -- Internals -------------------------------------------------------------
 

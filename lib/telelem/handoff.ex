@@ -312,6 +312,27 @@ defmodule Telelem.Handoff do
   (`terminal_ack: true` only) is not a success: `{:outcome, {:done, _}}` is
   emitted only after the requester's confirmed write.
 
+  ## Diagnostics (`format_status/1`)
+
+  OTP's `format_status/1` projection covers exactly the status map OTP
+  hands it: `:sys.get_status/1`'s formatted `"State"` and `"Logged events"`,
+  and the `state`, `last_message`, `reason` (without its stacktrace) and
+  `log` fields of the `{gen_server, terminate}` error report. It is a total
+  allowlist that keeps the map's keys: `state` becomes fixed categories
+  (phase, outcome kind, terminal/downstream kind, authority, authorization,
+  observer, grant phase, receipts state), booleans and counts (attempts by
+  flag, unreported events); `message` only its kind (`{:call, :finish}`,
+  `:down`, `:exit`, ...); `reason` a fixed atom, `{tag, :redacted}` or
+  `:exception`/`:other`; each `log` entry only its sys tag. No id, pid,
+  reason, marker, chunk, terminal, deadline or receipt metadata is copied.
+  `status/1` and the closing report are unchanged.
+
+  Not covered (outside this callback): `:sys.get_state/1`; the raw `Debug`
+  (including the sys log with raw messages and states) and process
+  dictionary in `:sys.get_status/1`'s outer list; the error report's
+  stacktrace and `client_info`; proc_lib crash reports, supervisor reports
+  and the exit reason seen by links and monitors, all raw.
+
   ## Limits
 
   Transfer is synchronous to the coordinator and passive (unbounded) to the
@@ -1747,6 +1768,171 @@ defmodule Telelem.Handoff do
 
   defp with_receipts(map, %{receipts: nil}), do: map
   defp with_receipts(map, %{receipts: r}), do: Map.put(map, :receipts, r.state)
+
+  # ── Diagnostics (OTP format_status/1, see moduledoc) ─────────────────────
+
+  @calls [
+    :attach,
+    :begin_dispatch,
+    :ready,
+    :transfer,
+    :finish,
+    :terminal_written,
+    :cleaned,
+    :cancel,
+    :status
+  ]
+  @phases [:open, :elected, :committed]
+  @grant_phases [:idle, :reserving, :reserved, :authorizing, :authorized, :refused, :abandoned]
+  @reason_atoms [
+    :normal,
+    :shutdown,
+    :kill,
+    :killed,
+    :noproc,
+    :noconnection,
+    :timeout,
+    :function_clause,
+    :undef,
+    :badarg,
+    :badarith,
+    :system_limit
+  ]
+  @reason_tags [
+    :shutdown,
+    :timeout,
+    :noproc,
+    :badmatch,
+    :case_clause,
+    :try_clause,
+    :with_clause,
+    :badkey,
+    :badmap,
+    :bad_return_value,
+    :nocatch
+  ]
+  @log_tags [:in, :out, :noreply, :continue, :code_change, :postpone, :consume, :enter]
+
+  @impl true
+  # Total allowlist projection with exactly the keys OTP passed (gen merges
+  # the result over the raw map, so an omitted key would stay raw, and an
+  # extra key or a crash leaves message/reason/log raw). Unknown keys and
+  # unknown values become fixed atoms; nothing from the state, a message or
+  # a reason is copied, only fixed categories, booleans and counts.
+  def format_status(status) when is_map(status) do
+    Map.new(status, fn {k, v} -> {k, status_view(k, v)} end)
+  catch
+    _, _ -> Map.new(status, fn {k, _} -> {k, if(k == :log, do: [], else: :redacted)} end)
+  end
+
+  def format_status(_status), do: %{}
+
+  defp status_view(:state, s), do: state_view(s)
+  defp status_view(:message, m), do: message_view(m)
+  defp status_view(:reason, r), do: reason_view(r)
+  defp status_view(:log, l), do: log_view(l)
+  defp status_view(_key, _v), do: :redacted
+
+  defp state_view(%{attempts: attempts} = s) when is_map(attempts) do
+    as = Map.values(attempts)
+
+    %{
+      phase: pick(Map.get(s, :phase), @phases),
+      winner?: Map.get(s, :winner) != nil,
+      outcome: outcome_kind(Map.get(s, :outcome)),
+      terminal: terminal_view(Map.get(s, :terminal), Map.get(s, :downstream)),
+      terminal_ack?: Map.get(s, :terminal_ack) == true,
+      terminal_deadline?: is_integer(Map.get(s, :terminal_deadline)),
+      terminal_pending?: Map.get(s, :pending) != nil,
+      authority: pick(Map.get(s, :authority_state), [:up, :lost, :none]),
+      authorization: pick(Map.get(s, :authorization), [:admission, :fence_only, :none]),
+      observer: pick(Map.get(s, :observer_state), [:up, :lost, :none]),
+      unreported: count_list(Map.get(s, :unreported)),
+      attempts: %{
+        total: length(as),
+        attached: Enum.count(as, &match?(%{pid: p} when is_pid(p), &1)),
+        dispatched: Enum.count(as, &match?(%{dispatched: true}, &1)),
+        ready: Enum.count(as, &match?(%{ready: true}, &1)),
+        cancelled: Enum.count(as, &match?(%{cancelled: c} when c != nil, &1)),
+        closed: Enum.count(as, &match?(%{cleanup: c} when c != nil, &1)),
+        possible: Enum.count(as, &match?(%{charge: :possible}, &1))
+      },
+      grant: grant_view(Map.get(s, :grant)),
+      receipts: receipts_view(Map.get(s, :receipts))
+    }
+  end
+
+  defp state_view(_), do: :redacted
+
+  defp pick(v, allowed), do: if(v in allowed, do: v, else: :other)
+
+  defp count_list(l) when is_list(l), do: length(l)
+  defp count_list(_), do: 0
+
+  defp outcome_kind(nil), do: nil
+  defp outcome_kind({k, _}) when k in [:done, :incomplete, :failed], do: k
+  defp outcome_kind(_), do: :other
+
+  defp terminal_view(nil, _), do: nil
+
+  defp terminal_view({:authorized, _}, d),
+    do: %{upstream: :complete, downstream: downstream_kind(d)}
+
+  defp terminal_view(_, _), do: :other
+
+  defp downstream_kind(d) when d in [nil, :unconfirmed, :written, :not_tracked], do: d
+  defp downstream_kind({:error, _}), do: :error
+  defp downstream_kind(_), do: :other
+
+  defp grant_view(nil), do: nil
+
+  defp grant_view(%{} = g),
+    do: %{phase: pick(Map.get(g, :phase), @grant_phases), request?: Map.get(g, :req) != nil}
+
+  defp grant_view(_), do: :other
+
+  defp receipts_view(nil), do: nil
+
+  defp receipts_view(%{} = r),
+    do: %{
+      state: pick(Map.get(r, :state), [:recording, :disabled]),
+      permitted?: Map.get(r, :permitted) == true,
+      terminal?: Map.get(r, :terminal) == true
+    }
+
+  defp receipts_view(_), do: :other
+
+  defp message_view({:"$gen_call", _from, req}), do: {:call, request_kind(req)}
+  defp message_view({:"$gen_cast", _}), do: {:cast, :other}
+  defp message_view({:system, _from, _req}), do: :system
+  defp message_view({:EXIT, _, _}), do: :exit
+  defp message_view({:DOWN, _, _, _, _}), do: :down
+  defp message_view({:telelem_terminal_grant, _, _, _}), do: :terminal_grant
+  defp message_view({:terminal_deadline, _}), do: :terminal_deadline
+  defp message_view({:register_deadline, _}), do: :register_deadline
+  defp message_view({:cleanup_deadline, _, _}), do: :cleanup_deadline
+  defp message_view(_), do: :other
+
+  defp request_kind(req) when req in @calls, do: req
+
+  defp request_kind(req) when is_tuple(req) and tuple_size(req) > 0 and elem(req, 0) in @calls,
+    do: elem(req, 0)
+
+  defp request_kind(_), do: :other
+
+  defp reason_view(r) when r in @reason_atoms, do: r
+  defp reason_view(%{__exception__: true}), do: :exception
+  defp reason_view({tag, _}) when tag in @reason_tags, do: {tag, :redacted}
+  defp reason_view(_), do: :other
+
+  # Keeps the number of logged events and their sys tag only.
+  defp log_view(log) when is_list(log), do: Enum.map(log, &log_event/1)
+  defp log_view(_), do: []
+
+  defp log_event(e) when is_tuple(e) and tuple_size(e) > 0 and elem(e, 0) in @log_tags,
+    do: {elem(e, 0), :redacted}
+
+  defp log_event(_), do: :redacted
 
   # ── Helpers ──────────────────────────────────────────────────────────────
 
