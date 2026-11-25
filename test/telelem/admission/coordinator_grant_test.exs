@@ -173,7 +173,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert_receive {:req, {:telelem_handoff, ^h, {:data, @marker}}}, @t
     assert_receive {:req, {:telelem_handoff, ^h, {:done, :t}}}, @t
 
-    hmon = Process.monitor(h)
+    hmon = monitor!(h)
     assert :ok = step!(fake, {:cleanup, :possible})
     assert_receive {:req, {:telelem_handoff, ^h, {:closed, report}}}, @t
     assert_receive {:DOWN, ^hmon, :process, _, :normal}, @t
@@ -545,7 +545,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     await_mailbox!(ctx.auth, &match?([{:"$gen_call", {^h, _}, {:reserve, _, ^fake, @units}}], &1))
     refute_received {:fake, ^fake, ^ref, _}
 
-    hmon = Process.monitor(h)
+    hmon = monitor!(h)
     Process.exit(req, :kill)
     assert {:cancel, {:requester_down, :killed}} = await_step!(fake, ref)
     assert_receive {:fake_cancelled, ^fake, {:requester_down, :killed}}, @t
@@ -846,9 +846,22 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
   end
 
   defp close!(%{h: h, fake: fake}, charge) do
-    hmon = Process.monitor(h)
+    hmon = monitor!(h)
     assert :ok = step!(fake, {:cleanup, charge})
     assert_receive {:DOWN, ^hmon, :process, _, :normal}, @t
+  end
+
+  # A monitor request is a signal; a message from another process (the
+  # fake's cleanup call) can reach the target first and close it, and the
+  # late request then yields :noproc. A process_info request from this
+  # process is ordered after the monitor request, so seeing ourselves in
+  # :monitored_by proves the monitor is in place before anything else is
+  # triggered.
+  defp monitor!(pid) do
+    mon = Process.monitor(pid)
+    assert {:monitored_by, by} = Process.info(pid, :monitored_by)
+    assert self() in by
+    mon
   end
 
   defp leave!(%{tag: tag}, fake, gid) do
