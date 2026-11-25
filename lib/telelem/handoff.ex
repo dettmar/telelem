@@ -244,6 +244,69 @@ defmodule Telelem.Handoff do
   or the marker) and the record that follows it leaves that record missing
   and no terminal: the receipt is incomplete, never false-complete.
 
+  ## Activation (opt-in: `activation_limit: s`)
+
+  Off by default; without it nothing below applies and every shape above is
+  unchanged. `s` is an absolute `System.monotonic_time(:millisecond)`
+  instant with `now < s <= terminal_deadline` at `init/1`, and it requires
+  `coordinator_grant`, `terminal_ack: true` and `receipts`; anything else is
+  `{:bad_option, :activation_limit}` (a malformed `register_timeout` is
+  `{:bad_option, :register_timeout}`). The coordinator then starts
+  **inactive**:
+
+    * `init/1` checks the store binding exactly as above but opens no
+      writer and publishes nothing (no `ingress`). It arms none of the
+      request's timers (registration, terminal deadline, cleanup), sends no
+      message, emits no event or trace, and registers or reserves nothing.
+      It monitors the requester, the authority and the observer, and arms
+      one private **lifecycle expiry**: an absolute timer at `s` carrying
+      its own token (distinct from the request timers' token).
+    * Expiry: the expiry message with exactly that token, handled while
+      inactive, stops the coordinator `:normal`, silently (as below), with
+      the requester, authority and parent still alive. Activation cancels
+      the timer; an expiry message handled after activation (already
+      queued, or any copy) is ignored and never ends the request. A delayed
+      expiry changes nothing either: activation itself refuses at
+      `now >= s`.
+    * Every call is answered `{:error, :inactive}` and changes nothing,
+      except `status/1` (the usual map plus `activation: :inactive`) and
+      `{:activate, s}` from the exact requester pid. Every other message is
+      ignored, except the exact expiry, the requester's or the authority's
+      `:DOWN` (the coordinator then stops `:normal`) and the observer's `:DOWN`
+      (recorded as `:lost`, silently). `terminate/2` while inactive sends,
+      emits and publishes nothing, whatever the reason (a parent exit
+      included). The requester learns of these stops only from its monitor.
+    * Activation is one step in the coordinator, from the requester only and
+      with exactly its `s` (else `{:error, :not_requester}` /
+      `{:error, :activation_limit_mismatch}`, no change): re-check the
+      pinned store's binding, prepare the writer without publishing, then
+      check the clock. Only if `now < s` does it become active, publish
+      `ingress` (once, sequence one), cancel the expiry, arm the
+      registration timer (`register_timeout` from now) and the
+      terminal-deadline timer, and reply `:ok`. From then on it behaves exactly as without the option
+      (status adds `activation: :active`). A failed binding replies
+      `{:error, :receipts_unbound}`, a late check replies
+      `{:error, :activation_expired}`; both publish nothing and stop the
+      coordinator `:normal`.
+    * The decision does not depend on the reply being delivered: an
+      activation whose reply is late or lost (the caller timed out, gave up
+      or died) stays active and continues as any active request; nothing is
+      rolled back. A repeated activation of an active coordinator is
+      `{:error, :duplicate}` (the requester) or `{:error, :not_requester}`.
+      A coordinator without the option answers `{:error, :no_activation}`.
+
+  `activate/2` is the requester's wait. It is bounded by the absolute `s`,
+  never kills the coordinator, never waits for a `:DOWN` and never retries.
+  Before submission it returns `{:error, :activation_expired}` (`now >= s`)
+  or `{:error, :handoff_down}` (no process); neither can have published
+  anything. After submission, anything but a reply (a timeout at `s`, or the
+  coordinator's exit) is `{:error, :unconfirmed}`: ingress may or may not
+  have been published, and the caller must not treat it as "not activated".
+
+  Known limit: an activation check that passes just before `s` with a reply
+  that reaches the caller after its own bound at `s` is reported as
+  `:unconfirmed` while the coordinator is active.
+
   ## Charges: a local, conservative hint
 
   The handoff never refunds anything. The **admission authority's ledger is
@@ -323,7 +386,8 @@ defmodule Telelem.Handoff do
   `log` fields of the `{gen_server, terminate}` error report. It is a total
   allowlist that keeps the map's keys: `state` becomes fixed categories
   (phase, outcome kind, terminal/downstream kind, authority, authorization,
-  observer, grant phase, receipts state), booleans and counts (attempts by
+  observer, grant phase, receipts state and, only with `activation_limit`,
+  `activation: :inactive | :active`), booleans and counts (attempts by
   flag, unreported events); `message` only its kind (`{:call, :finish}`,
   `:down`, `:exit`, ...); `reason` a fixed atom, `{tag, :redacted}` or
   `:exception`/`:other`; each `log` entry only its sys tag. No id, pid,
@@ -412,6 +476,12 @@ defmodule Telelem.Handoff do
       any timer is armed; a past one is accepted.
     * `:receipts`. Default `nil`. `[store:, producer:, store_mode:, meta:]` opts in
       to "Receipts". Requires `:coordinator_grant` and `terminal_ack: true`.
+    * `:activation_limit`. Default `nil`. An absolute instant `s` with
+      `now < s <= :terminal_deadline` opts in to "Activation" (the
+      coordinator starts inactive and, unless activated before `s`, stops
+      silently at `s`). Requires `:coordinator_grant`,
+      `terminal_ack: true` and `:receipts`. `:register_timeout` then counts
+      from the activation and must be an integer in `0..4_294_967_295`.
   """
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -423,6 +493,51 @@ defmodule Telelem.Handoff do
 
   @doc "Snapshot of the coordinator state for tests and diagnostics."
   def status(h), do: call(h, :status)
+
+  @doc """
+  Requester only, `activation_limit` only: activates an inactive coordinator
+  (see "Activation"). `limit` is exactly the coordinator's
+  `:activation_limit`; a non-integer, or one more than 4_294_966_295 ms
+  ahead of now, raises `ArgumentError` before any message is sent.
+
+  Results:
+
+    * `:ok`: active; `ingress` was published (or its publication failed and
+      is recorded as a loss, as for any record).
+    * `{:error, :activation_expired}`: `now >= limit`, either here before
+      sending (nothing was sent) or at the coordinator's check (it stopped).
+      Not active, nothing published.
+    * `{:error, :handoff_down}`: no coordinator process when the call was
+      made; nothing was submitted.
+    * `{:error, :unconfirmed}`: submitted, but no reply by `limit` or the
+      coordinator exited first. It may be active with `ingress` published.
+      Never retry or treat it as "not activated".
+    * Other `{:error, _}` replies (`:not_requester`,
+      `:activation_limit_mismatch`, `:duplicate`, `:no_activation`,
+      `:receipts_unbound`) are the coordinator's decision; only
+      `:duplicate` means it is (still) active.
+
+  The wait ends at `limit` at the latest. The coordinator is not killed and
+  no `:DOWN` is awaited; a reply after the bound is discarded.
+  """
+  def activate(h, limit) when is_integer(limit) do
+    in_range!(limit, "activate/2")
+
+    if System.monotonic_time(:millisecond) >= limit do
+      {:error, :activation_expired}
+    else
+      try do
+        GenServer.call(h, {:activate, limit}, remaining(limit))
+      catch
+        # The monitor saw no process before the request was sent.
+        :exit, {:noproc, _} -> {:error, :handoff_down}
+        :exit, _ -> {:error, :unconfirmed}
+      end
+    end
+  end
+
+  def activate(_h, other),
+    do: raise(ArgumentError, "activate/2 limit must be an integer, got: #{inspect(other)}")
 
   # ── Attempt API (call from the attempt process itself) ───────────────────
 
@@ -733,6 +848,9 @@ defmodule Telelem.Handoff do
         r -> receipts_config(r)
       end
 
+    activation_limit = Keyword.get(opts, :activation_limit)
+    register_timeout = Keyword.get(opts, :register_timeout, 5_000)
+
     {:links, links} = Process.info(self(), :links)
 
     linked =
@@ -776,6 +894,14 @@ defmodule Telelem.Handoff do
       not (is_nil(receipts_cfg) or (grant_opt != nil and terminal_ack and receipts_cfg != :error)) ->
         {:stop, {:bad_option, :receipts}}
 
+      not valid_activation?(activation_limit, grant_opt, terminal_ack, receipts_cfg, deadline) ->
+        {:stop, {:bad_option, :activation_limit}}
+
+      activation_limit != nil and
+          not (is_integer(register_timeout) and register_timeout in 0..4_294_967_295) ->
+        # Armed only at activation: refuse here what send_after/3 would raise on.
+        {:stop, {:bad_option, :register_timeout}}
+
       linked != nil ->
         # A linked role's exit (as our parent) would stop us before its
         # :DOWN could be handled.
@@ -794,15 +920,18 @@ defmodule Telelem.Handoff do
 
         token = make_ref()
 
-        Process.send_after(
-          me,
-          {:register_deadline, token},
-          Keyword.get(opts, :register_timeout, 5_000)
-        )
+        # Inactive (activation_limit): no request timer until the activation,
+        # only the private lifecycle expiry at s (its own token).
+        if activation_limit == nil,
+          do: arm_request_timers(me, token, register_timeout, deadline)
 
-        # One timer at the shared absolute deadline bounds both the pending
-        # grant and the pending write result, independent of the requester.
-        if deadline, do: Process.send_after(me, {:terminal_deadline, token}, deadline, abs: true)
+        expiry =
+          if activation_limit != nil do
+            etoken = make_ref()
+
+            {Process.send_after(me, {:activation_expiry, etoken}, activation_limit, abs: true),
+             etoken}
+          end
 
         blank = %{
           pid: nil,
@@ -851,19 +980,121 @@ defmodule Telelem.Handoff do
           outcome: nil,
           unreported: [],
           # nil (default) | coordinator-owned receipt writer, see open_receipts/2
-          receipts: nil
+          receipts: nil,
+          # nil (default) | %{state: :inactive, limit, receipts_cfg,
+          # register_timeout} | %{state: :active, limit}, see "Activation"
+          activation:
+            activation_limit &&
+              %{
+                state: :inactive,
+                limit: activation_limit,
+                receipts_cfg: receipts_cfg,
+                register_timeout: register_timeout,
+                expiry: expiry
+              }
         }
 
-        # Last step of a successful init: check the store binding, then open
-        # the one writer and record ingress.
-        case open_receipts(s, receipts_cfg) do
-          {:ok, s} -> {:ok, s}
-          :error -> {:stop, {:bad_option, :receipts}}
+        cond do
+          activation_limit != nil ->
+            # Inactive: the binding is checked now (and again at activation),
+            # but no writer is opened and nothing is published.
+            if receipts_bound?(receipts_cfg.producer, receipts_cfg.store, receipts_cfg.meta.mode),
+              do: {:ok, s},
+              else: {:stop, {:bad_option, :receipts}}
+
+          true ->
+            # Last step of a successful init: check the store binding, then
+            # open the one writer and record ingress.
+            case open_receipts(s, receipts_cfg) do
+              {:ok, s} -> {:ok, s}
+              :error -> {:stop, {:bad_option, :receipts}}
+            end
         end
     end
   end
 
+  # The registration timer (relative) and the one timer at the shared
+  # absolute deadline, which bounds both the pending grant and the pending
+  # write result, independent of the requester. Same order as before
+  # activation existed.
+  defp arm_request_timers(me, token, register_timeout, deadline) do
+    Process.send_after(me, {:register_deadline, token}, register_timeout)
+    if deadline, do: Process.send_after(me, {:terminal_deadline, token}, deadline, abs: true)
+    :ok
+  end
+
+  defp valid_activation?(nil, _grant, _ack, _cfg, _deadline), do: true
+
+  defp valid_activation?(limit, grant, ack, cfg, deadline),
+    do:
+      is_integer(limit) and grant != nil and ack and is_map(cfg) and is_integer(deadline) and
+        limit <= deadline and System.monotonic_time(:millisecond) < limit
+
+  # ── Activation (opt-in, see moduledoc) ───────────────────────────────────
+
+  # The one gate while inactive: only the safe status and the exact
+  # requester's activation are handled; every other call changes nothing.
+  defp inactive_call(:status, _from, s), do: {:reply, status_map(s), s}
+
+  defp inactive_call({:activate, limit}, {pid, _}, s) do
+    cond do
+      pid != s.requester -> {:reply, {:error, :not_requester}, s}
+      limit !== s.activation.limit -> {:reply, {:error, :activation_limit_mismatch}, s}
+      true -> activate_now(s)
+    end
+  end
+
+  defp inactive_call(_msg, _from, s), do: {:reply, {:error, :inactive}, s}
+
+  # The single decision. Re-check the pinned binding and prepare the writer
+  # (no publication), then the clock; nothing runs between a passing check
+  # and the ingress publication. The reply is not awaited: a lost or late
+  # reply leaves the coordinator active (no rollback).
+  defp activate_now(%{activation: %{limit: limit, receipts_cfg: cfg} = a} = s) do
+    if receipts_bound?(cfg.producer, cfg.store, cfg.meta.mode) do
+      r = prepare_receipts(cfg)
+
+      if System.monotonic_time(:millisecond) < limit do
+        s = %{s | activation: %{state: :active, limit: limit}, receipts: r} |> receipt(:ingress)
+        # The expiry is over: a copy already queued is ignored once active.
+        _ = Process.cancel_timer(elem(a.expiry, 0))
+        arm_request_timers(self(), s.register_token, a.register_timeout, s.terminal_deadline)
+        {:reply, :ok, trace(s, :activated)}
+      else
+        # Still inactive: terminate/2 is silent.
+        {:stop, :normal, {:error, :activation_expired}, s}
+      end
+    else
+      {:stop, :normal, {:error, :receipts_unbound}, s}
+    end
+  end
+
+  # Only real lifecycle exits act while inactive, silently: the exact
+  # expiry, and the requester's or authority's :DOWN. Everything else
+  # (other tokens, grants, attempt traffic, EXITs of non-parents) is
+  # ignored: nothing of the request exists yet.
+  defp inactive_info({:activation_expiry, token}, %{activation: %{expiry: {_, token}}} = s),
+    do: {:stop, :normal, s}
+
+  defp inactive_info({:DOWN, ref, :process, _, _}, %{requester_mon: ref} = s),
+    do: {:stop, :normal, s}
+
+  defp inactive_info({:DOWN, ref, :process, _, _}, %{authority_mon: ref} = s),
+    do: {:stop, :normal, s}
+
+  defp inactive_info({:DOWN, ref, :process, _, _}, %{observer_mon: ref} = s),
+    do: {:noreply, %{s | observer_state: :lost}}
+
+  defp inactive_info(_msg, s), do: {:noreply, s}
+
+  defp with_activation(map, %{activation: nil}), do: map
+  defp with_activation(map, %{activation: a}), do: Map.put(map, :activation, a.state)
+
   @impl true
+  # While inactive every call goes through the one gate (see "Activation").
+  def handle_call(msg, from, %{activation: %{state: :inactive}} = s),
+    do: inactive_call(msg, from, s)
+
   def handle_call({:attach, id}, from, s), do: handle_call({:attach, id, nil}, from, s)
 
   # attach_grant/3: the mode is checked first, in this one step, so a
@@ -1077,27 +1308,21 @@ defmodule Telelem.Handoff do
     end
   end
 
-  def handle_call(:status, _from, s) do
-    {:reply,
-     %{
-       phase: s.phase,
-       winner: s.winner,
-       outcome: s.outcome,
-       terminal: terminal_state(s),
-       authority: s.authority_state,
-       authorization: s.authorization,
-       terminal_pending: s.pending != nil,
-       observer: s.observer_state,
-       attempts:
-         Map.new(s.attempts, fn {id, a} ->
-           {id, Map.take(a, [:pid, :dispatched, :ready, :cancelled, :cleanup, :charge])}
-         end)
-     }
-     |> with_grant_phase(s)
-     |> with_receipts(s), s}
+  # Active (or never inactive): activation is over or was never configured.
+  def handle_call({:activate, _limit}, {pid, _}, s) do
+    cond do
+      s.activation == nil -> {:reply, {:error, :no_activation}, s}
+      pid != s.requester -> {:reply, {:error, :not_requester}, s}
+      true -> {:reply, {:error, :duplicate}, s}
+    end
   end
 
+  def handle_call(:status, _from, s), do: {:reply, status_map(s), s}
+
   @impl true
+  # While inactive every message goes through the one gate first.
+  def handle_info(msg, %{activation: %{state: :inactive}} = s), do: inactive_info(msg, s)
+
   # With a coordinator grant request outstanding, its reply or its request
   # monitor's :DOWN is matched first, with the documented gen_server API.
   def handle_info(msg, %{grant: %{req: req}} = s) when req != nil do
@@ -1109,6 +1334,26 @@ defmodule Telelem.Handoff do
   end
 
   def handle_info(msg, s), do: info(msg, s)
+
+  defp status_map(s) do
+    %{
+      phase: s.phase,
+      winner: s.winner,
+      outcome: s.outcome,
+      terminal: terminal_state(s),
+      authority: s.authority_state,
+      authorization: s.authorization,
+      terminal_pending: s.pending != nil,
+      observer: s.observer_state,
+      attempts:
+        Map.new(s.attempts, fn {id, a} ->
+          {id, Map.take(a, [:pid, :dispatched, :ready, :cancelled, :cleanup, :charge])}
+        end)
+    }
+    |> with_grant_phase(s)
+    |> with_receipts(s)
+    |> with_activation(s)
+  end
 
   # The grant was issued while the pinned authority was alive; it reaches us
   # before that authority's :DOWN. This is the authorization point.
@@ -1223,10 +1468,15 @@ defmodule Telelem.Handoff do
   end
 
   # Non-parent links (none are supported) are trapped and ignored; the
-  # parent's EXIT is handled by gen_server and lands in terminate/2.
+  # parent's EXIT is handled by gen_server and lands in terminate/2. A stale
+  # activation expiry (once active) lands here too and is ignored.
   defp info(_other, s), do: {:noreply, s}
 
   @impl true
+  # Inactive: nothing of the request exists (no outcome owed, no attempt, no
+  # evidence), so nothing is sent, emitted or published, whatever the reason.
+  def terminate(_reason, %{activation: %{state: :inactive}}), do: :ok
+
   def terminate(reason, s) do
     # Nothing is published from here: an abnormal stop leaves no terminal, so
     # the receipt can never read complete.
@@ -1745,28 +1995,32 @@ defmodule Telelem.Handoff do
   # Checks the binding once, then opens exactly one writer per coordinator,
   # owned by this process; ingress is its sequence one. Nothing waits on or
   # calls the store in between. A failed binding is :error (init stops).
-  defp open_receipts(s, %{producer: p, store: store, meta: m}) do
+  defp open_receipts(s, %{producer: p, store: store, meta: m} = cfg) do
     if receipts_bound?(p, store, m.mode) do
-      r =
-        case Telelem.Receipts.Writer.open(p, m.tenant_id, m.request_id) do
-          {:ok, w} ->
-            %{
-              writer: w,
-              route_rev: m.route_rev,
-              deployment_id: m.deployment_id,
-              state: :recording
-            }
-
-          {:error, _} ->
-            %{writer: nil, route_rev: nil, deployment_id: nil, state: :disabled}
-        end
-
-      {:ok,
-       %{s | receipts: Map.merge(r, %{permitted: false, terminal: false})}
-       |> receipt(:ingress)}
+      {:ok, %{s | receipts: prepare_receipts(cfg)} |> receipt(:ingress)}
     else
       :error
     end
+  end
+
+  # Opens the writer (owned by this process; a pure struct, nothing is
+  # published or sent). The caller publishes ingress.
+  defp prepare_receipts(%{producer: p, meta: m}) do
+    r =
+      case Telelem.Receipts.Writer.open(p, m.tenant_id, m.request_id) do
+        {:ok, w} ->
+          %{
+            writer: w,
+            route_rev: m.route_rev,
+            deployment_id: m.deployment_id,
+            state: :recording
+          }
+
+        {:error, _} ->
+          %{writer: nil, route_rev: nil, deployment_id: nil, state: :disabled}
+      end
+
+    Map.merge(r, %{permitted: false, terminal: false})
   end
 
   # The permission bit: set when the one dispatch permission is released.
@@ -1853,7 +2107,8 @@ defmodule Telelem.Handoff do
     :terminal_written,
     :cleaned,
     :cancel,
-    :status
+    :status,
+    :activate
   ]
   @phases [:open, :elected, :committed]
   @grant_phases [:idle, :reserving, :reserved, :authorizing, :authorized, :refused, :abandoned]
@@ -1933,6 +2188,7 @@ defmodule Telelem.Handoff do
       grant: grant_view(Map.get(s, :grant)),
       receipts: receipts_view(Map.get(s, :receipts))
     }
+    |> activation_view(Map.get(s, :activation))
   end
 
   defp state_view(_), do: :redacted
@@ -1975,6 +2231,15 @@ defmodule Telelem.Handoff do
 
   defp receipts_view(_), do: :other
 
+  # Only with activation_limit (absent otherwise, so default views keep their
+  # exact keys): its category, never the limit or the receipt configuration.
+  defp activation_view(map, nil), do: map
+
+  defp activation_view(map, %{} = a),
+    do: Map.put(map, :activation, pick(Map.get(a, :state), [:inactive, :active]))
+
+  defp activation_view(map, _), do: Map.put(map, :activation, :other)
+
   defp message_view({:"$gen_call", _from, req}), do: {:call, request_kind(req)}
   defp message_view({:"$gen_cast", _}), do: {:cast, :other}
   defp message_view({:system, _from, _req}), do: :system
@@ -1984,6 +2249,7 @@ defmodule Telelem.Handoff do
   defp message_view({:terminal_deadline, _}), do: :terminal_deadline
   defp message_view({:register_deadline, _}), do: :register_deadline
   defp message_view({:cleanup_deadline, _, _}), do: :cleanup_deadline
+  defp message_view({:activation_expiry, _}), do: :activation_expiry
   defp message_view(_), do: :other
 
   defp request_kind(req) when req in @calls, do: req
