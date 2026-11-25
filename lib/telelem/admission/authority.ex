@@ -9,6 +9,10 @@ defmodule Telelem.Admission.Authority do
 
     * all-or-none `reserve/4` (slot + units, idempotent by op id)
     * `authorize/2` dispatch, `cancel/2`, `settle/3`, `reconcile/3`
+      (`reserve/5` and `authorize/3` take an explicit caller wait; a timeout
+      there neither cancels nor rolls back the queued request;
+      `send_reserve/4` and `send_authorize/2` send the same requests
+      asynchronously, for a caller that must not block)
     * reservation TTL timers armed through the injected clock
     * **monitored owner death**: a live reserved grant is released, and a
       dispatched grant becomes `:unresolved` (slot freed, spend still encumbered)
@@ -91,12 +95,77 @@ defmodule Telelem.Admission.Authority do
   def child_spec(opts),
     do: %{id: Keyword.get(opts, :id, __MODULE__), start: {__MODULE__, :start_link, [opts]}}
 
-  @spec reserve(GenServer.server(), term(), pid(), pos_integer()) :: result()
-  def reserve(auth, op_id, owner, units) when is_pid(owner),
-    do: GenServer.call(auth, {:reserve, op_id, owner, units})
+  # Caller wait used by reserve/4 and authorize/2 (GenServer.call's default).
+  @default_wait 5_000
 
+  defguardp is_wait(t) when t == :infinity or (is_integer(t) and t >= 0)
+
+  @doc "`reserve/5` with the default #{@default_wait} ms caller wait."
+  @spec reserve(GenServer.server(), term(), pid(), pos_integer()) :: result()
+  def reserve(auth, op_id, owner, units), do: reserve(auth, op_id, owner, units, @default_wait)
+
+  @doc """
+  All-or-none reservation of one slot and `units` for `owner`, idempotent by
+  `op_id`. Waits up to `timeout` (ms or `:infinity`) for the reply.
+
+  `timeout` bounds only how long **the caller waits**. It is not a deadline
+  for the authority, not a cancellation and not a rollback. When it expires
+  the call exits with `{:timeout, {GenServer, :call, _}}`, just like
+  `GenServer.call/3`, but the request was already sent and, unless the
+  authority dies first, is still applied in mailbox order. A reservation can therefore exist (owned by
+  `owner`, monitored, TTL armed) although the caller saw a timeout. The late
+  reply is discarded. To learn the grant id, retry with the same `op_id`
+  (`{:duplicate, grant_id}`); to give it up, `cancel/2` it or let `owner`
+  exit.
+  """
+  @spec reserve(GenServer.server(), term(), pid(), pos_integer(), timeout()) :: result()
+  def reserve(auth, op_id, owner, units, timeout) when is_pid(owner) and is_wait(timeout),
+    do: GenServer.call(auth, {:reserve, op_id, owner, units}, timeout)
+
+  @doc "`authorize/3` with the default #{@default_wait} ms caller wait."
   @spec authorize(GenServer.server(), grant_id()) :: result()
-  def authorize(auth, gid), do: GenServer.call(auth, {:authorize, gid})
+  def authorize(auth, gid), do: authorize(auth, gid, @default_wait)
+
+  @doc """
+  Dispatch a reserved grant (`:reserved` → `:dispatched`). Waits up to
+  `timeout` (ms or `:infinity`) for the reply.
+
+  As with `reserve/5`, `timeout` is the **caller's wait**, not cancellation
+  or rollback. On expiry the call exits with `{:timeout, {GenServer, :call,
+  _}}`, but the request was already sent and, unless the authority dies
+  first, is still applied: the grant may become
+  `:dispatched` after the caller gave up waiting, and the late reply is
+  discarded. Treat a timed-out authorize as possibly dispatched. If the
+  owner then exits, the grant becomes `:unresolved`: the slot is freed but
+  its units stay encumbered until `settle/3` or `reconcile/3`. They are
+  never released back to available units by the timeout or by the owner
+  leaving.
+  """
+  @spec authorize(GenServer.server(), grant_id(), timeout()) :: result()
+  def authorize(auth, gid, timeout) when is_wait(timeout),
+    do: GenServer.call(auth, {:authorize, gid}, timeout)
+
+  @doc """
+  Asynchronous `reserve/5`: sends the same request to the pinned authority
+  pid `auth` with `:gen_server.send_request/2` and returns its request id.
+  The caller matches the reply (`result()`) or the request monitor's `:DOWN`
+  with `:gen_server.check_response/2`, and gives the request up with
+  `:gen_server.receive_response(request_id, 0)`. Giving it up only discards
+  the reply. Like a timed-out `reserve/5`, it neither cancels nor rolls back
+  the request: unless `auth` dies first, it is still applied in mailbox order.
+  """
+  @spec send_reserve(pid(), term(), pid(), pos_integer()) :: :gen_server.request_id()
+  def send_reserve(auth, op_id, owner, units) when is_pid(auth) and is_pid(owner),
+    do: :gen_server.send_request(auth, {:reserve, op_id, owner, units})
+
+  @doc """
+  Asynchronous `authorize/3` to the pinned authority pid `auth`, with the same
+  reply handling as `send_reserve/4`. Abandoning the request does not stop
+  it: treat an abandoned authorize as possibly dispatched.
+  """
+  @spec send_authorize(pid(), grant_id()) :: :gen_server.request_id()
+  def send_authorize(auth, gid) when is_pid(auth),
+    do: :gen_server.send_request(auth, {:authorize, gid})
 
   @spec cancel(GenServer.server(), grant_id()) :: result()
   def cancel(auth, gid), do: GenServer.call(auth, {:cancel, gid})
