@@ -47,9 +47,10 @@ defmodule Telelem.Serve.Tree do
   pids; nothing here, or in either start function, looks anything up again,
   by name or otherwise. Pins are never rebound: if the tree is gone or
   replaced, the old pins keep naming the old (dead) pids, a later
-  `CoordinatorStart.start/3` on them is `{:not_sent, :start_unconfirmed}`
-  and a later `OwnerGuard.start/2` is `{:error, :start_failed}`, and a new
-  setup must resolve the new root.
+  `CoordinatorStart.start/3` on them (otherwise valid and timely) is
+  `{:error, {:not_sent, :start_unconfirmed}}` and a later
+  `OwnerGuard.start/2` is `{:error, :start_failed}`, and a new setup must
+  resolve the new root.
 
   Steps, in order; the first failure is returned:
 
@@ -105,11 +106,12 @@ defmodule Telelem.Serve.Tree do
     * an overall time bound: both levels wait with `:infinity`; only each
       child's own `shutdown` is finite.
 
-  It holds only for an orderly stop. On branch loss the lost branch is
-  already gone before its sibling is shut down (if the `:coordinators`
-  branch is lost, coordinators end before guards). If the root is killed,
-  both branches get its exit signal at once and shut down concurrently, in
-  no order.
+  It holds only for an orderly stop. On branch loss only the lost branch's
+  supervisor pid has exited before its sibling is shut down; if it was lost
+  abruptly (e.g. killed), its workers may still be exiting, so no order
+  between coordinator and guard exits follows. If the root is killed, both
+  branches get its exit signal at once and shut down concurrently. Neither
+  abrupt branch loss nor a root kill gives any worker exit order.
   """
 
   use Supervisor
