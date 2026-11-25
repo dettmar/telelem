@@ -56,14 +56,24 @@ defmodule Telelem.Serve.RequesterTest do
   for an absolute `D` to pass. One case takes Handoff's own 5 s
   `terminal_written/2` call timeout.
 
-  Not covered (no hook without changing Handoff): a `terminal_written/2`
-  reply lost *after* the coordinator sent `{:done, _}` (it replies in the
-  same step it sends the outcome, so a reply is never lost without killing
-  the requester); `terminal_written/2` processed by Handoff before its `D`
-  timer but after `D` (Handoff's own `{:error, :deadline}` branch); a
-  writer call already started when `D` passes cannot be interrupted, so the
-  bounds here are clock checks, not wall-clock limits. No real socket,
-  Plug, framing or peer receipt is exercised.
+  Handoff sends the outcome message *before* it replies to
+  `terminal_written/2`, and runs its `:on_event` callback in between, so the
+  reply can be lost after `{:done, _}` was sent. One case drives exactly
+  that with Handoff's public `:on_event` option (blocked on the outcome
+  event, then the coordinator is killed): the reply is `{:error,
+  :unconfirmed}` and the queued `{:done, _}` still decides `:complete`.
+  Messages the coordinator never sends in that state (a terminal while it
+  has none, or with another `D`) are placed in the requester's mailbox by
+  the test, keyed by the real coordinator pid.
+
+  Not covered: which of Handoff's two late branches answers a marker write
+  that returned after `D` (its timer's `{:error, :ended}` or its own
+  `{:error, :deadline}`; the outcome is the same, so either is accepted);
+  the re-wait after a clamped stream wait (a bound more than `2^32 - 1` ms
+  away is only shown not to crash or return early); a writer call already
+  started when `D` passes cannot be interrupted, so the bounds here are
+  clock checks, not wall-clock limits. No real socket, Plug, framing or
+  peer receipt is exercised.
 
       scripts/mix test test/telelem/serve/requester_test.exs --seed 0
   """
@@ -135,11 +145,13 @@ defmodule Telelem.Serve.RequesterTest do
     go(r, fn -> Requester.run(cfg, @auth, rd, writer(test), controller: r, observer: r) end)
     assert_receive {:result, ^r, res}, @t
 
-    assert {:no_write, {:outcome, {:failed, :admission_refused}}, ev} = res
-    h = ev.handoff
+    assert {:no_write, {:outcome, {:failed, :admission_refused}}, ev, pv} = res
+    safe!(res)
+    h = pv.handoff
     assert %{header: :not_called, chunks: 0, credit: 0, terminal: :none} = ev
-    assert %{report: :not_sent, cancel: :not_submitted, elected: nil} = ev
+    assert %{report: :not_sent, cancel: :not_submitted, elected: false} = ev
     assert ev.outcome == {:failed, :admission_refused}
+    assert pv.outcome == {:failed, :admission_refused} and pv.elected == nil
     assert is_binary(ev.request_id) and is_integer(ev.deadline_ms)
     for x <- [@auth, @body, ctx.target.host], do: refute(contains?(res, x))
 
@@ -178,7 +190,12 @@ defmodule Telelem.Serve.RequesterTest do
     rd = reader(@body)
     r = owner!()
     go(r, fn -> Requester.run(cfg, @auth, rd, writer(test)) end)
-    assert_receive {:result, ^r, {:no_write, {:start, {:ingress, :unauthenticated}}}}, @t
+    assert_receive {:result, ^r, res}, @t
+
+    assert res ==
+             {:no_write, {:start, {:ingress, :unauthenticated}}, %{},
+              %{start: {:ingress, :unauthenticated}}}
+
     refute_received {:read_body, _, _}
     assert DynamicSupervisor.count_children(ctx.pins.coordinators) == @empty
 
@@ -190,9 +207,16 @@ defmodule Telelem.Serve.RequesterTest do
     go(r, fn -> Requester.run(cfg, @auth, rd, writer(test)) end)
     assert_receive {:result, ^r, res}, @t
 
-    assert {:no_write, {:start, {:launch, :expired, failure}}} = res
+    # Primary's typed error is handed back verbatim, privately; the log-safe
+    # part keeps only closed categories and the request id (no pid).
+    assert {:no_write, {:start, {:launch, :expired}}, sev, %{start: start}} = res
+    assert {:launch, :expired, failure} = start
     assert %{activation: :confirmed, go: :not_sent, cancel: :submitted, handoff: h} = failure
     assert map_size(failure) == 5
+    assert is_pid(h)
+    rid = failure.request_id
+    assert sev == %{request_id: rid, activation: :confirmed, go: :not_sent, cancel: :submitted}
+    safe!(res)
     reason = Primary.cancel_reason()
     assert calls(tr, r, :args) == [{Handoff, :submit_cancel, [h, reason]}]
     refute_received {:writer, _, _, _}
@@ -264,10 +288,12 @@ defmodule Telelem.Serve.RequesterTest do
     assert_receive {:result, _, res}, @t
     assert_receive {:finish, :ok}, @t
 
-    assert {:complete, ev} = res
+    assert {:complete, ev, pv} = res
+    safe!(res)
     assert %{header: :ok, chunks: 2, credit: 9, terminal: :written, written_late: false} = ev
-    assert %{report: {:sent, :ok}, outcome: {:done, :term}, cancel: :not_submitted} = ev
-    assert ev.elected == :primary and ev.writer.n == 4
+    assert %{report: {:sent, :ok}, outcome: :done, cancel: :not_submitted, elected: true} = ev
+    assert %{elected: :primary, outcome: {:done, :term}, report: {:sent, :ok}, handoff: ^h} = pv
+    assert pv.writer.n == 4
     sync!(c)
     refute_received {:att, {:telelem_wire_credit, _, _}}
     refute_received {:writer, _, _, _}
@@ -294,7 +320,9 @@ defmodule Telelem.Serve.RequesterTest do
     assert att!(c, fn -> Handoff.transfer(h, "de") end) == :ok
     reply(assert_writer!({:chunk, "de"}), {:error, :closed})
 
-    assert_receive {:result, _, {:aborted, {:data, :failed}, ev}}, @t
+    assert_receive {:result, _, {:aborted, {:data, :failed}, ev, pv} = res}, @t
+    safe!(res)
+    assert pv.writer.n == 2
     assert %{header: :ok, chunks: 1, credit: 3, cancel: :submitted, report: :not_sent} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :submit_cancel, [h, :write_failed]}]
     assert_receive {:att, {:telelem_handoff, ^h, {:cancel, :write_failed}}}, @t
@@ -320,7 +348,8 @@ defmodule Telelem.Serve.RequesterTest do
       assert att!(c, fn -> Handoff.transfer(h, "c1") end) == :ok
       reply(assert_writer!(:header), how)
 
-      assert_receive {:result, _, {:aborted, {:header, ^why}, ev}}, @t
+      assert_receive {:result, _, {:aborted, {:header, ^why}, ev, _} = res}, @t
+      safe!(res)
       assert %{header: ^why, chunks: 0, credit: 0, cancel: :submitted} = ev
       assert calls(tr, c.req, :args) == [{Handoff, :submit_cancel, [h, reason]}]
       refute_received {:writer, _, _, _}
@@ -342,7 +371,8 @@ defmodule Telelem.Serve.RequesterTest do
     wait_until!(c.d)
     reply(ref, :ok)
 
-    assert_receive {:result, _, {:aborted, {:data, :deadline}, ev}}, @t
+    assert_receive {:result, _, {:aborted, {:data, :deadline}, ev, _} = res}, @t
+    safe!(res)
     assert %{header: :ok, chunks: 0, credit: 0, cancel: :submitted} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :submit_cancel, [h, :deadline]}]
     refute_received {:writer, _, _, _}
@@ -362,13 +392,14 @@ defmodule Telelem.Serve.RequesterTest do
     wait_until!(c.d)
     true = :erlang.resume_process(c.req)
 
-    assert_receive {:result, _, {:no_write, {:data, :deadline}, ev}}, @t
+    assert_receive {:result, _, {:no_write, {:data, :deadline}, ev, _} = res}, @t
+    safe!(res)
     assert %{header: :not_called, cancel: :submitted, credit: 0} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :submit_cancel, [h, :deadline]}]
     refute_received {:writer, _, _, _}
   end
 
-  test "late terminal write: the marker write returns after D; the actual :ok is reported once anyway; Handoff's deadline outcome stands; no cancel",
+  test "late terminal write: the marker write returns after D; the actual :ok is reported once anyway; Handoff's deadline outcome stands (reply :ended or :deadline); no cancel",
        ctx do
     c = start!(ctx, 600)
     tr = trace!(c.req, [{Handoff, :submit_cancel, 2}, {Handoff, :terminal_written, 2}])
@@ -385,10 +416,15 @@ defmodule Telelem.Serve.RequesterTest do
     wait_until!(c.d)
     reply(ref, :ok)
 
-    assert_receive {:result, _, {:aborted, why, ev}}, @t
+    assert_receive {:result, _, {:aborted, why, ev, pv} = res}, @t
+    safe!(res)
     assert why == {:outcome, {:incomplete, {:terminal_unconfirmed, :deadline}}}
     assert %{terminal: :written, written_late: true, cancel: :not_submitted, credit: 2} = ev
-    assert ev.report == {:sent, {:error, :ended}}
+    # Not ordered here: Handoff's D timer (:ended) or its own late check
+    # (:deadline) answers the report; the outcome is the same.
+    assert ev.report in [{:sent, {:error, :ended}}, {:sent, {:error, :deadline}}]
+    assert pv.report == ev.report
+    assert pv.outcome == {:incomplete, {:terminal_unconfirmed, :deadline}}
     assert calls(tr, c.req, :args) == [{Handoff, :terminal_written, [h, :ok]}]
     sync!(c)
     refute_received {:att, {:telelem_wire_credit, _, _}}
@@ -418,8 +454,10 @@ defmodule Telelem.Serve.RequesterTest do
     wait_until!(c.d)
     true = :erlang.resume_process(c.req)
 
-    assert_receive {:result, _, {:complete, ev}}, @t
-    assert %{terminal: :written, written_late: false, outcome: {:done, :term}} = ev
+    assert_receive {:result, _, {:complete, ev, pv} = res}, @t
+    safe!(res)
+    assert %{terminal: :written, written_late: false, outcome: :done} = ev
+    assert pv.outcome == {:done, :term}
     assert %{report: {:sent, :ok}, cancel: :not_submitted, credit: 0} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :terminal_written, [h, :ok]}]
     sync!(c)
@@ -442,7 +480,8 @@ defmodule Telelem.Serve.RequesterTest do
     reply(ref, :ok)
 
     assert_receive {:DOWN, ^hm, :process, ^h, :killed}, 7_000
-    assert_receive {:result, _, {:aborted, :handoff_down, ev}}, @t
+    assert_receive {:result, _, {:aborted, :handoff_down, ev, _} = res}, @t
+    safe!(res)
     assert %{terminal: :written, report: {:sent, {:error, :unconfirmed}}} = ev
     assert %{outcome: :not_observed, cancel: :not_submitted} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :terminal_written, [h, :ok]}]
@@ -459,7 +498,8 @@ defmodule Telelem.Serve.RequesterTest do
     finish(c, :term)
     reply(assert_writer!(:header), :ok)
     reply(assert_writer!({:chunk, @marker}), {:error, :closed})
-    assert_receive {:result, _, {:aborted, {:terminal, :failed}, ev}}, @t
+    assert_receive {:result, _, {:aborted, {:terminal, :failed}, ev, _} = res}, @t
+    safe!(res)
     assert ev.outcome == {:incomplete, {:downstream_write, :write_failed}}
     assert %{terminal: :failed, report: {:sent, :ok}, cancel: :not_submitted} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :terminal_written, [h, {:error, :write_failed}]}]
@@ -477,7 +517,8 @@ defmodule Telelem.Serve.RequesterTest do
     wait_until!(c.d)
     true = :erlang.resume_process(c.req)
 
-    assert_receive {:result, _, {:no_write, {:terminal, :deadline}, ev}}, @t
+    assert_receive {:result, _, {:no_write, {:terminal, :deadline}, ev, _} = res}, @t
+    safe!(res)
     assert ev.outcome == {:incomplete, {:terminal_unconfirmed, :deadline}}
     assert %{header: :not_called, terminal: :deadline, cancel: :not_submitted} = ev
     assert elem(ev.report, 0) == :sent
@@ -492,9 +533,10 @@ defmodule Telelem.Serve.RequesterTest do
     serve!(c, writer(self(), true), stream_grace_ms: 100)
     elect!(c)
     h = c.h
-    assert_receive {:result, _, {:no_write, :receive_timeout, ev}}, @t
+    assert_receive {:result, _, {:no_write, :receive_timeout, ev, _} = res}, @t
     assert now() >= c.d + 100
-    assert %{cancel: :submitted, elected: :primary} = ev
+    safe!(res)
+    assert %{cancel: :submitted, elected: true} = ev
     assert calls(tr, c.req, :args) == [{Handoff, :submit_cancel, [h, :receive_timeout]}]
     assert_receive {:att, {:telelem_handoff, ^h, {:cancel, :receive_timeout}}}, @t
     :trace.session_destroy(tr)
@@ -504,27 +546,226 @@ defmodule Telelem.Serve.RequesterTest do
     serve!(c, writer(self(), true))
     elect!(c)
     Process.exit(c.h, :kill)
-    assert_receive {:result, _, {:no_write, :handoff_down, ev}}, @t
+    assert_receive {:result, _, {:no_write, :handoff_down, ev, _} = res}, @t
+    safe!(res)
     assert %{cancel: :not_submitted, outcome: :not_observed} = ev
     assert calls(tr, c.req, :args) == []
+  end
+
+  test "markers in the writer state, the upstream terminal and an outcome reason are handed back privately and never in the log-safe parts",
+       ctx do
+    wm = "WRITER-MARKER-3c9f"
+    om = "OUTCOME-MARKER-81d2"
+    rm = "REASON-MARKER-6b40"
+
+    # Complete: an arbitrary writer state and an arbitrary upstream terminal.
+    c = start!(ctx, 5_000)
+    serve!(c, writer(self(), true, %{secret: wm}))
+    elect!(c)
+    finish(c, {:usage, om})
+    reply(assert_writer!(:header), :ok)
+    reply(assert_writer!({:chunk, @marker}), :ok)
+    assert_receive {:result, _, {:complete, ev, pv} = res}, @t
+    assert_receive {:finish, :ok}, @t
+    safe!(res)
+    for x <- [wm, om], do: refute(contains?(ev, x))
+    assert ev.outcome == :done
+    assert pv.writer.secret == wm and pv.writer.n == 2
+    assert pv.outcome == {:done, {:usage, om}}
+
+    # Aborted: the committed winner exits with an arbitrary reason.
+    c = start!(ctx, 5_000)
+    serve!(c, writer(self(), true, %{secret: wm}))
+    elect!(c)
+    h = c.h
+    assert att!(c, fn -> Handoff.transfer(h, "c1") end) == :ok
+    reply(assert_writer!(:header), :ok)
+    reply(assert_writer!({:chunk, "c1"}), :ok)
+    assert_receive {:att, {:telelem_wire_credit, ^h, 2}}, @t
+    Process.exit(c.att, {:shutdown, rm})
+    assert_receive {:result, _, {:aborted, why, ev, pv} = res}, @t
+    safe!(res)
+    assert why == {:outcome, {:incomplete, :winner_down}}
+    assert ev.outcome == {:incomplete, :winner_down}
+    for x <- [wm, rm], do: refute(contains?({why, ev}, x))
+    assert pv.outcome == {:incomplete, {:winner_down, {:shutdown, rm}}}
+    assert pv.writer.secret == wm
+  end
+
+  test "terminal mismatch (another D, or an empty marker): one error report, no write and no cancel",
+       ctx do
+    # The real coordinator's terminal carries its D; the handle states another.
+    c = start!(ctx, 5_000, handle_d: 1_000)
+    tr = trace!(c.req, [{Handoff, :submit_cancel, 2}, {Handoff, :terminal_written, 2}])
+    serve!(c, writer(self(), true))
+    elect!(c)
+    h = c.h
+    finish(c, :term)
+    assert_receive {:result, _, {:no_write, {:terminal, :mismatch}, ev, pv} = res}, @t
+    assert_receive {:finish, :ok}, @t
+    safe!(res)
+    assert %{header: :not_called, terminal: :mismatch, cancel: :not_submitted} = ev
+
+    assert %{
+             report: {:sent, :ok},
+             outcome: {:incomplete, {:downstream_write, :terminal_mismatch}}
+           } = ev
+
+    assert pv.outcome == {:incomplete, {:downstream_write, :terminal_mismatch}}
+
+    assert calls(tr, c.req, :args) == [
+             {Handoff, :terminal_written, [h, {:error, :terminal_mismatch}]}
+           ]
+
+    refute_received {:writer, _, _, _}
+    :trace.session_destroy(tr)
+
+    # An empty marker keyed by the real coordinator, which has no terminal:
+    # the one error report is refused and no outcome follows.
+    c = start!(ctx, 5_000)
+    tr = trace!(c.req, [{Handoff, :submit_cancel, 2}, {Handoff, :terminal_written, 2}])
+    serve!(c, writer(self(), true), observe_ms: 100)
+    elect!(c)
+    h = c.h
+    send(c.req, {:telelem_handoff, h, {:terminal, "", c.d}})
+    assert_receive {:result, _, {:no_write, {:terminal, :mismatch}, ev, _} = res}, @t
+    safe!(res)
+    assert %{terminal: :mismatch, report: {:sent, {:error, :no_terminal}}} = ev
+    assert %{outcome: :not_observed, cancel: :not_submitted} = ev
+
+    assert calls(tr, c.req, :args) == [
+             {Handoff, :terminal_written, [h, {:error, :terminal_mismatch}]}
+           ]
+
+    refute_received {:writer, _, _, _}
+  end
+
+  test "no outcome within observe_ms after the report: outcome_not_observed, not complete; no cancel",
+       ctx do
+    c = start!(ctx, 5_000)
+    tr = trace!(c.req, [{Handoff, :submit_cancel, 2}, {Handoff, :terminal_written, 2}])
+    serve!(c, writer(self(), true), observe_ms: 200)
+    elect!(c)
+    h = c.h
+
+    # A valid terminal for exactly D, keyed by the real coordinator, which has
+    # no terminal: it answers {:error, :no_terminal} and sends no outcome.
+    send(c.req, {:telelem_handoff, h, {:terminal, @marker, c.d}})
+    reply(assert_writer!(:header), :ok)
+    ref = assert_writer!({:chunk, @marker})
+    t0 = now()
+    reply(ref, :ok)
+
+    assert_receive {:result, _, {:aborted, :outcome_not_observed, ev, pv} = res}, @t
+    assert now() - t0 >= 200
+    safe!(res)
+    assert %{terminal: :written, written_late: false, outcome: :not_observed} = ev
+    assert %{report: {:sent, {:error, :no_terminal}}, cancel: :not_submitted} = ev
+    assert pv.report == {:sent, {:error, :no_terminal}}
+    assert calls(tr, c.req, :args) == [{Handoff, :terminal_written, [h, :ok]}]
+    assert Process.alive?(h)
+    refute Enum.any?(mailbox(c.req), &match?({:telelem_handoff, ^h, {_, _}}, &1))
+  end
+
+  test "reply lost after the outcome was sent: done is queued before the coordinator dies; the reply is unconfirmed and done still completes",
+       ctx do
+    test = self()
+
+    # Handoff sends the outcome, then calls on_event, then replies. Held in
+    # on_event for the outcome, the coordinator has sent {:done, _} only.
+    on_event = fn
+      {:outcome, {:done, _}} ->
+        send(test, {:on_event_outcome, self()})
+        receive do: (:never -> :ok)
+
+      _ ->
+        :ok
+    end
+
+    c = start!(ctx, 5_000, handoff: [on_event: on_event])
+    tr = trace!(c.req, [{Handoff, :submit_cancel, 2}, {Handoff, :terminal_written, 2}])
+    serve!(c, writer(self(), true))
+    elect!(c)
+    h = c.h
+    finish(c, :term)
+    reply(assert_writer!(:header), :ok)
+    reply(assert_writer!({:chunk, @marker}), :ok)
+    assert_receive {:on_event_outcome, ^h}, @t
+    assert Enum.any?(mailbox(c.req), &match?({:telelem_handoff, ^h, {:done, :term}}, &1))
+    refute_received {:result, _, _}
+    Process.exit(h, :kill)
+
+    assert_receive {:result, _, {:complete, ev, pv} = res}, @t
+    safe!(res)
+    assert %{terminal: :written, outcome: :done, report: {:sent, {:error, :unconfirmed}}} = ev
+    assert %{cancel: :not_submitted} = ev
+    assert pv.report == {:sent, {:error, :unconfirmed}} and pv.outcome == {:done, :term}
+    assert calls(tr, c.req, :args) == [{Handoff, :terminal_written, [h, :ok]}]
+  end
+
+  test "D at Handoff's farthest accepted bound with the largest grace: the stream wait is representable and does not end early; one further step is refused before any effect" do
+    test = self()
+    h = idle()
+    max = Handoff.max_deadline_ahead_ms()
+
+    mk = fn d ->
+      %Handle{
+        request_id: "rq-far",
+        handoff: h,
+        guard: idle(),
+        owner: idle(),
+        witness: idle(),
+        ref: make_ref(),
+        deadline_ms: d
+      }
+    end
+
+    # D + grace - now exceeds 2^32 - 1 ms: one unclamped wait would raise.
+    d = now() + max
+    assert d + 60_000 - now() > 4_294_967_295
+    req = owner!()
+    handle = mk.(d)
+    go(req, fn -> Requester.serve(handle, writer(test), stream_grace_ms: 60_000) end)
+    refute_receive {:result, ^req, _}, 300
+    assert Process.alive?(req)
+    assert {:current_function, {Requester, :stream, 1}} = Process.info(req, :current_function)
+
+    Process.exit(h, :kill)
+    assert_receive {:result, ^req, {:no_write, :handoff_down, ev, pv} = res}, @t
+    safe!(res)
+    assert %{deadline_ms: ^d, cancel: :not_submitted, report: :not_sent} = ev
+    assert pv.handoff == h
+    refute_received {:writer, _, _, _}
+
+    # Past Handoff's range: refused before monitoring or writing anything.
+    far = mk.(now() + max + 10_000)
+
+    assert Requester.serve(far, writer(test), stream_grace_ms: 60_000) ==
+             {:no_write, {:invalid, :handle}}
+
+    assert {:monitors, []} = Process.info(self(), :monitors)
   end
 
   # ── helpers: real Handoff + cooperative attempt ─────────────────────────
 
   # A real coordinator whose requester is a fresh owner process and whose
   # only attempt (:primary) is a test actor, also the credit owner.
-  defp start!(ctx, d_ms) do
+  # `opts`: `handoff:` extra Handoff options; `handle_d:` an offset added to
+  # D in the handle only (the coordinator keeps D).
+  defp start!(ctx, d_ms, opts \\ []) do
     req = owner!()
     att = actor()
     d = now() + d_ms
 
     {:ok, h} =
       Handoff.start(
-        requester: req,
-        attempts: [:primary],
-        admission_authority: ctx.auth,
-        terminal_deadline: d,
-        terminal_ack: true
+        [
+          requester: req,
+          attempts: [:primary],
+          admission_authority: ctx.auth,
+          terminal_deadline: d,
+          terminal_ack: true
+        ] ++ Keyword.get(opts, :handoff, [])
       )
 
     on_exit(fn -> Process.exit(h, :kill) end)
@@ -536,7 +777,7 @@ defmodule Telelem.Serve.RequesterTest do
       owner: att,
       witness: idle(),
       ref: make_ref(),
-      deadline_ms: d
+      deadline_ms: d + Keyword.get(opts, :handle_d, 0)
     }
 
     %{h: h, req: req, att: att, d: d, handle: handle}
@@ -627,7 +868,8 @@ defmodule Telelem.Serve.RequesterTest do
 
   defp seed!(r), do: for(m <- seeded(), do: send(r, m))
 
-  defp writer(test, gate \\ false), do: {Writer, %{test: test, gate: gate, n: 0}}
+  defp writer(test, gate \\ false, extra \\ %{}),
+    do: {Writer, Map.merge(extra, %{test: test, gate: gate, n: 0})}
 
   # The writer runs in the owner process and blocks on exactly this ref.
   defp assert_writer!(call) do
@@ -791,6 +1033,18 @@ defmodule Telelem.Serve.RequesterTest do
   end
 
   defp mailbox(pid), do: elem(Process.info(pid, :messages), 1)
+
+  # The log-safe parts of a disposition hold only atoms, integers and the
+  # request id: no pid, ref, function or other binary.
+  defp safe!({:complete, ev, _private}), do: log_safe!(ev, ev.request_id)
+  defp safe!({_, why, ev, _private}), do: log_safe!({why, ev}, Map.get(ev, :request_id))
+
+  defp log_safe!(t, _rid) when is_atom(t) or is_integer(t), do: :ok
+  defp log_safe!(t, rid) when is_binary(t) and t == rid, do: :ok
+  defp log_safe!(t, rid) when is_tuple(t), do: log_safe!(Tuple.to_list(t), rid)
+  defp log_safe!(t, rid) when is_list(t), do: Enum.each(t, &log_safe!(&1, rid))
+  defp log_safe!(%{} = m, rid), do: log_safe!(Map.to_list(m), rid)
+  defp log_safe!(t, _rid), do: flunk("not log-safe: #{inspect(t)}")
 
   defp resume(p) do
     if Process.alive?(p), do: :sys.resume(p)
