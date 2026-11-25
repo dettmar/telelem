@@ -176,6 +176,63 @@ defmodule Telelem.Handoff do
   `:reserved`, `:authorizing`, `:authorized`, `:refused`, `:abandoned`),
   never the grant token, op id or a raw authority reply.
 
+  ## Receipts (opt-in: `receipts: [producer:, store_mode:, meta:]`)
+
+  Off by default; without it nothing is published and every shape above is
+  unchanged. It requires `coordinator_grant` and `terminal_ack: true`.
+
+    * `producer`: a `Telelem.Receipts.Producer` resolved beforehand with
+      `Telelem.Receipts.Store.producer/1`. The coordinator never calls the
+      store. At start it checks, without messaging anyone, that the pending
+      table exists, is a public `:set` owned by a live local
+      `Telelem.Receipts.Store`, that the counters array has the size and sign
+      the store creates, and that `max_pending <= 256` and
+      `max_event_bytes <= 512` (the §2 ceilings). A handle failing any check
+      (including one whose store has exited) is `{:bad_option, :receipts}`.
+      These checks do not authenticate the handle: the store's own
+      configured limits and its mode are not observable through the existing
+      API.
+    * `store_mode`: the trusted configuration's statement of the store's
+      mode; it must equal `meta.mode`. It is not verified against the store.
+    * `meta`: exactly `receipt_meta/1` of the trusted `Prepared` value
+      (`tenant_id`, gateway `request_id`, `route_rev`, `deployment_id` of the
+      primary, `mode`).
+
+  The coordinator opens exactly one `Telelem.Receipts.Writer` (it is the only
+  owner) at the end of `init/1` and keeps the advanced writer after every
+  publication result, so a failed publication leaves a sequence gap that
+  later records declare. Publication is one synchronous ETS insert that never
+  waits on the store; its result never changes the request. Events, in
+  sequence order (attempt `1` with the primary's deployment for `dispatch`
+  and `commit`; attempt `0`, deployment `none` for the others):
+
+    1. `ingress` (exposure `none`) at start.
+    2. `dispatch` (`possible`) immediately after the one permission reply,
+       before any trace or observer work; the deadline check stays right
+       before the reply.
+    3. `commit` (`possible`) once, when the stream commits: before the first
+       chunk is forwarded, or, for a finish-first commit, after the marker and
+       the winner's decision were sent.
+    4. `authority_down` only while no outcome is reached, including an
+       authorized terminal that still awaits its write acknowledgement.
+    5. `terminal` once, immediately before the outcome is sent to the
+       requester, with that outcome's kind. `done` therefore means only a
+       local marker-write acknowledgement processed before the deadline.
+
+  Exposure of `authority_down` and `terminal` is `possible` exactly when the
+  dispatch permission was released, else `none`; it is not taken from the
+  ledger or from what was published. No `connect_refused` is ever inferred,
+  and usage stays unknown (`Telelem.Receipts.Receipt`). An exception raised
+  while publishing disables this request's evidence for good (no later
+  record, in particular no terminal), so its receipt can never read
+  complete. `terminate/2` publishes nothing. Status and report carry only
+  `receipts: :recording | :disabled`; the trace carries `{:receipt, kind,
+  :ok | :dropped | :rejected | :fault}`.
+
+  Known gap: a coordinator killed between a release (the permission reply,
+  or the marker) and the record that follows it leaves that record missing
+  and no terminal: the receipt is incomplete, never false-complete.
+
   ## Charges: a local, conservative hint
 
   The handoff never refunds anything. The **admission authority's ledger is
@@ -304,6 +361,8 @@ defmodule Telelem.Handoff do
     * `:coordinator_grant`. Default `nil`. `{:one_primary, units}` opts in to
       "Coordinator grant". Requires `:admission_authority`,
       `:terminal_deadline` and `attempts: [:primary]` exactly.
+    * `:receipts`. Default `nil`. `[producer:, store_mode:, meta:]` opts in
+      to "Receipts". Requires `:coordinator_grant` and `terminal_ack: true`.
   """
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -578,6 +637,13 @@ defmodule Telelem.Handoff do
     deadline = Keyword.get(opts, :terminal_deadline)
     terminal_ack = Keyword.get(opts, :terminal_ack, false) == true
     grant_opt = Keyword.get(opts, :coordinator_grant)
+    # Parsed once: nil (off), :error, or the checked configuration.
+    receipts_cfg =
+      case Keyword.get(opts, :receipts) do
+        nil -> nil
+        r -> receipts_config(r)
+      end
+
     {:links, links} = Process.info(self(), :links)
 
     linked =
@@ -612,6 +678,9 @@ defmodule Telelem.Handoff do
 
       not valid_grant_opt?(grant_opt, admission, ids, deadline) ->
         {:stop, {:bad_option, :coordinator_grant}}
+
+      not (is_nil(receipts_cfg) or (grant_opt != nil and terminal_ack and receipts_cfg != :error)) ->
+        {:stop, {:bad_option, :receipts}}
 
       linked != nil ->
         # A linked role's exit (as our parent) would stop us before its
@@ -653,43 +722,46 @@ defmodule Telelem.Handoff do
           forced: false
         }
 
-        {:ok,
-         %{
-           parent: List.first(links),
-           requester: requester,
-           requester_mon: Process.monitor(requester),
-           authority: authority,
-           authority_mon: authority && Process.monitor(authority),
-           authority_state: if(authority, do: :up, else: :none),
-           authorization:
-             cond do
-               admission -> :admission
-               fence_only -> :fence_only
-               true -> :none
-             end,
-           terminal_deadline: deadline,
-           # nil | %{id, caller, tag, nonce, terminal, marker}: grant requested
-           pending: nil,
-           # nil (default) | coordinator-owned admission grant, see new_grant/2
-           grant: new_grant(grant_opt, ids),
-           observer_mon: observer && Process.monitor(observer),
-           observer_state:
-             if(observer || Keyword.has_key?(opts, :on_event), do: :up, else: :none),
-           on_event: on_event,
-           trace: Keyword.get(opts, :trace),
-           cleanup_timeout: Keyword.get(opts, :cleanup_timeout, 5_000),
-           register_token: token,
-           order: ids,
-           attempts: Map.new(ids, &{&1, blank}),
-           phase: :open,
-           winner: nil,
-           terminal_ack: terminal_ack,
-           # nil | {:authorized, terminal}: upstream complete, downstream unconfirmed
-           terminal: nil,
-           downstream: nil,
-           outcome: nil,
-           unreported: []
-         }}
+        s = %{
+          parent: List.first(links),
+          requester: requester,
+          requester_mon: Process.monitor(requester),
+          authority: authority,
+          authority_mon: authority && Process.monitor(authority),
+          authority_state: if(authority, do: :up, else: :none),
+          authorization:
+            cond do
+              admission -> :admission
+              fence_only -> :fence_only
+              true -> :none
+            end,
+          terminal_deadline: deadline,
+          # nil | %{id, caller, tag, nonce, terminal, marker}: grant requested
+          pending: nil,
+          # nil (default) | coordinator-owned admission grant, see new_grant/2
+          grant: new_grant(grant_opt, ids),
+          observer_mon: observer && Process.monitor(observer),
+          observer_state: if(observer || Keyword.has_key?(opts, :on_event), do: :up, else: :none),
+          on_event: on_event,
+          trace: Keyword.get(opts, :trace),
+          cleanup_timeout: Keyword.get(opts, :cleanup_timeout, 5_000),
+          register_token: token,
+          order: ids,
+          attempts: Map.new(ids, &{&1, blank}),
+          phase: :open,
+          winner: nil,
+          terminal_ack: terminal_ack,
+          # nil | {:authorized, terminal}: upstream complete, downstream unconfirmed
+          terminal: nil,
+          downstream: nil,
+          outcome: nil,
+          unreported: [],
+          # nil (default) | coordinator-owned receipt writer, see open_receipts/2
+          receipts: nil
+        }
+
+        # Last step of a successful init: open the one writer, record ingress.
+        {:ok, open_receipts(s, receipts_cfg)}
     end
   end
 
@@ -915,7 +987,8 @@ defmodule Telelem.Handoff do
            {id, Map.take(a, [:pid, :dispatched, :ready, :cancelled, :cleanup, :charge])}
          end)
      }
-     |> with_grant_phase(s), s}
+     |> with_grant_phase(s)
+     |> with_receipts(s), s}
   end
 
   @impl true
@@ -1049,6 +1122,10 @@ defmodule Telelem.Handoff do
 
   @impl true
   def terminate(reason, s) do
+    # Nothing is published from here: an abnormal stop leaves no terminal, so
+    # the receipt can never read complete.
+    s = stop_receipts(s)
+
     unclosed = for id <- s.order, s.attempts[id].cleanup == nil, do: id
 
     if s.outcome == nil or unclosed != [] do
@@ -1076,8 +1153,15 @@ defmodule Telelem.Handoff do
     s |> close_unregistered() |> cancel_others({:lost_to, id})
   end
 
-  defp commit(%{phase: :elected} = s, id),
-    do: %{s | phase: :committed} |> emit({:committed, id}) |> trace({:committed, id})
+  # Commit evidence is recorded once, here, before observer work. For a
+  # finish-first commit (coordinator grant) the marker and the winner's
+  # decision were already sent by release_terminal/2.
+  defp commit(%{phase: :elected} = s, id) do
+    %{s | phase: :committed}
+    |> receipt(:commit)
+    |> emit({:committed, id})
+    |> trace({:committed, id})
+  end
 
   defp commit(s, _id), do: s
 
@@ -1101,6 +1185,9 @@ defmodule Telelem.Handoff do
   # authorized terminal (or any reached outcome) is never rewritten.
   defp authority_lost(s, reason, at) do
     s = trace(%{s | authority_state: :lost}, {:authority_down, at, reason})
+    # Evidence only while no outcome is reached, including an authorized
+    # terminal still awaiting its write acknowledgement.
+    s = if s.outcome == nil, do: receipt(s, :authority_down), else: s
     if s.terminal == nil, do: set_outcome(s, ended(s, {:authority_down, reason})), else: s
   end
 
@@ -1130,6 +1217,9 @@ defmodule Telelem.Handoff do
   defp set_outcome(%{outcome: o} = s, _) when o != nil, do: s
 
   defp set_outcome(s, outcome) do
+    # Terminal evidence before the requester can learn the outcome, so a
+    # lookup made after the notification sees it (unless publication failed).
+    s = receipt(s, :terminal, elem(outcome, 0))
     send(s.requester, {@tag, self(), outcome})
     record_outcome(s, outcome)
   end
@@ -1273,6 +1363,7 @@ defmodule Telelem.Handoff do
       unreported: Enum.reverse(s.unreported)
     }
     |> with_grant_phase(s)
+    |> with_receipts(s)
   end
 
   # Outward views carry only the grant phase: never the token, the op id or
@@ -1372,6 +1463,9 @@ defmodule Telelem.Handoff do
           grant_refused(s, g, :dispatch_deadline)
         else
           GenServer.reply(g.from, :ok)
+          # Dispatch evidence right after the one permission, before anything
+          # else (the permission bit is set first; publication never gates it).
+          s = s |> receipt_permitted() |> receipt(:dispatch)
 
           {:noreply,
            s
@@ -1452,6 +1546,200 @@ defmodule Telelem.Handoff do
       %{s | downstream: :not_tracked} |> record_outcome({:done, p.terminal})
     end
   end
+
+  # ── Receipts (opt-in, see moduledoc) ─────────────────────────────────────
+
+  @doc """
+  Projects the receipt metadata the coordinator may hold from one prepared
+  request: `%{tenant_id, request_id, route_rev, deployment_id, mode}`, with
+  `request_id` the gateway-generated id and `deployment_id` the plan's
+  primary. The body, target, principal subject and deadlines are not part of
+  it. Returns `{:error, :invalid_prepared}` if the plan does not belong to the
+  pinned revision.
+  """
+  @spec receipt_meta(Telelem.Serve.Ingress.Prepared.t()) ::
+          {:ok, map()} | {:error, :invalid_prepared}
+  def receipt_meta(%Telelem.Serve.Ingress.Prepared{} = p) do
+    with %Telelem.Route.Revision{} = rev <- p.revision,
+         %Telelem.Route.Plan{} = plan <- p.plan,
+         true <-
+           plan.rev == rev.rev and plan.digest == rev.digest and p.route_id == rev.route_id and
+             plan.primary in rev.deployments,
+         meta = %{
+           tenant_id: p.tenant_id,
+           request_id: p.gateway_id,
+           route_rev: rev.rev,
+           deployment_id: plan.primary,
+           mode: p.mode
+         },
+         true <- valid_meta?(meta) do
+      {:ok, meta}
+    else
+      _ -> {:error, :invalid_prepared}
+    end
+  end
+
+  def receipt_meta(_), do: {:error, :invalid_prepared}
+
+  # Contract §2 initial ceilings. A handle claiming more is refused: its
+  # fields alone cannot raise the bounds.
+  @receipt_max_pending 256
+  @receipt_max_event_bytes 512
+  @int64_max 0x7FFFFFFFFFFFFFFF
+
+  # `[producer:, store_mode:, meta:]` (keyword list or map, exactly these
+  # keys). Every check is contained: a malformed handle is :error, never a
+  # crash of init.
+  defp receipts_config(opt) do
+    opt = if is_list(opt) and Keyword.keyword?(opt), do: Map.new(opt), else: opt
+
+    with %{} <- opt,
+         false <- is_struct(opt),
+         [:meta, :producer, :store_mode] <- opt |> Map.keys() |> Enum.sort(),
+         %{producer: p, store_mode: mode, meta: meta} <- opt,
+         true <- mode in [:sandbox, :serving] and valid_meta?(meta) and meta.mode == mode,
+         true <- genuine_producer?(p) do
+      %{producer: p, meta: meta}
+    else
+      _ -> :error
+    end
+  catch
+    _, _ -> :error
+  end
+
+  defp valid_meta?(%{} = m) when not is_struct(m) do
+    Enum.sort(Map.keys(m)) == [:deployment_id, :mode, :request_id, :route_rev, :tenant_id] and
+      Telelem.Receipts.Event.valid_id?(m.tenant_id) and
+      Telelem.Receipts.Event.valid_id?(m.request_id) and
+      Telelem.Receipts.Event.valid_id?(m.deployment_id) and is_integer(m.route_rev) and
+      m.route_rev > 0 and m.route_rev <= @int64_max and m.mode in [:sandbox, :serving]
+  end
+
+  defp valid_meta?(_), do: false
+
+  # A handle resolved beforehand with Telelem.Receipts.Store.producer/1. The
+  # coordinator never calls the store; it checks what the existing APIs show
+  # without a message: the pending table exists, is a public :set owned by a
+  # live local Telelem.Receipts.Store, the counters array has the size and
+  # sign the store creates, and the ceilings are within the contract's. The
+  # store's own configured limits and its mode are not observable this way.
+  defp genuine_producer?(
+         %Telelem.Receipts.Producer{
+           table: t,
+           ref: ref,
+           max_pending: mp,
+           max_event_bytes: mb,
+           loss_slots: ls
+         } = p
+       )
+       when map_size(p) == 6 and is_reference(t) and is_integer(mp) and is_integer(mb) and
+              is_integer(ls) and ls > 0 do
+    owner = :ets.info(t, :owner)
+
+    mp in 1..@receipt_max_pending and mb in 1..@receipt_max_event_bytes and is_pid(owner) and
+      node(owner) == node() and
+      :proc_lib.translate_initial_call(owner) == {Telelem.Receipts.Store, :init, 1} and
+      :ets.info(t, :protection) == :public and :ets.info(t, :type) == :set and
+      :ets.info(t, :keypos) == 1 and counters_match?(:atomics.info(ref), ls)
+  end
+
+  defp genuine_producer?(_), do: false
+
+  defp counters_match?(%{size: size, min: min}, loss_slots),
+    do: min < 0 and size == Telelem.Receipts.Producer.counters_size(loss_slots)
+
+  defp counters_match?(_, _), do: false
+
+  defp open_receipts(s, nil), do: s
+
+  # Exactly one writer per coordinator, owned by this process; ingress is
+  # its sequence one.
+  defp open_receipts(s, %{producer: p, meta: m}) do
+    r =
+      case Telelem.Receipts.Writer.open(p, m.tenant_id, m.request_id) do
+        {:ok, w} ->
+          %{writer: w, route_rev: m.route_rev, deployment_id: m.deployment_id, state: :recording}
+
+        {:error, _} ->
+          %{writer: nil, route_rev: nil, deployment_id: nil, state: :disabled}
+      end
+
+    %{s | receipts: Map.merge(r, %{permitted: false, terminal: false})}
+    |> receipt(:ingress)
+  end
+
+  # The permission bit: set when the one dispatch permission is released.
+  # It alone decides exposure of later request-level events.
+  defp receipt_permitted(%{receipts: nil} = s), do: s
+  defp receipt_permitted(%{receipts: r} = s), do: %{s | receipts: %{r | permitted: true}}
+
+  defp stop_receipts(%{receipts: nil} = s), do: s
+
+  defp stop_receipts(%{receipts: r} = s),
+    do: %{s | receipts: %{r | state: :disabled, writer: nil}}
+
+  defp receipt(s, kind, outcome \\ :none)
+
+  defp receipt(%{receipts: %{state: :recording} = r} = s, kind, outcome) do
+    if kind == :terminal and r.terminal do
+      s
+    else
+      publish_receipt(s, r, kind, outcome)
+    end
+  end
+
+  defp receipt(s, _kind, _outcome), do: s
+
+  # One synchronous, non-waiting publication. Every normal result (ok,
+  # dropped, rejected) keeps the advanced writer, so a lost record leaves a
+  # sequence gap and is declared by later records. Anything raised disables
+  # this request's evidence for good: no later record, in particular no
+  # terminal, so the receipt cannot read complete. Never affects the request.
+  defp publish_receipt(s, r, kind, outcome) do
+    {tenant, request} = r.writer.key
+    attempt? = kind in [:dispatch, :commit]
+
+    exposure =
+      cond do
+        attempt? -> :possible
+        kind == :ingress -> :none
+        r.permitted -> :possible
+        true -> :none
+      end
+
+    event = %{
+      tenant_id: tenant,
+      request_id: request,
+      route_rev: r.route_rev,
+      attempt: if(attempt?, do: 1, else: 0),
+      deployment_id: if(attempt?, do: r.deployment_id, else: :none),
+      at_ms: System.monotonic_time(:millisecond),
+      kind: kind,
+      outcome: outcome,
+      exposure: exposure
+    }
+
+    r = if kind == :terminal, do: %{r | terminal: true}, else: r
+
+    {r, result} =
+      try do
+        {result, w} = Telelem.Receipts.Writer.record(r.writer, event)
+        {%{r | writer: w}, receipt_result(result)}
+      catch
+        _, _ -> {%{r | writer: nil, state: :disabled}, :fault}
+      end
+
+    trace(%{s | receipts: r}, {:receipt, kind, result})
+  end
+
+  # Fixed terms only; nothing from the event or the store. Any other result
+  # raises inside publish_receipt/4's try and disables evidence as a fault.
+  defp receipt_result(:ok), do: :ok
+  defp receipt_result({:dropped, reason}) when reason in [:overflow, :store_down], do: :dropped
+  defp receipt_result({:rejected, _}), do: :rejected
+
+  defp with_receipts(map, %{receipts: nil}), do: map
+  defp with_receipts(map, %{receipts: r}), do: Map.put(map, :receipts, r.state)
 
   # ── Helpers ──────────────────────────────────────────────────────────────
 
