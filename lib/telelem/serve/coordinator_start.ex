@@ -31,22 +31,40 @@ defmodule Telelem.Serve.CoordinatorStart do
 
     * **requester** (the caller): creates a scoped alias, then spawns the
       watchdog with `spawn_opt(..., [:monitor])` (unlinked, monitored in one
-      step). Every wait it does is bounded by `S`.
+      step). Every wait it does is bounded by `S`. Only the watchdog is given
+      the alias.
     * **watchdog** (unlinked, traps exits): monitors the requester first;
       only then, if the requester's `:DOWN` is not already delivered and
       `now < S`, spawns the worker with `spawn_link` (linked in the same
-      step). It ends on the first of: the worker's `:EXIT` (the worker is
-      gone), the requester's `:DOWN` or `now >= S`; in the last two cases it
-      sends `exit(worker, :kill)` to the exact worker before it returns
-      `:normal`. If the watchdog is killed instead, its link kills the worker
-      (the worker does not trap exits). The worker therefore never outlives
-      the watchdog.
+      step). It relays the worker's one result, unchanged, to the
+      requester's alias, and ends on the first of: the worker's `:EXIT` (the
+      worker is gone), the requester's `:DOWN` or `now >= S`; in the last two
+      cases it sends `exit(worker, :kill)` to the exact worker before it
+      returns `:normal`. If the watchdog is killed instead, its link kills
+      the worker (the worker does not trap exits). The worker therefore never
+      outlives the watchdog.
     * **worker** (linked to the watchdog, not trapping): if `now < S`, calls
       the public `DynamicSupervisor.start_child/2` once (its wait is
       unbounded, which is why it is not the requester) and sends one
-      sanitized result to the requester's alias: `{:ok, pid}`,
-      `{:refused, category}` (an explicit `{:error, _}` or `:ignore` reply)
-      or `:no_reply` (the call exited). Then it returns.
+      sanitized result to the watchdog: `{:ok, pid}`, `{:refused, category}`
+      (an explicit `{:error, _}` or `:ignore` reply) or `:no_reply` (the
+      call exited). Then it returns.
+
+  ## Why the result goes through the watchdog
+
+  Erlang orders signals only per sender/receiver pair. Had the worker sent
+  its result straight to the requester, the result and the watchdog's
+  `:DOWN` would come from two senders, and the `:DOWN` (for example the
+  watchdog's `:normal` return on the worker's `:EXIT`) could arrive first
+  and hide a result the worker sent before `S`. Because the watchdog itself
+  relays the result before it ends, the relay and the watchdog's `:DOWN`
+  both come from the watchdog and arrive in that order. So when the
+  requester gets the watchdog's `:DOWN`, whatever the reason (`:normal`,
+  `:killed` or anything else), any relayed result is already in its mailbox,
+  and nothing else holds the alias. One check with no wait is then exact; no
+  extra wait is needed after the `:DOWN`. A result the worker sent to a
+  watchdog that was killed before relaying it was never observed by the
+  requester and is `:start_unconfirmed`.
 
   Killing the watchdog or the worker does **not** withdraw a start request
   already queued at the supervisor. The supervisor may still process it: a
@@ -55,15 +73,17 @@ defmodule Telelem.Serve.CoordinatorStart do
   inactive coordinator nobody activates. Such a **late child** stays silent
   (`Telelem.Handoff` "Activation": nothing sent, emitted or published) and
   stops `:normal` at `S`, or earlier on the requester's `:DOWN`. Its startup
-  reply goes to the deactivated alias (dropped by the runtime) or is
-  drained.
+  reply goes to the worker's call, which is dead (dropped by the runtime) or
+  abandoned; a relayed result the requester has not used is drained, or
+  dropped by the runtime once the alias is deactivated.
 
   ## Requester steps
 
     1. `now >= S`: `{:error, {:not_sent, :expired}}`, nothing spawned.
-    2. Wait (bounded by `S`) for the worker's result on the alias, or the
-       watchdog's `:DOWN` (then a result already delivered is still taken).
-       A result counts only if a clock read after receiving it is `< S`.
+    2. Wait (bounded by `S`) for the relayed result on the alias, or the
+       watchdog's `:DOWN` of any reason (then a result already relayed,
+       which is ordered before it, is still taken; see above). A result
+       counts only if a clock read after receiving it is `< S`.
     3. Always, whatever won: send `exit(watchdog, :kill)` to the exact
        watchdog (no wait for it), deactivate the alias, drain results
        already delivered to it, and demonitor the watchdog with `:flush`.
@@ -77,7 +97,9 @@ defmodule Telelem.Serve.CoordinatorStart do
       before `S`; `pid` is active.
     * `{:error, {:not_sent, why}}`: no activation was submitted.
         * `:expired`: `S` was reached before submission (before spawning,
-          or after a timely start, before calling `activate/2`).
+          or after a timely start, before calling `activate/2`, or at
+          `activate/2`'s own pre-send check, which returns
+          `{:error, :activation_expired}`; see below).
         * `{:start_refused, category}`: an explicit refusal reply from the
           supervisor, observed before `S`. `category` is an atom,
           `{:bad_option, atom}`, `{:linked, atom}`, `{:bad_option, :other}`
@@ -92,23 +114,26 @@ defmodule Telelem.Serve.CoordinatorStart do
       `{:error, reason}` (one of the coordinator's documented decisions,
       received before `S`). `pid` is not active, except for `:duplicate`,
       which cannot happen here (this is the child's only activation).
-      `:activation_expired` is included as W1 reports it: either
-      `activate/2`'s own pre-send clock check (nothing sent) or the
-      coordinator's check (it stopped); in both cases nothing was published
-      and it is not active.
     * `{:error, {:unconfirmed, pid}}`: the activation was submitted and no
       reply was received and checked before `S`. `pid` may be active with
       `ingress` published and will then message the requester as any active
       coordinator. Never retry or treat it as "not activated".
+
+  `{:error, :activation_expired}` from `activate/2` is known pre-send and is
+  reported as `{:not_sent, :expired}`. W1 returns it from two places, but
+  only one can reach the caller: `activate/2`'s own clock check before
+  sending (nothing sent). The coordinator replies `:activation_expired` only
+  after its own clock read is `>= S`, and `activate/2` returns a reply only
+  if a later read of the same node's monotonic clock is `< S`, which cannot
+  hold then; such a reply is returned as `{:error, :unconfirmed}`, which
+  stays `{:unconfirmed, pid}` here. Every result after submission therefore
+  stays a decision received before `S` or `{:unconfirmed, pid}`.
 
   ## Known limits
 
     * The bound is a monotonic-clock check, not real-time scheduling: a
       requester scheduled after `S` reports `:start_unconfirmed` or
       `{:unconfirmed, pid}`, never a decision.
-    * `:activation_expired` from `activate/2` does not say whether the
-      request was submitted (W1 API); both cases are "not active, nothing
-      published".
     * The exact watchdog is killed on every return; its worker, if it was
       blocked in `start_child/2`, dies by the link. The supervisor's queued
       request is not withdrawn (see "late child").
@@ -234,8 +259,10 @@ defmodule Telelem.Serve.CoordinatorStart do
         {@tag, ^al, res} ->
           timely(res, s)
 
-        {:DOWN, ^wmon, :process, _, _} ->
-          # A result already delivered (sent before the worker ended) wins.
+        {:DOWN, ^wmon, :process, _, _reason} ->
+          # Any reason. Only the watchdog sends to the alias, and its relay
+          # is ordered before its own :DOWN (one sender), so a relayed result
+          # is already here and nothing can follow: no wait is needed.
           receive do
             {@tag, ^al, res} -> timely(res, s)
           after
@@ -269,17 +296,26 @@ defmodule Telelem.Serve.CoordinatorStart do
   end
 
   defp activate(h, s) do
-    if now() >= s do
-      {:error, {:not_sent, :expired}}
-    else
-      case Handoff.activate(h, s) do
-        :ok -> {:ok, h}
-        {:error, :handoff_down} -> {:error, {:not_sent, :handoff_down}}
-        {:error, :unconfirmed} -> {:error, {:unconfirmed, h}}
-        {:error, reason} -> {:error, {:refused, reason, h}}
-      end
-    end
+    if now() >= s,
+      do: {:error, {:not_sent, :expired}},
+      else: activation_result(Handoff.activate(h, s), h)
   end
+
+  @doc false
+  # The classification of a `Telelem.Handoff.activate/2` result (pure).
+  # `:activation_expired` reaches the caller only from activate/2's pre-send
+  # check (see the module doc), so it is known non-submission.
+  @spec activation_result(term(), pid()) :: result()
+  def activation_result(:ok, h), do: {:ok, h}
+  def activation_result({:error, :activation_expired}, _h), do: {:error, {:not_sent, :expired}}
+  def activation_result({:error, :handoff_down}, _h), do: {:error, {:not_sent, :handoff_down}}
+  def activation_result({:error, :unconfirmed}, h), do: {:error, {:unconfirmed, h}}
+
+  def activation_result({:error, reason}, h) when is_atom(reason),
+    do: {:error, {:refused, reason, h}}
+
+  # Not a documented W1 result: never a decision.
+  def activation_result(_other, h), do: {:error, {:unconfirmed, h}}
 
   # ── watchdog (unlinked; traps exits) ─────────────────────────────────────
 
@@ -296,14 +332,21 @@ defmodule Telelem.Serve.CoordinatorStart do
         :ok
 
       true ->
-        w = spawn_link(__MODULE__, :worker, [Map.take(a, [:alias, :sup, :spec, :limit])])
-        watch(w, rmon, s)
+        w =
+          spawn_link(__MODULE__, :worker, [
+            %{watchdog: self(), sup: a.sup, spec: a.spec, limit: s}
+          ])
+
+        watch(w, a.alias, rmon, s)
     end
   end
 
   # Returns :normal only after the worker's own :EXIT, or after sending the
   # exact worker a kill (its link alone would not end it on a :normal exit).
-  defp watch(w, rmon, s) do
+  # The worker's result is relayed as received; the worker sends it before it
+  # ends (one sender), so it is relayed before its :EXIT is handled, and the
+  # relay is ordered before this process's own :DOWN at the requester.
+  defp watch(w, al, rmon, s) do
     left = s - now()
 
     if left <= 0 do
@@ -311,6 +354,10 @@ defmodule Telelem.Serve.CoordinatorStart do
       :ok
     else
       receive do
+        {@tag, ^w, res} ->
+          send(al, {@tag, al, res})
+          watch(w, al, rmon, s)
+
         {:EXIT, ^w, _} ->
           :ok
 
@@ -318,7 +365,7 @@ defmodule Telelem.Serve.CoordinatorStart do
           Process.exit(w, :kill)
           :ok
       after
-        min(left, @max_wait) -> watch(w, rmon, s)
+        min(left, @max_wait) -> watch(w, al, rmon, s)
       end
     end
   end
@@ -334,7 +381,7 @@ defmodule Telelem.Serve.CoordinatorStart do
   # ── worker (linked to the watchdog; does not trap exits) ─────────────────
 
   @doc false
-  def worker(%{alias: al, sup: sup, spec: spec, limit: s}) do
+  def worker(%{watchdog: wd, sup: sup, spec: spec, limit: s}) do
     if now() < s do
       res =
         try do
@@ -343,7 +390,9 @@ defmodule Telelem.Serve.CoordinatorStart do
           _, _ -> :no_reply
         end
 
-      send(al, {@tag, al, sanitize(res)})
+      # To the watchdog, which relays it (see "Why the result goes through
+      # the watchdog"); never to the requester directly.
+      send(wd, {@tag, self(), sanitize(res)})
     end
 
     :ok

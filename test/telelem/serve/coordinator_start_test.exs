@@ -319,9 +319,12 @@ defmodule Telelem.Serve.CoordinatorStartTest do
       assert now() < s
       assert %{activation: :inactive} = Handoff.status(h)
 
-      # The worker delivered its result and returned; the watchdog then
-      # returned :normal on its :EXIT (the suspended requester killed nothing).
-      assert_receive {:trace, ^worker, :send, {_, _, {:ok, ^h}}, _alias}, @t
+      # The worker sent its result to the watchdog, which relayed it to the
+      # requester's alias; both then returned :normal (the suspended
+      # requester killed nothing).
+      al = alias_of!()
+      assert_receive {:trace, ^worker, :send, {_, ^worker, {:ok, ^h}}, ^wd}, @t
+      assert_receive {:trace, ^wd, :send, {_, ^al, {:ok, ^h}}, ^al}, @t
       assert_receive {:DOWN, ^kmon, :process, _, :normal}, @t
       assert_receive {:DOWN, ^wmon, :process, _, :normal}, @t
 
@@ -589,7 +592,160 @@ defmodule Telelem.Serve.CoordinatorStartTest do
     req_quiet!(r)
   end
 
+  # ── result ordering: one sender ─────────────────────────────────────────
+
+  test "the worker's result goes only to the watchdog, which relays it before its own :normal :DOWN (one sender); the requester takes it",
+       ctx do
+    r = requester()
+    {opts, col} = trusted(ctx, r, "relay")
+    s = now() + 30_000
+    tr = traced!(:coordinator_start_relay, r)
+    :ok = :sys.suspend(ctx.sup)
+    ref = req_do(r, fn -> CoordinatorStart.start(ctx.sup, s, opts) end)
+    {wd, worker} = blocked!(tr, ctx.sup)
+    al = alias_of!()
+    wmon = Process.monitor(wd)
+    kmon = Process.monitor(worker)
+    # The requester cannot run: the relay and the watchdog's :DOWN both
+    # queue in its mailbox before it looks.
+    true = :erlang.suspend_process(r.req)
+
+    h =
+      try do
+        :ok = :sys.resume(ctx.sup)
+        assert [{:undefined, h, :worker, [Handoff]}] = DynamicSupervisor.which_children(ctx.sup)
+        assert_receive {:DOWN, ^kmon, :process, _, :normal}, @t
+        # The watchdog's :normal return on the worker's :EXIT.
+        assert_receive {:DOWN, ^wmon, :process, _, :normal}, @t
+
+        # The worker's only send after its start call: its result, to the
+        # watchdog. It never sends to the requester or its alias.
+        assert [{:send, {_, ^worker, {:ok, ^h}}, ^wd}] =
+                 for({:send, _, _} = e <- split!(tr, worker), do: e)
+
+        # The watchdog's only send: the relay to the alias, before it ends.
+        wd_events = split!(tr, wd)
+        assert [{:send, {_, ^al, {:ok, ^h}}, ^al}] = for({:send, _, _} = e <- wd_events, do: e)
+        relay = index!(wd_events, &match?({:send, _, ^al}, &1))
+        ended = index!(wd_events, &match?({:exit, :normal}, &1))
+        assert relay < ended, inspect(wd_events)
+
+        # In the requester's mailbox the relay precedes the watchdog's :DOWN.
+        assert {:messages, msgs} = Process.info(r.req, :messages)
+        got = index!(msgs, &match?({_, ^al, {:ok, ^h}}, &1))
+        down = index!(msgs, &match?({:DOWN, _, :process, ^wd, :normal}, &1))
+        assert got < down, inspect(msgs)
+        h
+      after
+        :trace.session_destroy(tr)
+        true = :erlang.resume_process(r.req)
+      end
+
+    # Taken (before s) and activated.
+    assert_receive {:req_did, ^ref, {:ok, ^h}}, @t
+    assert now() < s
+    assert %{activation: :active} = Handoff.status(h)
+    assert [{:ingress, 0, :none, :none, :none}] = events!(ctx.store, "relay")
+    assert [{:receipt, :ingress, :ok}, :activated] = collected(col)
+    assert {:monitors, []} = Process.info(r.req, :monitors)
+    req_quiet!(r)
+  end
+
+  # ── activation result classification ────────────────────────────────────
+
+  test "activate/2 results: :activation_expired is known pre-send ({:not_sent, :expired}); after submission no decision stays unconfirmed" do
+    test = self()
+    # Forwards everything it receives: nothing may be submitted to it.
+    p = spawn(fn -> fwd_loop(test) end)
+    on_exit(fn -> Process.exit(p, :kill) end)
+
+    # The real W1 result of activate/2's own pre-send check (equality expires).
+    assert {:error, :activation_expired} = w1 = Handoff.activate(p, now())
+    assert {:error, {:not_sent, :expired}} = CoordinatorStart.activation_result(w1, p)
+    send(p, :barrier)
+    assert_receive {:fwd, :barrier}, @t
+    refute_received {:fwd, _}
+
+    for {w1, expected} <- [
+          {:ok, {:ok, p}},
+          {{:error, :activation_expired}, {:error, {:not_sent, :expired}}},
+          {{:error, :handoff_down}, {:error, {:not_sent, :handoff_down}}},
+          {{:error, :unconfirmed}, {:error, {:unconfirmed, p}}},
+          {{:error, :receipts_unbound}, {:error, {:refused, :receipts_unbound, p}}},
+          {{:error, :not_requester}, {:error, {:refused, :not_requester, p}}},
+          {{:error, :activation_limit_mismatch},
+           {:error, {:refused, :activation_limit_mismatch, p}}},
+          {{:error, :duplicate}, {:error, {:refused, :duplicate, p}}},
+          {{:error, :no_activation}, {:error, {:refused, :no_activation, p}}},
+          # Not a documented W1 result: never a decision.
+          {{:error, {:not, :documented}}, {:error, {:unconfirmed, p}}},
+          {:surprise, {:error, {:unconfirmed, p}}}
+        ] do
+      assert CoordinatorStart.activation_result(w1, p) == expected, inspect(w1)
+    end
+  end
+
+  test "the coordinator's own :activation_expired reply (decided at s) is never a pre-send result: {:unconfirmed, h}, nothing published",
+       ctx do
+    r = requester()
+    {opts, col} = trusted(ctx, r, "coord-expired")
+    s = now() + @window
+    tr = traced!(:coordinator_start_coord_expired, r)
+    :ok = :sys.suspend(ctx.sup)
+    ref = req_do(r, fn -> CoordinatorStart.start(ctx.sup, s, opts) end)
+    {_wd, _worker} = blocked!(tr, ctx.sup)
+    # Hold the requester, let the start complete, then hold the coordinator.
+    true = :erlang.suspend_process(r.req)
+    :ok = :sys.resume(ctx.sup)
+    assert [{:undefined, h, :worker, [Handoff]}] = DynamicSupervisor.which_children(ctx.sup)
+    hmon = Process.monitor(h)
+    true = :erlang.suspend_process(h)
+    htr = :trace.session_create(:coordinator_start_coord_expired_h, self(), [])
+    1 = :trace.process(htr, h, true, [:send])
+
+    try do
+      true = :erlang.resume_process(r.req)
+      # Timely start result: the one activation is submitted before s.
+      assert_receive {:trace, _, :send, {:"$gen_call", _, {:activate, ^s}}, ^h}, @t
+      assert now() < s
+      true = :erlang.suspend_process(r.req)
+      wait_until(s)
+
+      # The coordinator handles the queued activation at or after s and
+      # replies :activation_expired (it stops, inactive and silent).
+      true = :erlang.resume_process(h)
+      assert_receive {:trace, ^h, :send, {_, {:error, :activation_expired}}, _}, @t
+      assert_receive {:DOWN, ^hmon, :process, _, :normal}, @t
+    after
+      :trace.session_destroy(htr)
+      :trace.session_destroy(tr)
+      # Badarg if a failed step left it running.
+      _ =
+        try do
+          :erlang.resume_process(r.req)
+        catch
+          :error, :badarg -> :running
+        end
+    end
+
+    # Submitted: reported unconfirmed (observed at or after s), never
+    # {:not_sent, :expired} and never a refusal.
+    assert_receive {:req_did, ^ref, {:error, {:unconfirmed, ^h}}}, @t
+    assert collected(col) == []
+    assert Store.stats(ctx.store).receipts == 0
+    assert {:monitors, []} = Process.info(r.req, :monitors)
+    req_quiet!(r)
+  end
+
   # ── helpers ─────────────────────────────────────────────────────────────
+
+  defp fwd_loop(test) do
+    receive do
+      m -> send(test, {:fwd, m})
+    end
+
+    fwd_loop(test)
+  end
 
   # The trusted options in the fixed order of `trusted_keys/0`.
   defp trusted(ctx, _r, request_id, over \\ []) do
