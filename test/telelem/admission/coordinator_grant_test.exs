@@ -75,7 +75,13 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
   test "opt-in is explicit and validated; without it the status shape is unchanged", ctx do
     req = idle()
     d = now() + 60_000
-    base = [requester: req, attempts: [:p], admission_authority: ctx.auth, terminal_deadline: d]
+
+    base = [
+      requester: req,
+      attempts: [:primary],
+      admission_authority: ctx.auth,
+      terminal_deadline: d
+    ]
 
     for bad <- [
           [coordinator_grant: {:one_primary, 0}],
@@ -84,7 +90,16 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
           [coordinator_grant: {:one_primary, :four}],
           [coordinator_grant: {:two_primaries, @units}],
           [coordinator_grant: @units],
-          [coordinator_grant: {:one_primary, @units}, attempts: [:p, :q]]
+          [coordinator_grant: {:one_primary, @units}, attempts: [:primary, :q]],
+          [coordinator_grant: {:one_primary, @units}, attempts: [:q, :primary]],
+          [coordinator_grant: {:one_primary, @units}, attempts: [:primary, :backup]],
+          # The single attempt must be the primary role, not any singleton.
+          [coordinator_grant: {:one_primary, @units}, attempts: [:backup]],
+          [coordinator_grant: {:one_primary, @units}, attempts: [nil]],
+          [coordinator_grant: {:one_primary, @units}, attempts: [:p]],
+          [coordinator_grant: {:one_primary, @units}, attempts: ["primary"]],
+          [coordinator_grant: {:one_primary, @units}, attempts: [{:primary, 0}]],
+          [coordinator_grant: {:one_primary, @units}, attempts: [0]]
         ] do
       assert {:error, {:bad_option, :coordinator_grant}} =
                Handoff.start(Keyword.merge(base, bad)),
@@ -95,7 +110,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert {:error, {:bad_option, :coordinator_grant}} =
              Handoff.start(
                requester: req,
-               attempts: [:p],
+               attempts: [:primary],
                authority: idle(),
                terminal_deadline: d,
                coordinator_grant: {:one_primary, @units}
@@ -105,10 +120,17 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert {:error, {:bad_option, :terminal_deadline}} =
              Handoff.start(
                requester: req,
-               attempts: [:p],
+               attempts: [:primary],
                admission_authority: ctx.auth,
                coordinator_grant: {:one_primary, @units}
              )
+
+    # Legacy modes keep accepting any unique attempt ids.
+    for ids <- [[:backup], [nil], [:p], [:p, :q]] do
+      {:ok, legacy} = Handoff.start(Keyword.put(base, :attempts, ids))
+      refute Map.has_key?(Handoff.status(legacy), :grant)
+      Process.exit(legacy, :kill)
+    end
 
     {:ok, h} = Handoff.start(base)
     on_exit(fn -> Process.exit(h, :kill) end)
@@ -131,7 +153,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert %{owner: ^fake, state: :reserved, units: @units} = g
     assert {:process, fake} in elem(Process.info(ctx.auth, :monitors), 1)
 
-    assert %{grant: :reserved, attempts: %{p: %{pid: ^fake, dispatched: false}}} =
+    assert %{grant: :reserved, attempts: %{primary: %{pid: ^fake, dispatched: false}}} =
              Handoff.status(h)
 
     assert {:ok, :simulated} = step!(fake, :connect)
@@ -140,13 +162,13 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert_receive {:fake_http, ^fake, @http_marker}, @t
     assert Authority.snapshot(ctx.auth).grants[gid].state == :dispatched
     status = Handoff.status(h)
-    assert %{grant: :authorized, attempts: %{p: %{dispatched: true}}} = status
+    assert %{grant: :authorized, attempts: %{primary: %{dispatched: true}}} = status
 
     assert :release = step!(fake, :ready)
     assert :ok = step!(fake, {:transfer, "chunk"})
     assert :ok = step!(fake, {:finish, :t, @marker})
 
-    assert_receive {:req, {:telelem_handoff, ^h, {:elected, :p}}}, @t
+    assert_receive {:req, {:telelem_handoff, ^h, {:elected, :primary}}}, @t
     assert_receive {:req, {:telelem_handoff, ^h, {:data, "chunk"}}}, @t
     assert_receive {:req, {:telelem_handoff, ^h, {:data, @marker}}}, @t
     assert_receive {:req, {:telelem_handoff, ^h, {:done, :t}}}, @t
@@ -155,7 +177,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert :ok = step!(fake, {:cleanup, :possible})
     assert_receive {:req, {:telelem_handoff, ^h, {:closed, report}}}, @t
     assert_receive {:DOWN, ^hmon, :process, _, :normal}, @t
-    assert %{outcome: {:done, :t}, grant: :authorized, possible_charges: [:p]} = report
+    assert %{outcome: {:done, :t}, grant: :authorized, possible_charges: [:primary]} = report
 
     # One reserve, one authorize, one terminal request; no cancel, settle or retry.
     assert [{:reserve, _, ^fake, @units}, {:authorize, ^gid}, :terminal] =
@@ -194,7 +216,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
       assert :release = step!(fake, :ready)
 
       fref = step_async(fake, {:finish, :t, @marker})
-      assert_receive {:ev_blocked, ^gate, {:committed, :p}}, @t
+      assert_receive {:ev_blocked, ^gate, {:committed, :primary}}, @t
 
       # The coordinator is still inside the callback: everything below was
       # sent before it.
@@ -243,7 +265,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
              phase: :open,
              winner: nil,
              grant: :reserved,
-             attempts: %{p: %{ready: false, dispatched: false}}
+             attempts: %{primary: %{ready: false, dispatched: false}}
            } = Handoff.status(h)
 
     assert Authority.snapshot(ctx.auth).grants[gid].state == :reserved
@@ -264,7 +286,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
 
     assert {:error, :deadline_required} = step!(fake, {:attach, []})
     assert {:error, :deadline_required} = step!(fake, {:attach, [deadline: d + 1]})
-    assert %{attempts: %{p: %{pid: nil}}, grant: :idle} = Handoff.status(h)
+    assert %{attempts: %{primary: %{pid: nil}}, grant: :idle} = Handoff.status(h)
     assert Authority.snapshot(ctx.auth).grants == %{}
 
     assert {:ok, _} = step!(fake, :attach)
@@ -323,8 +345,8 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     leave!(ctx, fake, gid)
     assert_ledger!(ctx, gid, :unresolved, encumbered: @units, available: @left)
 
-    refute {:grant, :p, :authorized} in collected(r)
-    assert {:grant, :p, {:abandoned, :authorizing}} in collected(r)
+    refute {:grant, :primary, :authorized} in collected(r)
+    assert {:grant, :primary, {:abandoned, :authorizing}} in collected(r)
     assert [{:reserve, _, ^fake, @units}, {:authorize, ^gid}] = authority_requests!(ctx.auth, h)
     refute_received {:fake_http, _, _}
     assert_private!(ctx, r, gid, [])
@@ -352,7 +374,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert %{grant: :abandoned, outcome: {:failed, :client_gone}} = Handoff.status(h)
     assert {:messages, []} = Process.info(h, :messages)
     assert [{:process, _}] = for(m <- monitors(h), m == {:process, ctx.auth}, do: m)
-    refute {:grant, :p, :authorized} in collected(r)
+    refute {:grant, :primary, :authorized} in collected(r)
     assert_ledger!(ctx, gid, :dispatched, active: 1, encumbered: @units, available: @left)
     refute_received {:fake_http, _, _}
   end
@@ -391,7 +413,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
       :ok = :sys.resume(h)
       assert {:cancel, :dispatch_deadline} = await_step!(fake, ref)
       assert_receive {:req, {:telelem_handoff, ^h, {:failed, :dispatch_deadline}}}, @t
-      assert {:grant, :p, {:refused, :dispatch_deadline}} in collected(r)
+      assert {:grant, :primary, {:refused, :dispatch_deadline}} in collected(r)
 
       if @stage == :authorize do
         assert_receive {:fake_gate, ^fake, {:closed, {:not_permitted, _}}}, @t
@@ -460,7 +482,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
         end
 
       assert now() < d, "setup took longer than the #{@window} ms window"
-      assert_receive {:tr, {:grant_deadline, :p, @phase}}, max(d - now(), 0) + @t
+      assert_receive {:tr, {:grant_deadline, :primary, @phase}}, max(d - now(), 0) + @t
       assert_receive {:req, {:telelem_handoff, ^h, {:failed, :dispatch_deadline}}}, @t
 
       if ref, do: assert({:cancel, :dispatch_deadline} = await_step!(fake, ref))
@@ -539,7 +561,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     leave!(ctx, fake, gid)
     assert_ledger!(ctx, gid, :released, available: @limit)
     assert [{:reserve, _, ^fake, @units}] = authority_requests!(ctx.auth, h)
-    assert {:grant, :p, {:abandoned, :reserving}} in collected(r)
+    assert {:grant, :primary, {:abandoned, :reserving}} in collected(r)
   end
 
   test "requester cancel while reserved/connecting: no authorize is ever sent; owner exit releases",
@@ -596,7 +618,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
 
       assert_receive {:req, {:telelem_handoff, ^h, {:failed, :no_winner}}}, @t
       assert_receive {:req, {:telelem_handoff, ^h, {:closed, report}}}, @t
-      assert %{grant: :abandoned, attempts: %{p: %{cleanup: {:down, :killed}}}} = report
+      assert %{grant: :abandoned, attempts: %{primary: %{cleanup: {:down, :killed}}}} = report
 
       if @stage == :reserve do
         # Not applied yet, so the authority does not monitor the owner: the
@@ -686,7 +708,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
 
     :ok = :sys.suspend(h)
     ref = step_async(fake, :attach)
-    await_mailbox!(h, &match?([{:"$gen_call", {^fake, _}, {:attach, :p, _}}], &1))
+    await_mailbox!(h, &match?([{:"$gen_call", {^fake, _}, {:attach, :primary, _}}], &1))
 
     amon = Process.monitor(ctx.auth)
     Process.exit(ctx.auth, :kill)
@@ -703,7 +725,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert [{:authority_down, :open, :killed}] = for({:authority_down, _, _} = e <- evs, do: e)
 
     assert index!(evs, {:authority_down, :open, :killed}) <
-             index!(evs, {:grant, :p, {:abandoned, :reserving}})
+             index!(evs, {:grant, :primary, {:abandoned, :reserving}})
 
     # The successor authority never saw a request for this attempt.
     assert_receive {:telelem_admission, _, {:authority_up, new, 2}}, @t
@@ -734,7 +756,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     evs = collected(r)
     assert [_] = for({:authority_down, _, _} = e <- evs, do: e)
     down = index!(evs, {:authority_down, :open, :killed})
-    abandoned = index!(evs, {:grant, :p, {:abandoned, :authorizing}})
+    abandoned = index!(evs, {:grant, :primary, {:abandoned, :authorizing}})
 
     # pinned first: handled as the authority's :DOWN, then the request is
     # abandoned; request monitor first: check_response's :DOWN, then the loss.
@@ -785,7 +807,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
 
     base = [
       requester: req,
-      attempts: [:p],
+      attempts: [:primary],
       admission_authority: ctx.auth,
       terminal_deadline: d,
       coordinator_grant: {:one_primary, @units},
@@ -846,7 +868,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
         fake_loop(%{
           test: test,
           h: r.h,
-          id: :p,
+          id: :primary,
           d: r.d,
           amon: Process.monitor(r.auth),
           connected: false,
@@ -960,10 +982,10 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
   defp intruder_loop(test, h, d) do
     receive do
       {:do, ref, :attach} ->
-        send(test, {:intruded, ref, Handoff.attach(h, :p, deadline: d)})
+        send(test, {:intruded, ref, Handoff.attach(h, :primary, deadline: d)})
 
       {:do, ref, :begin_dispatch} ->
-        send(test, {:intruded, ref, Handoff.begin_dispatch(h, :p, deadline: d)})
+        send(test, {:intruded, ref, Handoff.begin_dispatch(h, :primary, deadline: d)})
     end
 
     intruder_loop(test, h, d)
@@ -1031,7 +1053,7 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     evs
   end
 
-  defp grant_phases(r), do: for({:grant, :p, p} <- collected(r), do: p)
+  defp grant_phases(r), do: for({:grant, :primary, p} <- collected(r), do: p)
 
   defp index!(list, x) do
     i = Enum.find_index(list, &(&1 == x))

@@ -132,8 +132,8 @@ defmodule Telelem.Handoff do
 
   Off by default; without it nothing below applies and every shape above is
   unchanged. It requires `:admission_authority` (the pinned local
-  authority), `:terminal_deadline` and exactly one attempt id (the primary,
-  no successor). `units` is a trusted positive integer. The coordinator then
+  authority), `:terminal_deadline` and `attempts: [:primary]` exactly (one
+  attempt, the primary, no successor; any other id or list is refused). `units` is a trusted positive integer. The coordinator then
   owns the admission calls for that attempt, through
   `Telelem.Admission.Authority.send_reserve/4` / `send_authorize/2` to the
   pinned pid (never re-resolved), so it never blocks on the authority:
@@ -303,7 +303,7 @@ defmodule Telelem.Handoff do
       `:never_registered`.
     * `:coordinator_grant`. Default `nil`. `{:one_primary, units}` opts in to
       "Coordinator grant". Requires `:admission_authority`,
-      `:terminal_deadline` and a single attempt id.
+      `:terminal_deadline` and `attempts: [:primary]` exactly.
   """
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -1287,7 +1287,7 @@ defmodule Telelem.Handoff do
   defp valid_grant_opt?({:one_primary, units}, admission, ids, deadline),
     do:
       is_integer(units) and units > 0 and admission != nil and is_integer(deadline) and
-        match?([_], ids)
+        ids == [:primary]
 
   defp valid_grant_opt?(_, _, _, _), do: false
 
