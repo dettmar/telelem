@@ -31,9 +31,9 @@ defmodule Telelem.Serve.Diagnostics do
       would then report no handlers rather than an error); or `:unknown`
       for any other form, including a known tag with any other function of
       arity 2 (the function `telemetry:execute/3` dispatches through would
-      then not be the one `telemetry:list_handlers/1` reflects), for a
-      descriptor that changed during the observation, or if it could not be
-      read.
+      then not be the one `telemetry:list_handlers/1` reflects), when the
+      two descriptor samples described under Limits differ or classify
+      differently, or if it could not be read.
     * `telemetry_handlers`: `:none` when no handler is attached to an event
       under `[:bandit]` or `[:thousand_island]`, `:present`, or
       `:unobservable` (always so unless the registry is `:ets` or
@@ -58,24 +58,16 @@ defmodule Telelem.Serve.Diagnostics do
   other prefixes (such as `[:plug]`), tracing, `:sys` debugging or crash
   dumps. Telemetry events are still executed when no handler is attached.
 
-  The snapshot is a sequence of separate reads (the registry descriptor,
-  each telemetry prefix in turn, the descriptor again, then the primary
-  level, handler IDs and module levels), not one atomic view. An `:ok` therefore does not establish that
-  all of these were quiet at the same instant: a handler or level may have
-  appeared before one read and been removed before another. The registry
-  descriptor is sampled twice, once before and once after the handler
-  lookups, and only those two samples are compared. The result is
-  `:unknown` when the two samples differ, or when the second sample does
-  not classify as the first did; the latter can happen with an unchanged
-  descriptor, for example if the registry process or table owner changed
-  in between. A change that is reverted before the second sample leaves
-  the two samples equal and is not detected, in either form. In the
-  `:ets` form attaching or detaching a handler changes only the table and
-  stores an equal descriptor, so such a change during or between the
-  per-prefix lookups is not detected even when it is not reverted. In the
-  `:persistent_term` form the descriptor carries the handler map, so a
-  handler change in that window is detected only if the second sample
-  still differs from the first.
+  The snapshot is built from separate reads, not one atomic view, so an
+  `:ok` does not establish that everything was quiet at the same instant.
+  Only when the first registry descriptor sample classifies as `:ets` or
+  `:persistent_term` are the prefix lookups made and a second sample taken
+  after them; the registry is then `:unknown` unless the second sample is
+  identical to the first and classifies the same. This compares two
+  samples, not the history between them: matching samples do not rule out
+  changes in between, including a handler attached and removed around a
+  prefix lookup, whether or not that lookup observed it. The lookups stop
+  at the first prefix with a handler, so a later prefix may not be read.
   """
 
   @codes [

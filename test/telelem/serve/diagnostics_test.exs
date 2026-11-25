@@ -271,38 +271,42 @@ defmodule Telelem.Serve.DiagnosticsTest do
   end
 
   describe "observe/0 (live, read-only)" do
+    # Every live assertion below is on a boolean from a helper that accepts
+    # any term, so a failure reports only a fixed message, never a raw key,
+    # value, snapshot or Logger/telemetry configuration.
     test "returns only fixed atoms and changes nothing it reads" do
       before = global_state()
       snapshot = Diagnostics.observe()
-      # Compared as a boolean so a failure reports no raw Logger or
-      # telemetry configuration.
       unchanged? = global_state() == before
       assert unchanged?, "observe/0 changed Logger, telemetry or process state"
 
-      # Shape and values are checked as booleans so a failure reports only a
-      # fixed message, never a raw unexpected key or value.
-      keys_ok? = Enum.sort(Map.keys(snapshot)) == Enum.sort(Map.keys(@allowed))
-
-      assert keys_ok?, "observe/0 returned an unexpected snapshot shape"
-
-      values_ok? = Enum.all?(snapshot, fn {key, value} -> value in @allowed[key] end)
-      assert values_ok?, "observe/0 returned a value outside the documented atoms"
+      assert snapshot_ok?(snapshot),
+             "observe/0 returned an unexpected snapshot shape or a value outside the documented atoms"
     end
 
     test "agrees with what the pinned test environment can independently observe" do
       snapshot = Diagnostics.observe()
-      %{level: level} = :logger.get_primary_config()
 
-      assert snapshot.logger_level == if(level == :none, do: :none, else: :other)
+      level =
+        case :logger.get_primary_config() do
+          %{level: :none} -> :none
+          %{level: _} -> :other
+          _ -> :unobservable
+        end
 
-      assert snapshot.logger_handlers ==
-               if(:logger.get_handler_ids() == [], do: :none, else: :present)
+      assert field?(snapshot, :logger_level, level),
+             "logger_level disagrees with the primary Logger level"
+
+      handlers = if :logger.get_handler_ids() == [], do: :none, else: :present
+
+      assert field?(snapshot, :logger_handlers, handlers),
+             "logger_handlers disagrees with the installed Logger handlers"
 
       # The telemetry application is started under `mix test` and nothing in
       # this suite persists the registry, so the live descriptor is the ETS
-      # form with its exact pinned dispatch function (checked as a boolean so
-      # nothing raw is reported).
-      assert snapshot.telemetry_registry == :ets
+      # form with its exact pinned dispatch function.
+      assert field?(snapshot, :telemetry_registry, :ets),
+             "telemetry_registry is not :ets"
 
       pinned = &:telemetry_ets.list_for_event/2
 
@@ -315,7 +319,8 @@ defmodule Telelem.Serve.DiagnosticsTest do
         :telemetry.list_handlers([:bandit]) != [] or
           :telemetry.list_handlers([:thousand_island]) != []
 
-      assert snapshot.telemetry_handlers == if(attached?, do: :present, else: :none)
+      assert field?(snapshot, :telemetry_handlers, if(attached?, do: :present, else: :none)),
+             "telemetry_handlers disagrees with the attached Bandit/Thousand Island handlers"
     end
 
     test "check/0 refuses under the ordinary test Logger and returns only codes" do
@@ -327,6 +332,24 @@ defmodule Telelem.Serve.DiagnosticsTest do
       assert codes == Enum.filter(@codes, &(&1 in codes))
     end
   end
+
+  # Untyped on purpose: any term is accepted and only a boolean returned.
+  defp snapshot_ok?(%{} = snapshot) when map_size(snapshot) == map_size(@allowed) do
+    Enum.all?(@allowed, fn {key, allowed} ->
+      case Map.fetch(snapshot, key) do
+        {:ok, value} -> value in allowed
+        :error -> false
+      end
+    end)
+  end
+
+  defp snapshot_ok?(_), do: false
+
+  # `is_map_key/2` fails the guard for a non-map or a missing key.
+  defp field?(snapshot, key, expected) when is_map_key(snapshot, key),
+    do: :erlang.map_get(key, snapshot) === expected
+
+  defp field?(_snapshot, _key, _expected), do: false
 
   defp global_state do
     {:logger.get_primary_config(), Enum.sort(:logger.get_handler_ids()),
