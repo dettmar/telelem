@@ -1,27 +1,52 @@
 #!/bin/bash
-# Foreground route-store provision and start commands (M2a, TEL-015 local slice).
+# Foreground route-store provision, start and boot-validated commands (M2a, TEL-015
+# local slice).
 #
 #   scripts/route-store/provision --store HOST_DIR --tenant T --route R \
 #       --deployments A,B --preferred A --fallback-on-refusal true|false \
 #       --deadline-ms N --max-attempts 1|2
 #   scripts/route-store/start --store HOST_DIR --tenant T --route R
+#   scripts/route-store/boot-validated --store HOST_DIR --boot BOOT_DIR \
+#       --image-id sha256:HEX64 --manifest-sha256 HEX64 --tenant T --route R
 #
-# Optional on both: --container-name NAME (default: unique telelem-route-store-*).
+# Optional on all: --container-name NAME (default: unique telelem-route-store-*).
 # Harness only (start): --harness-control attaches stdin for the lifecycle suite; see
 # scripts/route-store/main.exs. It is not an operations interface.
 #
-# Both run one foreground `docker run --rm` of the pinned runner image. The lock
+# Each runs one foreground `docker run --rm` of the runner image. The lock
 # wrapper runs INSIDE that container as the writer's entry point, on the store
 # bind-mounted at /sbx/store, and execs the BEAM that calls Telelem.Ops.FileStore
 # (scripts/with-route-store-lock README, rule 6). The container has no network
 # (--network none), a read-only rootfs, no capabilities, no-new-privileges and the
 # caller's uid/gid. The only writable host path it sees is HOST_DIR (at /sbx/store;
 # /sbx itself is part of the read-only rootfs). The checkout as a whole is not
-# mounted: only the five store sources, this directory and the wrapper, all
+# mounted: only the store sources, this directory and the wrapper, all
 # read-only. Startup never provisions; provisioning is only ever create-only.
 #
+# boot-validated is `start` with a boot preflight (main.exs, boot_check.ex) and a
+# narrower container:
+#   - Image: exactly --image-id, a full local image ID the operator approved in advance
+#     (e.g. `docker image inspect -f '{{.Id}}' TAG` after scripts/setup). It must be
+#     present locally under that ID; the run is by ID with --pull never. TELELEM_IMAGE
+#     is refused in this mode. The launcher does not establish where the image came
+#     from; that is the operator's approval.
+#   - Mounts: the closed fixed set (nine sources, this directory, the wrapper, and
+#     BOOT_DIR read-only at /sbx/boot); HOST_DIR at /sbx/store is the only writable
+#     application bind. The BEAM re-checks this set in /proc/self/mountinfo.
+#   - Environment: the container command is `env -i` with a fixed list (no host or
+#     image values); entry.sh and main.exs check the actual env.
+#   - Output: --log-driver none (no daemon-side log file), fixed messages only.
+#   - argv: only the flags above. No key material is ever on argv, in env or in the
+#     image: keys are files in BOOT_DIR (see boot_check.ex for its manifest).
+#
+# Trust assumptions (not checked, not claimed): the local docker daemon and the
+# approved image are trusted; BOOT_DIR is a trusted local staging directory that
+# nothing untrusted writes while this runs. The read-only bind only stops the
+# container from writing it; nothing here makes the host copy immutable. The BEAM
+# hashes each staged file once and uses only the bytes it hashed.
+#
 # Exit status: the writer's (see main.exs: 0 ok, 2 usage/contract, 3 store refused,
-# 4 lock not held), the wrapper's (75 busy, 64/69/70/78; stderr
+# 4 lock not held, 5 boot check refused), the wrapper's (75 busy, 64/69/70/78; stderr
 # "with-route-store-lock:"), docker's (125-127), 128+N for a signal, or 2 from this
 # launcher (stderr "route-store:") for usage, host-side precondition or missing
 # prerequisite, before any container starts.
@@ -37,68 +62,133 @@ die() { printf '%s: %s\n' "$ME" "$*" >&2; exit 2; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}"
 WRAP="$ROOT/scripts/with-route-store-lock"
 SRC=(ops/boundary.ex ops/plan_digest.ex ops/file_store.ex route/revision.ex sandbox/path_policy.ex)
+BOOT_SRC=(sandbox/id.ex sandbox/bindings.ex sandbox/verified_target.ex sandbox/bootstrap.ex)
 
-(($# >= 1)) || die "usage: launch provision|start --store HOST_DIR ..."
+(($# >= 1)) || die "usage: launch provision|start|boot-validated --store HOST_DIR ..."
 mode=$1
 shift
-case $mode in provision | start) ;; *) die "unknown mode '$mode' (provision|start)" ;; esac
+case $mode in
+  provision | start) IMAGE="${TELELEM_IMAGE:-telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0}" ;;
+  boot-validated) [[ ! -v TELELEM_IMAGE ]] || die "TELELEM_IMAGE is not used by boot-validated; pass --image-id" ;;
+  *) die "unknown mode '$mode' (provision|start|boot-validated)" ;;
+esac
 
-store= name= harness=0 pass=()
-while (($#)); do
-  case $1 in
-    --store) (($# >= 2)) || die "--store needs a value"; store=$2; shift 2 ;;
-    --container-name) (($# >= 2)) || die "--container-name needs a value"; name=$2; shift 2 ;;
-    --harness-control)
-      [[ $mode == start ]] || die "--harness-control is only for start"
-      harness=1 pass+=("$1"); shift ;;
-    --dir | --dir=*) die "--dir is fixed by the launcher; use --store HOST_DIR" ;;
-    --store=* | --container-name=*) die "use '${1%%=*} VALUE', not '${1%%=*}=VALUE'" ;;
-    *) pass+=("$1"); shift ;;
-  esac
-done
+store= name= harness=0 pass=() boot= image_id= msha= tenant= route=
+if [[ $mode == boot-validated ]]; then
+  # Closed argv: each flag once, nothing passed through unchecked.
+  while (($#)); do
+    case $1 in
+      --store | --container-name | --boot | --image-id | --manifest-sha256 | --tenant | --route)
+        (($# >= 2)) || die "$1 needs a value"
+        v=${1#--}
+        v=${v//-/_}
+        case $v in store | boot | tenant | route) ;; container_name) v=name ;; image_id) ;; manifest_sha256) v=msha ;; esac
+        [[ -z ${!v} ]] || die "$1 given twice"
+        printf -v "$v" '%s' "$2"
+        shift 2
+        ;;
+      *) die "boot-validated takes only --store --boot --image-id --manifest-sha256 --tenant --route [--container-name]" ;;
+    esac
+  done
+  [[ -n $boot && -n $image_id && -n $msha && -n $tenant && -n $route ]] ||
+    die "boot-validated needs --boot, --image-id, --manifest-sha256, --tenant and --route"
+  [[ $image_id =~ ^sha256:[0-9a-f]{64}$ ]] || die "--image-id must be a full local image ID (sha256:<64 hex>)"
+  [[ $msha =~ ^[0-9a-f]{64}$ ]] || die "--manifest-sha256 must be 64 lowercase hex"
+  idre='^[a-zA-Z0-9_-]{1,64}$'
+  [[ $tenant =~ $idre && $route =~ $idre ]] || die "--tenant and --route must be ids [a-zA-Z0-9_-]{1,64}"
+else
+  while (($#)); do
+    case $1 in
+      --store) (($# >= 2)) || die "--store needs a value"; store=$2; shift 2 ;;
+      --container-name) (($# >= 2)) || die "--container-name needs a value"; name=$2; shift 2 ;;
+      --harness-control)
+        [[ $mode == start ]] || die "--harness-control is only for start"
+        harness=1 pass+=("$1"); shift ;;
+      --dir | --dir=*) die "--dir is fixed by the launcher; use --store HOST_DIR" ;;
+      --store=* | --container-name=*) die "use '${1%%=*} VALUE', not '${1%%=*}=VALUE'" ;;
+      *) pass+=("$1"); shift ;;
+    esac
+  done
+fi
 [[ -n $store ]] || die "--store HOST_DIR is required"
 if [[ -z $name ]]; then
   name="telelem-route-store-$mode-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
 fi
 [[ $name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || die "bad --container-name '$name'"
 
-# --- host-side store preconditions (defense in depth; the wrapper and FileStore check
-# again inside the container on /sbx/store) --------------------------------------------
-[[ $store == /* && $store != / ]] || die "--store must be an absolute path other than /: $store"
-[[ -d $store && ! -L $store ]] || die "--store is not an existing directory (or is a symlink): $store"
-canon=$(realpath -e -- "$store") || die "cannot resolve --store: $store"
-[[ $canon == "$store" ]] || die "--store is not canonical (resolves to $canon): $store"
-read -r s_uid s_mode < <(LC_ALL=C stat -c '%u %a' -- "$store")
-[[ $s_uid == "$EUID" ]] || die "--store is owned by uid $s_uid, not $EUID: $store"
-(((8#$s_mode & 8#022) == 0)) || die "--store is group- or other-writable (mode $s_mode): $store"
-# Every ancestor: a real directory, not world-writable unless sticky (PathPolicy rule).
-p=$store
-while [[ $p != / ]]; do
-  p=$(dirname -- "$p")
-  read -r a_mode < <(LC_ALL=C stat -c '%a' -- "$p")
-  if (((8#$a_mode & 8#002) != 0 && (8#$a_mode & 8#1000) == 0)); then
-    die "ancestor $p of --store is world-writable without the sticky bit"
-  fi
-done
+# --- host-side directory preconditions (defense in depth; the wrapper, FileStore and,
+# for the boot directory, boot_check.ex check again inside the container) ---------------
 under() { [[ $1 == "$2" || $1 == "$2"/* ]]; }
-for d in /etc/telelem /var/lib/telelem /run/telelem /run/secrets "$ROOT"; do
-  if under "$store" "$d" || under "$d" "$store"; then
-    die "--store must not overlap $d: $store"
+host_dir() { # FLAG PATH
+  local flag=$1 d=$2 canon s_uid s_mode p a_mode x
+  [[ $d == /* && $d != / ]] || die "$flag must be an absolute path other than /: $d"
+  [[ -d $d && ! -L $d ]] || die "$flag is not an existing directory (or is a symlink): $d"
+  canon=$(realpath -e -- "$d") || die "cannot resolve $flag: $d"
+  [[ $canon == "$d" ]] || die "$flag is not canonical (resolves to $canon): $d"
+  read -r s_uid s_mode < <(LC_ALL=C stat -c '%u %a' -- "$d")
+  [[ $s_uid == "$EUID" ]] || die "$flag is owned by uid $s_uid, not $EUID: $d"
+  (((8#$s_mode & 8#022) == 0)) || die "$flag is group- or other-writable (mode $s_mode): $d"
+  # Every ancestor: a real directory, not world-writable unless sticky (PathPolicy rule).
+  p=$d
+  while [[ $p != / ]]; do
+    p=$(dirname -- "$p")
+    read -r a_mode < <(LC_ALL=C stat -c '%a' -- "$p")
+    if (((8#$a_mode & 8#002) != 0 && (8#$a_mode & 8#1000) == 0)); then
+      die "ancestor $p of $flag is world-writable without the sticky bit"
+    fi
+  done
+  for x in /etc/telelem /var/lib/telelem /run/telelem /run/secrets "$ROOT"; do
+    if under "$d" "$x" || under "$x" "$d"; then
+      die "$flag must not overlap $x: $d"
+    fi
+  done
+}
+host_dir --store "$store"
+if [[ $mode == boot-validated ]]; then
+  host_dir --boot "$boot"
+  if under "$boot" "$store" || under "$store" "$boot"; then
+    die "--boot must not overlap --store: $boot"
   fi
-done
+fi
 
 # --- prerequisites ---------------------------------------------------------------------
 command -v docker >/dev/null 2>&1 || die "docker CLI not found"
-docker image inspect "$IMAGE" >/dev/null 2>&1 || die "runner image $IMAGE not found (scripts/setup)"
+if [[ $mode == boot-validated ]]; then
+  got=$(docker image inspect --format '{{.Id}}' "$image_id" 2>/dev/null) || got=
+  [[ $got == "$image_id" ]] || die "approved image $image_id is not present locally under that exact ID"
+  IMAGE=$image_id
+  srcs=("${SRC[@]}" "${BOOT_SRC[@]}")
+  [[ -f $HERE/boot_check.ex ]] || die "missing $HERE/boot_check.ex"
+else
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || die "runner image $IMAGE not found (scripts/setup)"
+  srcs=("${SRC[@]}")
+fi
 [[ -x $WRAP ]] || die "missing $WRAP"
 mounts=()
-for f in "${SRC[@]}"; do
+for f in "${srcs[@]}"; do
   [[ -f $ROOT/lib/telelem/$f ]] || die "missing source lib/telelem/$f"
   mounts+=(-v "$ROOT/lib/telelem/$f:/opt/telelem/src/$(basename "$f"):ro")
 done
+
+if [[ $mode == boot-validated ]]; then
+  exec docker run --rm --pull never --log-driver none --name "$name" --label telelem.route-store="$mode" \
+    --sig-proxy=true \
+    --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --user "$(id -u):$(id -g)" --workdir / \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+    "${mounts[@]}" \
+    -v "$HERE:/opt/route-store:ro" \
+    -v "$WRAP:/opt/lock/with-route-store-lock:ro" \
+    -v "$boot:/sbx/boot:ro" \
+    -v "$store:/sbx/store" \
+    "$IMAGE" /usr/bin/env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 \
+    ERL_INETRC=/opt/route-store/inetrc ERL_CRASH_DUMP_SECONDS=0 \
+    /bin/sh /opt/route-store/entry.sh boot-validated \
+    --tenant "$tenant" --route "$route" --manifest-sha256 "$msha"
+fi
 
 io=()
 ((harness)) && io=(-i)

@@ -8,6 +8,8 @@
 #   elixir -pa EBIN main.exs provision --dir D --tenant T --route R --deployments A,B \
 #       --preferred A --fallback-on-refusal true|false --deadline-ms N --max-attempts 1|2
 #   elixir -pa EBIN main.exs start --dir D --tenant T --route R [--harness-control]
+#   elixir -pa EBIN main.exs boot-validated --dir /sbx/store --tenant T --route R \
+#       --manifest-sha256 HEX
 #
 # stdout carries exactly one compact JSON object per line (events below); stderr
 # carries "route-store: ..." diagnostics. Exit status:
@@ -15,7 +17,18 @@
 #   2  usage, or the store directory fails the trusted-directory contract
 #   3  the store refused (reason in the "error" event, e.g. not_provisioned)
 #   4  this OS process does not hold the store lock; nothing was touched
+#   5  boot-validated only: a boot check refused (fixed code in the "error" event,
+#      op "boot"); no FileStore call was made
 #   1  anything else (unexpected)
+#
+# `boot-validated` is `start` (no harness control) with a preflight between the lock
+# check and the first FileStore call: RouteStore.BootCheck (boot_check.ex) checks the
+# BEAM's actual environment, its resolver option, its mounts and the staged boot
+# inputs at /sbx/boot against the manifest digest given on argv. Its output is fixed:
+# events carry only codes from closed sets and digests, stderr carries fixed lines,
+# the OTP logger is silenced (no crash reports) and any unexpected exception becomes
+# {"event":"error","op":"boot","reason":"internal"} with exit 1. It opens no listener
+# and dials nothing; the bindings it validates are discarded after the check.
 #
 # `start` opens the real Telelem.Ops.FileStore, prints {"event":"ready",...} only after
 # FileStore.start/1 returned {:ok, pid}, and then stays in the foreground until SIGTERM
@@ -58,6 +71,7 @@ defmodule RouteStore.Main do
   alias Telelem.Ops.{FileStore, PlanDigest}
   alias Telelem.Route.Revision
   alias Telelem.Sandbox.PathPolicy
+  alias RouteStore.BootCheck
 
   @name :telelem_route_store
   # Trusted-directory contract (m2a-contracts §3, Telelem.Sandbox.Bootstrap): the
@@ -69,7 +83,8 @@ defmodule RouteStore.Main do
     case argv do
       ["provision" | rest] -> provision(rest)
       ["start" | rest] -> start(rest)
-      _ -> usage("expected provision or start")
+      ["boot-validated" | rest] -> boot_validated(rest)
+      _ -> usage("expected provision, start or boot-validated")
     end
   end
 
@@ -128,19 +143,7 @@ defmodule RouteStore.Main do
     trusted_dir!(dir)
     lock_held!(dir)
     main = self()
-
-    # Replace the default SIGTERM action. OTP's erl_signal_handler runs init:stop on
-    # SIGTERM, which kills every non-system process (the store included, with :kill and
-    # without terminate/2) and still runs after System.trap_signal/3 traps. Swap that
-    # handler for RouteStore.Signals, so SIGTERM only asks this loop for an orderly stop.
-    :ok =
-      :gen_event.swap_handler(
-        :erl_signal_server,
-        {:erl_signal_handler, :swap},
-        {RouteStore.Signals, main}
-      )
-
-    true = :erl_signal_handler not in :gen_event.which_handlers(:erl_signal_server)
+    install_signals(main)
 
     case FileStore.start(name: @name, dir: dir, tenant_id: opts[:tenant], route_id: opts[:route]) do
       {:ok, pid} ->
@@ -155,12 +158,150 @@ defmodule RouteStore.Main do
         })
 
         if opts[:harness_control], do: spawn_link(fn -> read_stdin(main) end)
-        loop(%{tenant: opts[:tenant], route: opts[:route], ref: ref})
+        loop(%{tenant: opts[:tenant], route: opts[:route], ref: ref, sanitized: false})
 
       {:error, reason} ->
         refused("start", reason)
     end
   end
+
+  # Replace the default SIGTERM action. OTP's erl_signal_handler runs init:stop on
+  # SIGTERM, which kills every non-system process (the store included, with :kill and
+  # without terminate/2) and still runs after System.trap_signal/3 traps. Swap that
+  # handler for RouteStore.Signals, so SIGTERM only asks this loop for an orderly stop.
+  defp install_signals(main) do
+    :ok =
+      :gen_event.swap_handler(
+        :erl_signal_server,
+        {:erl_signal_handler, :swap},
+        {RouteStore.Signals, main}
+      )
+
+    true = :erl_signal_handler not in :gen_event.which_handlers(:erl_signal_server)
+    :ok
+  end
+
+  ## boot-validated (see header)
+
+  @boot_opts [dir: :string, tenant: :string, route: :string, manifest_sha256: :string]
+  @store_dir "/sbx/store"
+  @boot_dir "/sbx/boot"
+
+  defp boot_validated(argv) do
+    # No OTP log output in this mode (crash and supervisor reports carry raw terms).
+    :ok = :logger.set_primary_config(:level, :none)
+
+    try do
+      boot_validated!(argv)
+    rescue
+      _ -> boot_fail(:internal, 1)
+    catch
+      _, _ -> boot_fail(:internal, 1)
+    end
+  end
+
+  defp boot_validated!(argv) do
+    opts =
+      case OptionParser.parse(argv, strict: @boot_opts) do
+        {opts, [], []} ->
+          if Enum.all?(Keyword.keys(@boot_opts), &Keyword.has_key?(opts, &1)), do: opts
+
+        _ ->
+          nil
+      end
+
+    if opts == nil or opts[:dir] != @store_dir,
+      do:
+        fail(
+          2,
+          "usage: boot-validated --dir #{@store_dir} --tenant T --route R --manifest-sha256 HEX"
+        )
+
+    # The shared checks of every writer mode, in the same order: trusted directory,
+    # then the kernel's view of this process's lock. Both print fixed text here, since
+    # dir is the fixed store path.
+    trusted_dir!(@store_dir)
+    lock_held!(@store_dir)
+
+    env = System.get_env()
+
+    summary =
+      with :ok <- BootCheck.env(env),
+           :ok <- BootCheck.resolver(env),
+           {:ok, mi} <- read_mountinfo(),
+           :ok <- BootCheck.mounts(mi),
+           {:ok, summary} <-
+             BootCheck.inputs(
+               sandbox_root: @sandbox_root,
+               boot_dir: @boot_dir,
+               store_dir: @store_dir,
+               tenant: opts[:tenant],
+               manifest_sha256: opts[:manifest_sha256]
+             ) do
+        summary
+      else
+        {:error, code} when is_atom(code) -> boot_fail(code, 5)
+        _ -> boot_fail(:internal, 1)
+      end
+
+    install_signals(self())
+
+    case FileStore.start(
+           name: @name,
+           dir: @store_dir,
+           tenant_id: opts[:tenant],
+           route_id: opts[:route]
+         ) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid)
+        {:ok, rec} = FileStore.fetch(@name, opts[:tenant], opts[:route])
+
+        emit(%{
+          event: "ready",
+          mode: "boot_validated",
+          tenant_id: opts[:tenant],
+          os_pid: System.pid(),
+          record: record_json(rec.revision, rec.last_plan_digest),
+          boot: summary
+        })
+
+        loop(%{tenant: opts[:tenant], route: opts[:route], ref: ref, sanitized: true})
+
+      {:error, reason} ->
+        code = sanitized_reason(reason)
+        emit(%{event: "error", op: "start", reason: code})
+        IO.puts(:stderr, "route-store: start refused: " <> code)
+        halt(3)
+    end
+  end
+
+  defp read_mountinfo do
+    case File.read("/proc/self/mountinfo") do
+      {:ok, text} -> {:ok, text}
+      _ -> {:error, :mountinfo_unreadable}
+    end
+  end
+
+  defp boot_fail(code, status) do
+    text = if code in BootCheck.codes(), do: Atom.to_string(code), else: "internal"
+    emit(%{event: "error", op: "boot", reason: text})
+    IO.puts(:stderr, "route-store: boot refused: " <> text)
+    halt(status)
+  end
+
+  # Store refusals as fixed text: an atom, or a tuple of atoms joined by "_"; anything
+  # else (it could carry terms from the store) collapses to "store_refused".
+  defp sanitized_reason(r) when is_atom(r), do: Atom.to_string(r)
+
+  defp sanitized_reason(r) when is_tuple(r) and tuple_size(r) in 1..4 do
+    parts = Tuple.to_list(r)
+
+    if Enum.all?(parts, &is_atom/1),
+      do: Enum.map_join(parts, "_", &Atom.to_string/1),
+      else: "store_refused"
+  end
+
+  defp sanitized_reason(_), do: "store_refused"
 
   defp loop(s) do
     receive do
@@ -176,7 +317,7 @@ defmodule RouteStore.Main do
       {:DOWN, ref, :process, _, reason} when ref == s.ref ->
         # The store stopped by itself (for example a failed write): the disk is the
         # only truth now. Report and exit non-zero; never retry or reopen here.
-        emit(%{event: "store_down", reason: inspect(reason)})
+        emit(%{event: "store_down", reason: if(s.sanitized, do: "exited", else: inspect(reason))})
         halt(1)
     end
   end
