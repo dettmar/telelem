@@ -32,10 +32,11 @@
 # staging directory is a trusted local input; the read-only bind only stops this
 # container from writing it. This module opens each staged file once (handle inode =
 # walked inode), hashes it and decodes only those bytes. One file is read again: the
-# fixture CA, which Sandbox.Bootstrap reads itself by its ca_file path when it builds
-# the bindings. That second read is not hashed; its certificates must equal the ones
-# in the hashed CA bytes (else bootstrap_ca_not_pinned), but a host-side swap to a file
-# with the same certificates would not be seen.
+# fixture CA, which Sandbox.Bootstrap rereads itself by its ca_file path, once per
+# fixture target it builds. Those rereads are not hashed; each successfully built
+# target's certificates must equal the ones in the hashed CA bytes (else
+# bootstrap_ca_not_pinned), but a host-side swap to a file with the same certificates
+# would not be seen.
 
 defmodule RouteStore.BootCheck do
   @moduledoc false
@@ -406,10 +407,11 @@ defmodule RouteStore.BootCheck do
 
   # The bootstrap document is decoded from the hashed bytes (never re-read from disk),
   # must name the start tenant and the locked store, and every target's CA must be the
-  # manifested fixture CA file. Sandbox.Bootstrap then builds the bindings. It reads
-  # that CA file again itself, by path, and that read is not hashed. So the resulting
-  # VerifiedTargets must carry exactly the certificates in the hashed CA bytes; a
-  # different CA file at that moment is refused (bootstrap_ca_not_pinned).
+  # manifested fixture CA file. Sandbox.Bootstrap then builds the bindings. It rereads
+  # that CA file itself, by path, once per target, and those rereads are not hashed.
+  # So each VerifiedTarget it returns must carry exactly the certificates in the hashed
+  # CA bytes; a different CA file at any of those reads is refused
+  # (bootstrap_ca_not_pinned).
   defp bootstrap(files, sb, boot, store, tenant) do
     ca_path = Path.join(boot, @roles["fixture_ca"])
 

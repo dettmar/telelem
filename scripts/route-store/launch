@@ -54,8 +54,9 @@
 # nothing untrusted writes while this runs. The read-only bind only stops the
 # container from writing it; nothing here makes the host copy immutable. The BEAM
 # opens each staged file once and decodes only the bytes it hashed, except that
-# Sandbox.Bootstrap reads the fixture CA file a second time by path; that read must
-# yield the same certificates as the hashed bytes (see boot_check.ex).
+# Sandbox.Bootstrap rereads the fixture CA file by path, once per fixture target it
+# builds; those rereads are not hashed, and each built target must carry the same
+# certificates as the hashed bytes (see boot_check.ex).
 #
 # Exit status: the writer's (see main.exs: 0 ok, 2 usage/contract, 3 store refused,
 # 4 lock not held, 5 boot check refused), the wrapper's (75 busy, 64/69/70/78; stderr
