@@ -34,22 +34,20 @@ defmodule Telelem.Serve.ListenerSpec do
     * Log options off: `startup_log: false`; `log_exceptions_with_status_codes:
       []` (no plug exception is logged by status); `log_protocol_errors:
       false` and `log_client_closures: false`; `log_unknown_messages: false`.
-    * `thousand_island_options: [silent_terminate_on_error: true]`. Under
-      Thousand Island 1.6.0 this only turns a handler callback's `{:error,
-      reason, state}` return into a `{:shutdown, {:silent_termination,
-      reason}}` exit instead of an abnormal exit with `reason`. It does not
-      act on the path this policy serves: after a plug exception or HTTP/1
-      protocol error the pinned `Bandit.Pipeline` handles the error itself
-      (telemetry, the `log_*` options above, an error response where it
-      can) and the Bandit HTTP/1 handler then returns `{:close, state}`, so
-      the connection ends as `{:shutdown, :local_closed}` whatever this
-      option is. In the pinned Bandit only the HTTP/2 and WebSocket
-      handlers return `{:error, reason, state}`, and both are disabled
-      here; the option is kept only as a fallback if that changes.
-      Exceptions raised from a handler callback are re-raised by Thousand
-      Island and reported by the runtime, a `:tcp_error`/`:ssl_error` still
-      stops the connection with that reason, and Thousand Island and Bandit
-      still emit their telemetry events for errors.
+    * `thousand_island_options: [silent_terminate_on_error: true]`. In
+      Thousand Island 1.6.0 this is read in one place: when a handler
+      callback returns `{:error, reason, state}` with a `reason` other than
+      `:timeout`, the connection stops with `{:shutdown,
+      {:silent_termination, reason}}` instead of with `reason`. A
+      `{:error, :timeout, state}` return is handled separately and stops
+      with `{:shutdown, :read_timeout}` whatever this option is. On the
+      HTTP/1 path this policy serves, the pinned Bandit HTTP/1 handler
+      turns an `{:error, _}` result from `Bandit.Pipeline` into `{:close,
+      state}`, so that connection ends as `{:shutdown, :local_closed}` and
+      this option does not apply to it. The option does not change
+      exceptions raised from a handler callback (Thousand Island re-raises
+      them) or a `:tcp_error`/`:ssl_error` message (the connection stops
+      with that reason).
 
   These options do not make the listener silent. The pinned Bandit still has
   log calls no option disables (for example the HTTP/1 request-trailer

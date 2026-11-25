@@ -279,11 +279,14 @@ defmodule Telelem.Serve.DiagnosticsTest do
       unchanged? = global_state() == before
       assert unchanged?, "observe/0 changed Logger, telemetry or process state"
 
-      assert Map.keys(snapshot) |> Enum.sort() == Map.keys(@allowed) |> Enum.sort()
+      # Shape and values are checked as booleans so a failure reports only a
+      # fixed message, never a raw unexpected key or value.
+      keys_ok? = Enum.sort(Map.keys(snapshot)) == Enum.sort(Map.keys(@allowed))
 
-      for {key, value} <- snapshot do
-        assert value in @allowed[key], "#{key}: #{inspect(value)}"
-      end
+      assert keys_ok?, "observe/0 returned an unexpected snapshot shape"
+
+      values_ok? = Enum.all?(snapshot, fn {key, value} -> value in @allowed[key] end)
+      assert values_ok?, "observe/0 returned a value outside the documented atoms"
     end
 
     test "agrees with what the pinned test environment can independently observe" do

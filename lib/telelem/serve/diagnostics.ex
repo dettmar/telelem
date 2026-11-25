@@ -63,13 +63,19 @@ defmodule Telelem.Serve.Diagnostics do
   level, handler IDs and module levels), not one atomic view. An `:ok` therefore does not establish that
   all of these were quiet at the same instant: a handler or level may have
   appeared before one read and been removed before another. The registry
-  is read before and after the handler lookups and the result is
-  `:unknown` only if the descriptor itself changed. In the `:ets` form
-  attaching or detaching a handler changes only the table and stores an
-  equal descriptor, so such a change during or between the per-prefix
-  lookups leaves the descriptor stable and is not detected (in the
+  descriptor is sampled twice, once before and once after the handler
+  lookups, and only those two samples are compared. The result is
+  `:unknown` when the two samples differ, or when the second sample does
+  not classify as the first did; the latter can happen with an unchanged
+  descriptor, for example if the registry process or table owner changed
+  in between. A change that is reverted before the second sample leaves
+  the two samples equal and is not detected, in either form. In the
+  `:ets` form attaching or detaching a handler changes only the table and
+  stores an equal descriptor, so such a change during or between the
+  per-prefix lookups is not detected even when it is not reverted. In the
   `:persistent_term` form the descriptor carries the handler map, so a
-  change inside that window is detected).
+  handler change in that window is detected only if the second sample
+  still differs from the first.
   """
 
   @codes [
