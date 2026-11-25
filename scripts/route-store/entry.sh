@@ -12,9 +12,13 @@
 #    and that process holds the locked descriptor until it exits.
 #
 # boot-validated adds, before step 1 (that is, before any BEAM, the compiler included):
+#   - the actual mount boundary (/proc/self/mountinfo) must be the closed set, checked
+#     first and with shell builtins only (boot_mounts.sh, the same policy and codes as
+#     RouteStore.BootCheck.mounts/1), so no program runs from an unchecked mount;
 #   - the environment must be exactly the fixed `env -i` set the launcher passes;
 #   - the resolver file must be exactly the pinned bytes (size and SHA-256 below), at
 #     the path ERL_INETRC names.
+# Refusals are exit 5 with one fixed "route-store: boot refused: entry_CODE" line.
 # It also compiles the four sandbox modules and boot_check.ex, discards compiler
 # output and prints only fixed "route-store:" lines. Everything after the exec is the
 # same path as `start`; main.exs then re-checks env, resolver and mounts in the VM.
@@ -28,6 +32,11 @@ shift
 
 if [ "$mode" = boot-validated ]; then
   boot_refuse() { echo "route-store: boot refused: $1" >&2; exit 5; }
+  # Mounts first: everything below (env, sort, stat, sha256sum, the compiler) runs
+  # from the filesystem this check has just shown to be the closed, static set.
+  [ -f /opt/route-store/boot_mounts.sh ] || boot_refuse entry_mount_check_missing
+  . /opt/route-store/boot_mounts.sh
+  rs_mounts /proc/self/mountinfo || boot_refuse "entry_$RS_MOUNTS_CODE"
   # Exact environment (names and values) before anything else runs. A value with a
   # newline adds a line and so also fails.
   want_env='ERL_CRASH_DUMP_SECONDS=0

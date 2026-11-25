@@ -30,9 +30,19 @@
 #     present locally under that ID; the run is by ID with --pull never. TELELEM_IMAGE
 #     is refused in this mode. The launcher does not establish where the image came
 #     from; that is the operator's approval.
+#   - Image properties that would act at run time: ENTRYPOINT is replaced
+#     (--entrypoint /usr/bin/env), HEALTHCHECK is disabled (--no-healthcheck), and an
+#     image that declares VOLUME paths is refused before any container (docker would
+#     add an anonymous writable volume for each). WorkingDir, User and Env are
+#     overridden as below; no other image property is consulted.
 #   - Mounts: the closed fixed set (nine sources, this directory, the wrapper, and
 #     BOOT_DIR read-only at /sbx/boot); HOST_DIR at /sbx/store is the only writable
-#     application bind. The BEAM re-checks this set in /proc/self/mountinfo.
+#     application bind. Each is a non-recursive, private bind (--mount
+#     bind-recursive=disabled, bind-propagation=private): no host submount below a
+#     source is carried in, and no later host mount event propagates. entry.sh checks
+#     the actual set in /proc/self/mountinfo before any BEAM; the BEAM re-checks it.
+#     Source paths containing a comma, a double quote or a control character are
+#     refused (they would change the --mount option list).
 #   - Environment: the container command is `env -i` with a fixed list (no host or
 #     image values); entry.sh and main.exs check the actual env.
 #   - Output: --log-driver none (no daemon-side log file), fixed messages only.
@@ -43,7 +53,9 @@
 # approved image are trusted; BOOT_DIR is a trusted local staging directory that
 # nothing untrusted writes while this runs. The read-only bind only stops the
 # container from writing it; nothing here makes the host copy immutable. The BEAM
-# hashes each staged file once and uses only the bytes it hashed.
+# opens each staged file once and decodes only the bytes it hashed, except that
+# Sandbox.Bootstrap reads the fixture CA file a second time by path; that read must
+# yield the same certificates as the hashed bytes (see boot_check.ex).
 #
 # Exit status: the writer's (see main.exs: 0 ok, 2 usage/contract, 3 store refused,
 # 4 lock not held, 5 boot check refused), the wrapper's (75 busy, 64/69/70/78; stderr
@@ -158,6 +170,10 @@ command -v docker >/dev/null 2>&1 || die "docker CLI not found"
 if [[ $mode == boot-validated ]]; then
   got=$(docker image inspect --format '{{.Id}}' "$image_id" 2>/dev/null) || got=
   [[ $got == "$image_id" ]] || die "approved image $image_id is not present locally under that exact ID"
+  vols=$(docker image inspect --format '{{json (index .Config "Volumes")}}' "$image_id" 2>/dev/null) ||
+    die "cannot read the VOLUME configuration of approved image $image_id"
+  [[ $vols == null || $vols == '{}' ]] ||
+    die "approved image $image_id declares VOLUME paths; boot-validated refuses images that add volumes"
   IMAGE=$image_id
   srcs=("${SRC[@]}" "${BOOT_SRC[@]}")
   [[ -f $HERE/boot_check.ex ]] || die "missing $HERE/boot_check.ex"
@@ -166,29 +182,44 @@ else
   srcs=("${SRC[@]}")
 fi
 [[ -x $WRAP ]] || die "missing $WRAP"
-mounts=()
 for f in "${srcs[@]}"; do
   [[ -f $ROOT/lib/telelem/$f ]] || die "missing source lib/telelem/$f"
-  mounts+=(-v "$ROOT/lib/telelem/$f:/opt/telelem/src/$(basename "$f"):ro")
 done
 
 if [[ $mode == boot-validated ]]; then
+  [[ -f $HERE/boot_mounts.sh ]] || die "missing $HERE/boot_mounts.sh"
+  # add_bind SRC DST [ro]: one non-recursive, private bind mount.
+  bmounts=()
+  add_bind() {
+    local opt="type=bind,source=$1,target=$2"
+    [[ $1 != *[,\"]* && $1 != *[[:cntrl:]]* ]] ||
+      die "mount source contains a comma, a double quote or a control character: $1"
+    [[ ${3-} == ro ]] && opt+=",readonly"
+    bmounts+=(--mount "$opt,bind-recursive=disabled,bind-propagation=private")
+  }
+  for f in "${srcs[@]}"; do add_bind "$ROOT/lib/telelem/$f" "/opt/telelem/src/$(basename "$f")" ro; done
+  add_bind "$HERE" /opt/route-store ro
+  add_bind "$WRAP" /opt/lock/with-route-store-lock ro
+  add_bind "$boot" /sbx/boot ro
+  add_bind "$store" /sbx/store
   exec docker run --rm --pull never --log-driver none --name "$name" --label telelem.route-store="$mode" \
     --sig-proxy=true \
     --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
-    --user "$(id -u):$(id -g)" --workdir / \
+    --user "$(id -u):$(id -g)" --workdir / --no-healthcheck \
     --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
-    "${mounts[@]}" \
-    -v "$HERE:/opt/route-store:ro" \
-    -v "$WRAP:/opt/lock/with-route-store-lock:ro" \
-    -v "$boot:/sbx/boot:ro" \
-    -v "$store:/sbx/store" \
-    "$IMAGE" /usr/bin/env -i \
+    "${bmounts[@]}" \
+    --entrypoint /usr/bin/env \
+    "$IMAGE" -i \
     PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 \
     ERL_INETRC=/opt/route-store/inetrc ERL_CRASH_DUMP_SECONDS=0 \
     /bin/sh /opt/route-store/entry.sh boot-validated \
     --tenant "$tenant" --route "$route" --manifest-sha256 "$msha"
 fi
+
+mounts=()
+for f in "${srcs[@]}"; do
+  mounts+=(-v "$ROOT/lib/telelem/$f:/opt/telelem/src/$(basename "$f"):ro")
+done
 
 io=()
 ((harness)) && io=(-i)

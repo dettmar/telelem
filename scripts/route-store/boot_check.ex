@@ -13,9 +13,13 @@
 #               lock wrapper produce (nothing inherited from the image or the host).
 #   resolver/1  the resolver option the booted VM actually uses is hosts-file only,
 #               from the pinned ERL_INETRC path (entry.sh pinned its bytes pre-boot).
-#   mounts/2    /proc/self/mountinfo: a read-only rootfs, the exact closed set of
-#               application mounts below /opt and /sbx (all read-only except the store
-#               at /sbx/store), and only docker's standard mounts elsewhere.
+#   mounts/1    /proc/self/mountinfo: no propagation tags, a read-only rootfs, the
+#               exact closed set of application mounts below /opt and /sbx (all
+#               read-only except the store at /sbx/store), and only docker's standard
+#               mounts elsewhere. entry.sh already ran the same policy before any BEAM
+#               (boot_mounts.sh); this is the writer's runtime recheck. The tables are
+#               shared by test: app_mounts/0, std_mounts/0 must equal boot_mounts.sh's,
+#               and both give the same verdict on the test's mountinfo cases.
 #   inputs/1    the staged boot directory against the versioned closed manifest:
 #               manifest digest supplied independently (argv), exact roles, exact byte
 #               lengths and SHA-256 per file, manifest/bootstrap/start tenant equal,
@@ -26,8 +30,12 @@
 #
 # Not established here: provenance or immutability of anything on the host. The
 # staging directory is a trusted local input; the read-only bind only stops this
-# container from writing it. Each file is read once (handle inode = walked inode) and
-# hashed, and only the bytes that were hashed are used.
+# container from writing it. This module opens each staged file once (handle inode =
+# walked inode), hashes it and decodes only those bytes. One file is read again: the
+# fixture CA, which Sandbox.Bootstrap reads itself by its ca_file path when it builds
+# the bindings. That second read is not hashed; its certificates must equal the ones
+# in the hashed CA bytes (else bootstrap_ca_not_pinned), but a host-side swap to a file
+# with the same certificates would not be seen.
 
 defmodule RouteStore.BootCheck do
   @moduledoc false
@@ -97,7 +105,7 @@ defmodule RouteStore.BootCheck do
   @std_any ~w(/proc /dev /dev/pts /dev/mqueue /dev/shm /tmp)
 
   @codes ~w(env_unexpected resolver_unexpected mountinfo_unreadable mount_unexpected
-            mount_rootfs_writable mount_app_set_mismatch mount_app_mode
+            mount_propagation mount_rootfs_writable mount_app_set_mismatch mount_app_mode
             bad_manifest_digest_arg boot_dir_policy boot_dir_unsafe boot_dir_not_closed
             manifest_unreadable manifest_size manifest_digest_mismatch manifest_not_json
             manifest_keys manifest_version manifest_tenant manifest_store_root
@@ -117,6 +125,12 @@ defmodule RouteStore.BootCheck do
 
   @doc false
   def manifest_version, do: @manifest_version
+
+  @doc false
+  def app_mounts, do: @app_mounts
+
+  @doc false
+  def std_mounts, do: %{any: @std_any, ro: @std_ro}
 
   ## environment ----------------------------------------------------------------------
 
@@ -178,18 +192,36 @@ defmodule RouteStore.BootCheck do
 
   def mounts(_), do: {:error, :mountinfo_unreadable}
 
+  # Per line, in this order: single spaces only (no empty field) and at least six
+  # fields, else unreadable; field 7 must be the "-" separator, so a mount with any
+  # optional field (shared:, master:, propagate_from:, unbindable) is refused; no
+  # backslash escape in the mount point.
   defp parse_mountinfo(text) do
     text
     |> String.split("\n", trim: true)
     |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
-      case String.split(line, " ") do
-        [_id, _parent, _dev, root, point, opts | _rest] ->
-          if String.contains?(line, " - ") and not String.contains?(point, "\\"),
-            do: {:cont, {:ok, [%{root: root, point: point, rw: rw?(opts)} | acc]}},
-            else: {:halt, {:error, :mount_unexpected}}
+      fields = String.split(line, " ")
 
-        _ ->
+      case fields do
+        _ when length(fields) < 6 ->
           {:halt, {:error, :mountinfo_unreadable}}
+
+        [_id, _parent, _dev, root, point, opts | rest] ->
+          cond do
+            "" in fields ->
+              {:halt, {:error, :mountinfo_unreadable}}
+
+            not match?(["-" | _], rest) ->
+              {:halt,
+               {:error,
+                if(String.contains?(line, " - "), do: :mount_propagation, else: :mount_unexpected)}}
+
+            String.contains?(point, "\\") ->
+              {:halt, {:error, :mount_unexpected}}
+
+            true ->
+              {:cont, {:ok, [%{root: root, point: point, rw: rw?(opts)} | acc]}}
+          end
       end
     end)
     |> case do
@@ -343,9 +375,10 @@ defmodule RouteStore.BootCheck do
     end)
   end
 
-  # One open per file: walk without symlinks, open raw, the handle must be the walked
-  # inode, then read at most max + 1 bytes. The key file must not be group/other
-  # readable. Returns the bytes; the caller hashes exactly these.
+  # One open per file by this module: walk without symlinks, open raw, the handle must
+  # be the walked inode, then read at most max + 1 bytes. The key file must not be
+  # group/other readable. Returns the bytes; the caller hashes exactly these. (The
+  # fixture CA is read once more, by Sandbox.Bootstrap; see bootstrap/5.)
   defp read_pinned(boot, name, max, what) do
     path = Path.join(boot, name)
     err = if what == :manifest, do: :manifest_unreadable, else: :file_unreadable
@@ -373,9 +406,10 @@ defmodule RouteStore.BootCheck do
 
   # The bootstrap document is decoded from the hashed bytes (never re-read from disk),
   # must name the start tenant and the locked store, and every target's CA must be the
-  # manifested fixture CA file. Sandbox.Bootstrap then builds the bindings (it reads
-  # that CA file itself), and the resulting VerifiedTargets must carry exactly the
-  # certificates in the hashed CA bytes.
+  # manifested fixture CA file. Sandbox.Bootstrap then builds the bindings. It reads
+  # that CA file again itself, by path, and that read is not hashed. So the resulting
+  # VerifiedTargets must carry exactly the certificates in the hashed CA bytes; a
+  # different CA file at that moment is refused (bootstrap_ca_not_pinned).
   defp bootstrap(files, sb, boot, store, tenant) do
     ca_path = Path.join(boot, @roles["fixture_ca"])
 
@@ -486,8 +520,11 @@ defmodule RouteStore.BootCheck do
     end
   end
 
+  # The modulus's actual bit length, not its byte width: a 2041..2047-bit modulus also
+  # takes 256 bytes, and is refused.
+  @rsa_min_bits 2048
   defp rsa_size(key, n) do
-    if bit_size(:binary.encode_unsigned(n)) >= 2048,
+    if n >= 1 <<< (@rsa_min_bits - 1),
       do: {:ok, {:rsa, key}},
       else: {:error, :downstream_key_unsupported}
   end

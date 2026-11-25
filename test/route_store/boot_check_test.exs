@@ -7,7 +7,11 @@ defmodule RouteStore.BootCheckTest do
   # integration/m2a/route-store/run case 8.
   use ExUnit.Case, async: true
 
+  import Bitwise
+
   alias RouteStore.BootCheck
+
+  @boot_mounts_sh Path.expand("../../scripts/route-store/boot_mounts.sh", __DIR__)
 
   @moduletag :tmp_dir
 
@@ -151,6 +155,19 @@ defmodule RouteStore.BootCheckTest do
     r = roots(d)
     {sha, _} = stage(r, chain: chain({:rsa, 2048, 65537}))
     assert {:ok, _} = check(r, sha)
+  end
+
+  test "RSA size is the modulus's bit length: 2047 bits in 256 bytes is refused", %{tmp_dir: d} do
+    c = chain({:rsa, 2047, 65537})
+    {:RSAPrivateKey, kd} = c.key
+    n = :public_key.der_decode(:RSAPrivateKey, kd) |> elem(2)
+    # The boundary case a byte-width check would let through.
+    assert byte_size(:binary.encode_unsigned(n)) == 256
+    assert n >= 1 <<< 2046 and n < 1 <<< 2047
+
+    r = roots(d)
+    {sha, _} = stage(r, chain: c)
+    assert refused(check(r, sha)) == :downstream_key_unsupported
   end
 
   test "manifest digest comes from the caller and must match", %{tmp_dir: d} do
@@ -474,5 +491,174 @@ defmodule RouteStore.BootCheckTest do
     assert mounts(g ++ [mi("/opt/a\\040b", "ro", "/h/x")]) == {:error, :mount_unexpected}
     assert mounts([]) == {:error, :mountinfo_unreadable}
     assert BootCheck.mounts("garbage") == {:error, :mountinfo_unreadable}
+  end
+
+  test "mounts: propagation tags and malformed fields are refused" do
+    g = good_mounts()
+
+    for tag <- ["shared:5", "master:3", "master:3 propagate_from:2", "unbindable"] do
+      tagged = "1 2 0:1 /h/store /sbx/store rw,nosuid #{tag} - tmpfs x rw"
+      assert mounts(swap(g, "/sbx/store", tagged)) == {:error, :mount_propagation}, tag
+    end
+
+    assert mounts(swap(g, "/tmp", "1 2 0:1 / /tmp  rw - tmpfs x rw")) ==
+             {:error, :mountinfo_unreadable}
+
+    assert mounts(swap(g, "/tmp", " 1 2 0:1 / /tmp rw - tmpfs x rw")) ==
+             {:error, :mountinfo_unreadable}
+
+    assert mounts(swap(g, "/tmp", "1 2 0:1 / /tmp rw")) == {:error, :mount_unexpected}
+    assert mounts(swap(g, "/tmp", "1 2 0:1 / /tmp")) == {:error, :mountinfo_unreadable}
+    assert mounts(g ++ ["1 2 0:1 / / ro - overlay x rw"]) == {:error, :mount_unexpected}
+  end
+
+  ## entry.sh's pre-BEAM mount check (boot_mounts.sh) is the same policy
+
+  # Mountinfo as docker 29.10 / runc shows it for `launch boot-validated` (host paths
+  # replaced), the shape the positive container run produces.
+  defp docker_mounts do
+    srcs =
+      Enum.map(
+        @src,
+        &"30 10 0:29 /c/lib/telelem/x/#{&1}.ex /opt/telelem/src/#{&1}.ex ro,nodev,relatime - zfs rpool/ROOT rw,xattr,posixacl,casesensitive"
+      )
+
+    [
+      "10 9 0:137 / / ro,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A:/var/lib/docker/overlay2/l/B,upperdir=/var/lib/docker/overlay2/u/diff,workdir=/var/lib/docker/overlay2/u/work,nouserxattr",
+      "11 10 0:146 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw",
+      "12 10 0:147 / /dev rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+      "13 12 0:148 / /dev/pts rw,nosuid,noexec,relatime - devpts devpts rw,gid=5,mode=620,ptmxmode=666",
+      "14 10 0:149 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs ro",
+      "15 14 0:44 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot",
+      "16 12 0:144 / /dev/mqueue rw,nosuid,nodev,noexec,relatime - mqueue mqueue rw",
+      "17 12 0:150 / /dev/shm rw,nosuid,nodev,noexec,relatime - tmpfs shm rw,size=65536k,inode64",
+      "18 10 0:151 / /tmp rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=65536k,inode64",
+      "19 10 0:33 /docker/containers/i/hostname /etc/hostname ro,nodev,relatime - zfs rpool/var/lib rw,xattr",
+      "20 10 0:33 /docker/containers/i/hosts /etc/hosts ro,nodev,relatime - zfs rpool/var/lib rw,xattr",
+      "21 10 0:33 /docker/containers/i/resolv.conf /etc/resolv.conf ro,nodev,relatime - zfs rpool/var/lib rw,xattr"
+    ] ++
+      srcs ++
+      [
+        "31 10 0:29 /c/scripts/route-store /opt/route-store ro,nodev,relatime - zfs rpool/ROOT rw,xattr",
+        "32 10 0:29 /c/scripts/with-route-store-lock /opt/lock/with-route-store-lock ro,nodev,relatime - zfs rpool/ROOT rw,xattr",
+        "33 10 0:64 /t/b1 /sbx/boot ro,nosuid,nodev - tmpfs tmpfs rw,nr_inodes=1048576,inode64",
+        "34 10 0:64 /t/s1 /sbx/store rw,nosuid,nodev - tmpfs tmpfs rw,nr_inodes=1048576,inode64",
+        "40 11 0:146 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "41 11 0:146 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "42 11 0:146 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "43 11 0:146 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "44 11 0:146 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw",
+        "45 11 0:152 / /proc/acpi ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64",
+        "46 11 0:147 /null /proc/interrupts rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+        "47 11 0:147 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+        "48 11 0:147 /null /proc/keys rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+        "49 11 0:152 / /proc/scsi ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64",
+        "50 11 0:147 /null /proc/timer_list rw,nosuid - tmpfs tmpfs rw,size=65536k,mode=755,inode64",
+        "51 14 0:152 / /sys/devices/virtual/powercap ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64",
+        "52 14 0:152 / /sys/firmware ro,relatime - tmpfs tmpfs ro,size=4k,nr_inodes=1,inode64"
+      ]
+  end
+
+  defp sh_mounts(text, dir) do
+    file = Path.join(dir, "mountinfo-#{System.unique_integer([:positive])}")
+    File.write!(file, text)
+
+    {out, 0} =
+      System.cmd("/bin/sh", [
+        "-c",
+        ~S|. "$1"; rs_mounts "$2"; s=$?; printf '%s %s' "$s" "$RS_MOUNTS_CODE"|,
+        "sh",
+        @boot_mounts_sh,
+        file
+      ])
+
+    case String.split(out, " ") do
+      ["0", ""] -> :ok
+      ["1", code] -> {:error, String.to_atom(code)}
+    end
+  end
+
+  test "boot_mounts.sh has BootCheck's tables" do
+    {out, 0} =
+      System.cmd("/bin/sh", ["-c", ~S|. "$1"; rs_mounts_table|, "sh", @boot_mounts_sh])
+
+    rows = out |> String.split("\n", trim: true) |> Enum.map(&String.split(&1, " "))
+    app = for [k, p] <- rows, k in ["app_ro", "app_rw"], into: %{}, do: {p, k == "app_rw"}
+    assert app == BootCheck.app_mounts()
+    assert length(for [k, _] <- rows, k in ["app_ro", "app_rw"], do: k) == map_size(app)
+    std = BootCheck.std_mounts()
+    assert for([k, p] <- rows, k == "std_any", do: p) == std.any
+    assert for([k, p] <- rows, k == "std_ro", do: p) == std.ro
+  end
+
+  test "boot_mounts.sh and mounts/1 give the same verdict, ok and refused", %{tmp_dir: d} do
+    g = good_mounts()
+    dm = docker_mounts()
+    j = &(Enum.join(&1, "\n") <> "\n")
+
+    cases = [
+      {:ok, j.(g)},
+      {:ok, j.(dm)},
+      {:ok, Enum.join(dm, "\n")},
+      {:ok, j.(Enum.reverse(dm))},
+      {:ok, "\n" <> Enum.join(dm, "\n\n") <> "\n"},
+      {:mount_rootfs_writable, j.(swap(g, "/", mi("/", "rw")))},
+      {:mount_rootfs_writable, j.(Enum.reject(dm, &String.contains?(&1, " / / ")))},
+      {:mount_app_mode, j.(swap(g, "/sbx/boot", mi("/sbx/boot", "rw", "/h/boot")))},
+      {:mount_app_mode, j.(swap(g, "/sbx/store", mi("/sbx/store", "ro", "/h/store")))},
+      {:mount_app_mode, j.(swap(dm, "/opt/route-store", mi("/opt/route-store", "rw", "/h/rs")))},
+      {:mount_app_set_mismatch, j.(Enum.reject(dm, &String.contains?(&1, " /sbx/boot ")))},
+      {:mount_app_set_mismatch,
+       j.(Enum.reject(dm, &String.contains?(&1, " /opt/telelem/src/id.ex ")))},
+      {:mount_unexpected, j.(dm ++ [mi("/opt/extra", "ro", "/h/x")])},
+      {:mount_unexpected, j.(dm ++ [mi("/opt/route-store/boot_check.ex", "ro", "/h/x")])},
+      {:mount_unexpected, j.(dm ++ [mi("/sbx/store/route.rec", "ro", "/h/r")])},
+      {:mount_unexpected, j.(dm ++ [mi("/opt", "ro", "/h/o")])},
+      {:mount_unexpected, j.(dm ++ [mi("/sbx", "ro", "/h/s")])},
+      {:mount_unexpected, j.(dm ++ [mi("/usr/local/bin/elixirc", "ro", "/h/e")])},
+      {:mount_unexpected, j.(dm ++ [mi("/data", "rw", "/h/data")])},
+      {:mount_unexpected, j.(swap(dm, "/etc/hosts", mi("/etc/hosts", "rw", "/c/hosts")))},
+      {:mount_unexpected, j.(swap(dm, "/sys", mi("/sys", "rw")))},
+      {:mount_unexpected, j.(dm ++ [mi("/sysfoo", "ro")])},
+      {:mount_unexpected, j.(dm ++ [mi("/proc/sys/x", "rw", "/sys", "proc")])},
+      {:ok, j.(dm ++ [mi("/proc/x", "rw", "/null", "tmpfs")])},
+      {:mount_unexpected, j.(dm ++ [mi("/sbx/boot", "ro", "/h/boot2")])},
+      {:mount_unexpected, j.(dm ++ [mi("/opt/a\\040b", "ro", "/h/x")])},
+      {:mount_unexpected, j.(dm ++ [mi("/opt/*", "ro", "/h/x")])},
+      {:mount_unexpected, j.(swap(dm, "/tmp", "1 2 0:1 / /tmp rw"))},
+      {:mount_propagation,
+       j.(swap(dm, "/sbx/store", "34 10 0:64 /t/s1 /sbx/store rw,nosuid shared:7 - tmpfs t rw"))},
+      {:mount_propagation, j.(swap(dm, "/", "10 9 0:137 / / ro master:1 - overlay o rw"))},
+      {:mountinfo_unreadable, j.(swap(dm, "/tmp", "1 2 0:1 / /tmp  rw - tmpfs x rw"))},
+      {:mountinfo_unreadable, j.(swap(dm, "/tmp", "1 2 0:1 / /tmp rw - tmpfs x rw "))},
+      {:mountinfo_unreadable, j.(swap(dm, "/tmp", "1 2 0:1 / /tmp"))},
+      {:mountinfo_unreadable, j.(dm ++ ["   "])},
+      {:mountinfo_unreadable, ""},
+      {:mountinfo_unreadable, "\n\n"},
+      {:mountinfo_unreadable, "garbage"}
+    ]
+
+    for {{want, text}, i} <- Enum.with_index(cases) do
+      want = if want == :ok, do: :ok, else: {:error, want}
+      assert BootCheck.mounts(text) == want, "case #{i}: mounts/1"
+      assert sh_mounts(text, d) == want, "case #{i}: boot_mounts.sh"
+    end
+
+    missing = Path.join(d, "no-such-mountinfo")
+
+    {out, 0} =
+      System.cmd(
+        "/bin/sh",
+        [
+          "-c",
+          ~S|. "$1"; rs_mounts "$2"; printf '%s %s' "$?" "$RS_MOUNTS_CODE"|,
+          "sh",
+          @boot_mounts_sh,
+          missing
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert out == "1 mountinfo_unreadable"
   end
 end

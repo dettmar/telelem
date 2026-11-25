@@ -5,7 +5,7 @@
 # disposable host directories.
 #
 #   integration/m2a/route-store/run                     # exit 0 PASS · 1 FAIL · 2 prerequisite missing
-#   integration/m2a/route-store/run --cleanup-selftest  # only case 0 (stubbed docker; no daemon needed)
+#   integration/m2a/route-store/run --cleanup-selftest  # only cases 0 and 0b (stubbed docker; no daemon needed)
 #
 # Every store is a fresh `mktemp -d` directory (mode 700) that is removed on exit.
 # Readiness and acknowledgements are JSON lines read from the writer's stdout through
@@ -691,10 +691,98 @@ cleanup_selftest() (
   exit "$fails"
 )
 
+# --- case 0b: the launcher's docker argv (stubbed docker CLI; no container) ---------------
+# Runs the real scripts/route-store/launch with a `docker` executable first on PATH that
+# answers `image inspect` from STUB_ID/STUB_VOLS and, for `run`, only records its argv
+# (NUL-separated) and exits 0. Nothing is created and no daemon is contacted.
+launcher_selftest() (
+  trap - EXIT INT TERM HUP
+  local d="$BASE/lsel" fails=0 a=() rc i img n
+  mkdir -m 700 "$d" "$d/bin" "$d/store" "$d/boot" "$d/b,x"
+  cat >"$d/bin/docker" <<'STUB'
+#!/bin/bash
+case "${1-} ${2-}" in
+  "image inspect")
+    case ${3-} in
+      --format)
+        case $4 in
+          '{{.Id}}') printf '%s\n' "$STUB_ID" ;;
+          '{{json (index .Config "Volumes")}}') printf '%s\n' "$STUB_VOLS" ;;
+          *) exit 1 ;;
+        esac ;;
+      *) exit 0 ;;
+    esac ;;
+  "run "*) shift; printf '%s\0' "$@" >"$STUB_ARGV" ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod 700 "$d/bin/docker"
+  ck() { if [[ $2 == "$3" ]]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s (got %s, want %s)\n' "$1" "'$2'" "'$3'"; fails=$((fails + 1)); fi; }
+  img="sha256:$(printf 'a%.0s' {1..64})"
+  # lrun ENV... -- LAUNCH ARGS...: -> rc, $d/err, and the recorded argv in a=().
+  lrun() {
+    local e=()
+    while [[ $1 != -- ]]; do e+=("$1"); shift; done
+    shift
+    rm -f "$d/argv"
+    env -u TELELEM_IMAGE PATH="$d/bin:$PATH" STUB_ID="$img" STUB_ARGV="$d/argv" "${e[@]}" "$RS/launch" "$@" >/dev/null 2>"$d/err"
+    rc=$?
+    a=()
+    [[ -e $d/argv ]] && mapfile -d '' a <"$d/argv"
+  }
+  BVL=(boot-validated --store "$d/store" --boot "$d/boot" --image-id "$img" --manifest-sha256 "$(printf 'b%.0s' {1..64})"
+    --tenant local --route chat --container-name telelem-rs-lsel)
+  lrun STUB_VOLS='{"/data":{}}' -- "${BVL[@]}"
+  ck "launch: an approved image that declares VOLUME paths is refused (exit 2), no docker run" \
+    "$rc $(grep -c 'declares VOLUME paths' "$d/err") ${#a[@]}" "2 1 0"
+  lrun STUB_VOLS='{}' -- "${BVL[@]}"
+  ck "launch: an empty VOLUME map is accepted" "$rc $((${#a[@]} > 0))" "0 1"
+  lrun STUB_VOLS=null -- "${BVL[@]}"
+  ck "launch: no VOLUME config: docker run is called" "$rc $((${#a[@]} > 0))" "0 1"
+  local mounts=() vs=0 ent= hc=0 at=-1
+  for ((i = 0; i < ${#a[@]}; i++)); do
+    case ${a[i]} in
+      --mount) mounts+=("${a[i + 1]}") ;;
+      -v | --volume) vs=$((vs + 1)) ;;
+      --entrypoint) ent=${a[i + 1]} ;;
+      --no-healthcheck) hc=1 ;;
+    esac
+    [[ ${a[i]} == "$img" && $at == -1 ]] && at=$i
+  done
+  n=0
+  for i in "${mounts[@]}"; do [[ $i == type=bind,source=/*,target=/*,bind-recursive=disabled,bind-propagation=private ]] && n=$((n + 1)); done
+  ck "launch: 13 binds, each non-recursive and private, no -v" "${#mounts[@]} $n $vs" "13 13 0"
+  n=$(printf '%s\n' "${mounts[@]}" | grep -c ',readonly,')
+  ck "launch: 12 of them read-only; only /sbx/store is writable" \
+    "$n $(printf '%s\n' "${mounts[@]}" | grep -v ',readonly,' | sed -E 's/.*,target=([^,]*),.*/\1/')" "12 /sbx/store"
+  ck "launch: the boot dir is bound read-only at /sbx/boot" \
+    "$(printf '%s\n' "${mounts[@]}" | grep -c "^type=bind,source=$d/boot,target=/sbx/boot,readonly,")" 1
+  ck "launch: ENTRYPOINT replaced by /usr/bin/env, HEALTHCHECK disabled" "$ent $hc" "/usr/bin/env 1"
+  ck "launch: the image is the approved ID, followed by -i and the fixed env list" \
+    "$at ${a[*]:at+1:9}" \
+    "$at -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 ERL_INETRC=/opt/route-store/inetrc ERL_CRASH_DUMP_SECONDS=0 /bin/sh /opt/route-store/entry.sh boot-validated"
+  lrun STUB_VOLS=null -- boot-validated --store "$d/store" --boot "$d/b,x" --image-id "$img" \
+    --manifest-sha256 "$(printf 'b%.0s' {1..64})" --tenant local --route chat
+  ck "launch: a mount source with a comma is refused (exit 2), no docker run" \
+    "$rc $(grep -c 'contains a comma' "$d/err") ${#a[@]}" "2 1 0"
+  # Legacy start: the same argv shape as before boot-validated existed (-v binds, image
+  # then /bin/sh entry.sh start ...).
+  lrun -- start --store "$d/store" --tenant local --route chat --container-name telelem-rs-lsel
+  ck "launch start (unchanged): -v binds only, no --mount/--entrypoint/--no-healthcheck" \
+    "$rc $(printf '%s\n' "${a[@]}" | grep -cx -e '--mount' -e '--entrypoint' -e '--no-healthcheck') $(printf '%s\n' "${a[@]}" | grep -cx -- -v)" "0 0 8"
+  ck "launch start (unchanged): ends with the image, /bin/sh entry.sh start and its args" \
+    "${a[*]: -8}" "telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0 /bin/sh /opt/route-store/entry.sh start --tenant local --route chat"
+  ((fails > 100)) && fails=100
+  exit "$fails"
+)
+
 # =========================================================================================
 echo "# 0. cleanup ownership (stubbed docker) and the process supervisor (own children only)"
 cleanup_selftest
 expect "case 0: every check above held" "$?" 0
+echo "# 0b. launcher argv for boot-validated and start (stubbed docker CLI; nothing runs)"
+launcher_selftest
+expect "case 0b: every check above held" "$?" 0
 if ((SELFTEST_ONLY)); then
   echo
   echo "passed $PASS, failed $FAIL"
@@ -1020,19 +1108,23 @@ ok "boot-validated writer verified: beam.smp as PID 1 (host pid $VPID) holding t
 INSPECT_PY='import json, sys
 c = json.load(sys.stdin)[0]
 h = c["HostConfig"]
-ms = sorted((m["Destination"], m["Type"], m["RW"]) for m in c["Mounts"])
+ms = sorted((m["Destination"], m["Type"], m["RW"], m.get("Propagation")) for m in c["Mounts"])
+nonrec = all((m.get("BindOptions") or {}).get("NonRecursive") is True for m in h.get("Mounts") or [])
 src = ["boundary", "plan_digest", "file_store", "revision", "path_policy", "id", "bindings", "verified_target", "bootstrap"]
-want = sorted([("/opt/telelem/src/%s.ex" % s, "bind", False) for s in src] +
-  [("/opt/route-store", "bind", False), ("/opt/lock/with-route-store-lock", "bind", False),
-   ("/sbx/boot", "bind", False), ("/sbx/store", "bind", True)])
+want = sorted([("/opt/telelem/src/%s.ex" % s, "bind", False, "private") for s in src] +
+  [("/opt/route-store", "bind", False, "private"), ("/opt/lock/with-route-store-lock", "bind", False, "private"),
+   ("/sbx/boot", "bind", False, "private"), ("/sbx/store", "bind", True, "private")])
 env = c["Config"]["Env"] or []
 cmd = c["Config"]["Cmd"] or []
+hc = (c["Config"].get("Healthcheck") or {}).get("Test")
 ok = [c["Image"] == sys.argv[1], h["NetworkMode"] == "none", h["LogConfig"]["Type"] == "none",
-      h["ReadonlyRootfs"] is True, h["CapDrop"] == ["ALL"], ms == want,
-      cmd[:2] == ["/usr/bin/env", "-i"], not any("KEY" in a for a in cmd),
+      h["ReadonlyRootfs"] is True, h["CapDrop"] == ["ALL"], ms == want, nonrec,
+      len(h.get("Mounts") or []) == len(want), not h.get("Binds"),
+      c["Config"].get("Entrypoint") == ["/usr/bin/env"], cmd[:1] == ["-i"], hc == ["NONE"],
+      not any("KEY" in a for a in cmd),
       not any(k in e for e in env for k in ("KEY", "SECRET", "TOKEN"))]
 print("ok" if all(ok) else "mismatch %r %r" % (ok, ms))'
-expect "docker inspect: image by approved ID, network none, log driver none, ro rootfs, closed mounts, env -i, no key in env/argv" \
+expect "docker inspect: approved ID, network none, log none, ro rootfs, closed non-recursive private binds, entrypoint env -i, no healthcheck, no key in env/argv" \
   "$(docker inspect "$CID" 2>/dev/null | python3 -I -c "$INSPECT_PY" "$IMAGE_ID")" ok
 run_cmd bv-busy boot-validated "$BS" --boot "$GOOD" --manifest-sha256 "$GOODSHA" "${BV[@]}"
 expect "second boot-validated against the running store: busy 75" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
@@ -1087,21 +1179,29 @@ expect "boot-validated never provisions: exit 3 not_provisioned, store still emp
   "$RC $(jget "$OUT" 'd["op"]+"/"+d["reason"]') $(snapshot "$STORE")" "3 start/not_provisioned $before"
 
 # 8e. In-container checks, reached by bypassing the launcher (as case 7 does): the same
-# docker run as `launch boot-validated`, with one thing changed per run.
-bv_direct() { # NAME STORE RS_DIR EXTRA_ENV BOOT_MOUNT_MODE [EXTRA docker args...] -> RC OUT ERR
-  local n st=$2 rsd=$3 xenv=$4 bmode=$5 m=() f
+# docker run as `launch boot-validated` (case 0b shows its argv), with one thing changed
+# per run.
+bv_direct() { # NAME STORE RS_DIR EXTRA_ENV BOOT_MOUNT_MODE(ro|rw) [EXTRA docker args...] -> RC OUT ERR
+  local n st=$2 rsd=$3 xenv=$4 bmode=$5 m=() f nr=bind-recursive=disabled,bind-propagation=private
   cname "$1" test "$st"
   n=$CNAME
   shift 5
   for f in ops/boundary.ex ops/plan_digest.ex ops/file_store.ex route/revision.ex sandbox/path_policy.ex \
     sandbox/id.ex sandbox/bindings.ex sandbox/verified_target.ex sandbox/bootstrap.ex; do
-    m+=(-v "$ROOT/lib/telelem/$f:/opt/telelem/src/${f##*/}:ro")
+    m+=(--mount "type=bind,source=$ROOT/lib/telelem/$f,target=/opt/telelem/src/${f##*/},readonly,$nr")
   done
+  m+=(--mount "type=bind,source=$rsd,target=/opt/route-store,readonly,$nr")
+  m+=(--mount "type=bind,source=$WRAP,target=/opt/lock/with-route-store-lock,readonly,$nr")
+  if [[ $bmode == ro ]]; then
+    m+=(--mount "type=bind,source=$GOOD,target=/sbx/boot,readonly,$nr")
+  else
+    m+=(--mount "type=bind,source=$GOOD,target=/sbx/boot,$nr")
+  fi
+  m+=(--mount "type=bind,source=$st,target=/sbx/store,$nr")
   timeout -k 5 "$T" docker run --rm --pull never --log-driver none --name "$n" --label telelem.route-store=test \
     --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
-    --workdir / --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 "${m[@]}" -v "$rsd:/opt/route-store:ro" \
-    -v "$WRAP:/opt/lock/with-route-store-lock:ro" -v "$GOOD:/sbx/boot:$bmode" -v "$st:/sbx/store" "$@" \
-    "$IMAGE_ID" /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 \
+    --workdir / --no-healthcheck --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 "${m[@]}" "$@" \
+    --entrypoint /usr/bin/env "$IMAGE_ID" -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 \
     ERL_INETRC=/opt/route-store/inetrc ERL_CRASH_DUMP_SECONDS=0 $xenv \
     /bin/sh /opt/route-store/entry.sh boot-validated --tenant local --route chat --manifest-sha256 "$GOODSHA" \
     >"$BASE/out" 2>"$BASE/err"
@@ -1132,9 +1232,9 @@ printf '{lookup, [native]}.\n' >>"$BASE/rs-alt/inetrc"
 bv_direct bv-resolver "$BS" "$BASE/rs-alt" "" ro </dev/null
 d_refused "resolver file not the pinned bytes, before any BEAM" entry entry_resolver_unpinned
 bv_direct bv-extramount "$BS" "$RS" "" ro -v "$GOOD:/opt/extra:ro" </dev/null
-d_refused "an extra read-only mount, seen in the VM's mountinfo" beam mount_unexpected
+d_refused "an extra read-only mount, before any BEAM (entry.sh mountinfo check)" entry entry_mount_unexpected
 bv_direct bv-bootrw "$BS" "$RS" "" rw </dev/null
-d_refused "the boot dir mounted writable" beam mount_app_mode
+d_refused "the boot dir mounted writable, before any BEAM (entry.sh mountinfo check)" entry entry_mount_app_mode
 
 echo
 echo "passed $PASS, failed $FAIL"
