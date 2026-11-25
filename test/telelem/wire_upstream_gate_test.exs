@@ -8,7 +8,11 @@ defmodule Telelem.WireUpstreamGateTest do
   `{:connect_failed, _, _}` message, which each case refutes).
 
   What this covers: the closed option interface (refused in the caller, no
-  process spawned), legacy defaults, the pure timeout clamps and the
+  process spawned) including a duplicate `:gate` and the gated numeric limit
+  ranges, the grant-specific attach (`Handoff.attach_grant/3`: a typed
+  `:grant_required` refusal from a coordinator without `coordinator_grant`,
+  `[:primary]` included, with nothing changed), legacy defaults and ordinary
+  attach, the pure timeout clamps and the
   controller's sanitized vocabulary, and pre-dial denial by a real
   `Telelem.Handoff` in `coordinator_grant` mode with its real pinned
   `Telelem.Admission.Authority` (ledger and receive trace are the evidence).
@@ -90,6 +94,10 @@ defmodule Telelem.WireUpstreamGateTest do
       path: Keyword.put(good, :path, "/v1/other"),
       unknown: Keyword.put(good, :transport_opts, verify: :verify_none),
       duplicate: good ++ [body: "{}"],
+      leading_nil_gate: [{:gate, nil} | good],
+      trailing_nil_gate: good ++ [gate: nil],
+      two_gates: good ++ [gate: [target: t, deadline: d]],
+      two_nil_gates_only: [handoff: h, id: :primary, gate: nil, gate: nil],
       missing_body: Keyword.delete(good, :body),
       missing_controller: Keyword.delete(good, :controller),
       gate_map: Keyword.put(good, :gate, %{target: t, deadline: d}),
@@ -126,6 +134,222 @@ defmodule Telelem.WireUpstreamGateTest do
     assert Authority.snapshot(ctx.auth).grants == %{}
   end
 
+  test "a duplicate :gate is refused before mode selection, with the gate's message", ctx do
+    d = now() + 60_000
+    gate = [target: ctx.target, deadline: d]
+
+    # Each would otherwise select legacy (first gate: nil) or one of two gates.
+    for opts <- [
+          [gate: nil, gate: gate],
+          [gate: nil, gate: nil],
+          [gate: gate, gate: nil],
+          [gate: gate, gate: gate],
+          [gate: nil, terminal_deadline: :soon, gate: nil]
+        ] do
+      e = assert_raise ArgumentError, fn -> Upstream.start_link(opts) end
+      assert e.message == "Upstream gate: :gate must be given at most once", inspect(opts)
+    end
+  end
+
+  test "every numeric limit of a gated attempt is range-checked before spawn; defaults pass",
+       ctx do
+    d = now() + 60_000
+    h = idle()
+    l = Limits.new()
+    ranges = Upstream.gate_limit_ranges()
+
+    # Every numeric field of Limits is covered, and every default is in range.
+    numeric = for {k, v} <- Map.from_struct(l), is_integer(v), do: k
+    assert Enum.sort(numeric) == Enum.sort(Keyword.keys(ranges))
+    for {k, max} <- ranges, do: assert(Map.fetch!(l, k) in 1..max, "default #{k}")
+
+    # The legacy defaults themselves are unchanged.
+    assert Map.from_struct(l) == %{
+             window: 65_536,
+             max_event: 65_536,
+             high_water: 131_072,
+             hard_cap: 262_144,
+             overflow: :abort,
+             cleanup_timeout_ms: 500,
+             cleanup_deadline_ms: 1_000,
+             connect_timeout_ms: 2_000,
+             register_timeout_ms: 2_000,
+             response_timeout_ms: 30_000,
+             max_request_body: 1_048_576,
+             upstream_recbuf: 16_384,
+             upstream_read_buffer: 16_384,
+             downstream_sndbuf: 65_536
+           }
+
+    good = [
+      handoff: h,
+      id: :primary,
+      controller: self(),
+      body: "{}",
+      limits: l,
+      gate: [target: ctx.target, deadline: d]
+    ]
+
+    {:links, links} = Process.info(self(), :links)
+
+    for {k, max} <- ranges, v <- [0, -1, max + 1, 1.0 * Map.fetch!(l, k), :x, nil, "1"] do
+      opts = Keyword.put(good, :limits, Map.put(l, k, v))
+      e = assert_raise ArgumentError, fn -> Upstream.start_link(opts) end
+      assert e.message == "Upstream gate: :limits #{k} must be an integer in 1..#{max}"
+    end
+
+    # A missing field is refused too (as nil).
+    e =
+      assert_raise ArgumentError, fn ->
+        Upstream.start_link(Keyword.put(good, :limits, Map.delete(l, :window)))
+      end
+
+    assert e.message =~ ":limits window must be an integer"
+
+    assert {:links, ^links} = Process.info(self(), :links)
+  end
+
+  test "upper-bound limits are accepted and the attempt still stops at the grant check", ctx do
+    {:ok, h} = Handoff.start(requester: idle(), attempts: [:primary])
+    on_exit(fn -> Process.exit(h, :kill) end)
+    ranges = Map.new(Upstream.gate_limit_ranges())
+
+    l =
+      Limits.new(
+        connect_timeout_ms: ranges.connect_timeout_ms,
+        response_timeout_ms: ranges.response_timeout_ms,
+        hard_cap: ranges.hard_cap,
+        max_request_body: ranges.max_request_body
+      )
+
+    {:ok, target} = VerifiedTarget.build("a", "127.0.0.1", 1, [ctx.der])
+
+    {:ok, up} =
+      Upstream.start_link(
+        handoff: h,
+        id: :primary,
+        controller: self(),
+        body: "{}",
+        limits: l,
+        gate: [target: target, deadline: now() + 60_000]
+      )
+
+    assert_receive {:telelem_wire, ^up, :primary,
+                    {:ended, {:attach, :error, :grant_required}, _}},
+                   @t
+
+    refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
+  end
+
+  test "legacy limits are not range-checked: a legacy attempt still spawns with them", ctx do
+    {:ok, h} = Handoff.start(requester: idle(), attempts: [:other])
+    on_exit(fn -> Process.exit(h, :kill) end)
+    lane = %{name: "a", host: "127.0.0.1", port: 1, cacerts: [ctx.der]}
+
+    {:ok, up} =
+      Upstream.start_link(
+        handoff: h,
+        id: :primary,
+        controller: self(),
+        lane: lane,
+        body: "{}",
+        limits: %{Limits.new() | connect_timeout_ms: 0, upstream_recbuf: 1.5}
+      )
+
+    mon = Process.monitor(up)
+    # Attach refused (unknown id): legacy ends silently, before any dial.
+    assert_receive {:DOWN, ^mon, :process, _, :normal}, @t
+    refute_received {:telelem_wire, ^up, _, _}
+  end
+
+  # ── grant-specific attach ───────────────────────────────────────────────
+
+  test "attach_grant/3 on a coordinator without coordinator_grant: typed refusal, nothing changed" do
+    req = idle()
+
+    {:ok, h} =
+      Handoff.start(requester: req, attempts: [:primary], trace: self(), register_timeout: 60_000)
+
+    on_exit(fn -> Process.exit(h, :kill) end)
+    d = now() + 60_000
+    before = Handoff.status(h)
+
+    assert Handoff.attach_grant(h, :primary, deadline: d) == {:error, :grant_required}
+    # Mode first: also for an unknown id.
+    assert Handoff.attach_grant(h, :other, deadline: d) == {:error, :grant_required}
+
+    assert Handoff.status(h) == before
+    assert %{phase: :open, outcome: nil, attempts: %{primary: %{pid: nil}}} = before
+    refute_received {:telelem_handoff_trace, ^h, _}
+    refute_received {:DOWN, _, :process, ^h, _}
+
+    # The deadline is required in the caller, before any call.
+    assert_raise ArgumentError, fn -> Handoff.attach_grant(h, :primary, []) end
+    assert_raise ArgumentError, fn -> Handoff.attach_grant(h, :primary, deadline: :soon) end
+
+    # Ordinary attach is unchanged for legacy callers.
+    assert {:ok, mref} = Handoff.attach(h, :primary)
+    assert is_reference(mref)
+    assert_receive {:telelem_handoff_trace, ^h, {:attached, :primary}}, @t
+    me = self()
+    assert %{attempts: %{primary: %{pid: ^me}}} = Handoff.status(h)
+  end
+
+  test "a gated attempt on a legacy [:primary] coordinator ends with a typed refusal before any dial",
+       ctx do
+    req = idle()
+
+    {:ok, h} =
+      Handoff.start(requester: req, attempts: [:primary], trace: self(), register_timeout: 60_000)
+
+    on_exit(fn -> Process.exit(h, :kill) end)
+    d = now() + 60_000
+    {:ok, target} = VerifiedTarget.build("a", "127.0.0.1", 1, [ctx.der])
+
+    {:ok, up} =
+      Upstream.start_link(
+        handoff: h,
+        id: :primary,
+        controller: self(),
+        body: "{}",
+        limits: Limits.new(),
+        gate: [target: target, deadline: d]
+      )
+
+    assert_receive {:telelem_wire, ^up, :primary,
+                    {:ended, {:attach, :error, :grant_required}, stats}},
+                   @t
+
+    # Not registered, so never acknowledged and never dispatched.
+    assert %{claim: :none, cleaned_ack: :not_sent, unsent_pending: 0} = stats
+    refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
+
+    assert %{
+             phase: :open,
+             outcome: nil,
+             attempts: %{primary: %{pid: nil, dispatched: false, cleanup: nil}}
+           } = Handoff.status(h)
+
+    # The status reply follows any trace h sent before it: there was none.
+    refute_received {:telelem_handoff_trace, ^h, _}
+  end
+
+  test "attach_grant/3 on a coordinator_grant coordinator reserves for the caller only", ctx do
+    r = start_h!(ctx)
+    %{h: h, d: d} = r
+
+    # Same checks as attach/3 with deadline: a wrong deadline changes nothing.
+    assert Handoff.attach_grant(h, :primary, deadline: d + 1) == {:error, :deadline_required}
+    assert %{grant: :idle, attempts: %{primary: %{pid: nil}}} = Handoff.status(h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+
+    me = self()
+    assert {:ok, _} = Handoff.attach_grant(h, :primary, deadline: d)
+    assert %{grant: :reserved, attempts: %{primary: %{pid: ^me}}} = Handoff.status(h)
+    {_gid, g} = only_grant!(ctx.auth)
+    assert %{owner: ^me, state: :reserved, units: @units} = g
+  end
+
   test "legacy defaults are unchanged: no gate, or gate: nil", ctx do
     # The legacy validation and its message.
     for gate <- [[], [gate: nil]] do
@@ -160,15 +384,15 @@ defmodule Telelem.WireUpstreamGateTest do
 
   test "a gated attempt whose attach is refused reports one sanitized end and never acknowledges",
        ctx do
-    {:ok, h} = Handoff.start(requester: idle(), attempts: [:other])
-    on_exit(fn -> Process.exit(h, :kill) end)
-    d = now() + 60_000
+    # A coordinator_grant coordinator (attempts: [:primary]) and an id it
+    # does not know: refused by the grant-specific attach, nothing reserved.
+    %{h: h, d: d} = start_h!(ctx)
 
     # terminal_deadline equal to the gate's is accepted.
     {:ok, up} =
       Upstream.start_link(
         handoff: h,
-        id: :primary,
+        id: :other,
         controller: self(),
         body: "{}",
         limits: Limits.new(),
@@ -176,13 +400,14 @@ defmodule Telelem.WireUpstreamGateTest do
         terminal_deadline: d
       )
 
-    assert_receive {:telelem_wire, ^up, :primary,
+    assert_receive {:telelem_wire, ^up, :other,
                     {:ended, {:attach, :error, :unknown_attempt}, stats}},
                    @t
 
     assert %{claim: :none, cleaned_ack: :not_sent, unsent_pending: 0} = stats
     refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
-    assert %{attempts: %{other: %{pid: nil}}} = Handoff.status(h)
+    assert %{grant: :idle, attempts: %{primary: %{pid: nil}}} = Handoff.status(h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
   end
 
   # ── timing and vocabulary (pure) ────────────────────────────────────────
@@ -236,6 +461,7 @@ defmodule Telelem.WireUpstreamGateTest do
       {{:done_without_finish_reason, :no_finish}, :done_without_finish_reason},
       {{:attach, :cancel, {:requester_down, secret}}, {:attach, :cancel, :requester_down}},
       {{:attach, :error, :unconfirmed}, {:attach, :error, :unconfirmed}},
+      {{:attach, :error, :grant_required}, {:attach, :error, :grant_required}},
       {{:attach, :other, :x}, :other},
       {{:stopped, :after_attach, {:cancelled, secret}},
        {:stopped, :after_attach, {:cancelled, :other}}},

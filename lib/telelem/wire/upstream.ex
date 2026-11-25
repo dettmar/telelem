@@ -96,19 +96,25 @@ defmodule Telelem.Wire.Upstream do
 
   ## Gated attempt (opt-in: `gate: [target:, deadline:]`)
 
-  Off by default; without `:gate` (or with `gate: nil`) nothing below applies
-  and every shape above is unchanged. It is meant for a coordinator started
-  with `coordinator_grant` (see `Telelem.Handoff`); the attempt cannot tell
-  how its coordinator was configured, so pairing them is the caller's
-  contract.
+  Off by default; without `:gate` (or with exactly one `gate: nil`) nothing
+  below applies and every shape above is unchanged. More than one `:gate`
+  entry (a leading `gate: nil` included) raises `ArgumentError` before either
+  mode is chosen. It requires a coordinator started with `coordinator_grant`
+  (see `Telelem.Handoff`): the attempt attaches with
+  `Handoff.attach_grant/3`, which any other coordinator refuses with
+  `{:error, :grant_required}` before registering it, so the attempt ends
+  without dialing.
 
   **Interface, validated in the caller before the attempt is spawned
   (`ArgumentError`, naming only the offending field) and again in the
   attempt.** Exactly the keys `:handoff` (pid), `:id`, `:controller` (pid),
   `:body` (binary, at most `limits.max_request_body` bytes), `:limits` (a
-  `Telelem.Wire.Limits` whose relations `Limits.new/1` accepts, with positive
-  integer timeouts), `:gate`, and optionally `:terminal_deadline` equal to
-  the gate's deadline; each once. `:lane`, `:recorder`, `:rid`, `:path` and
+  `Telelem.Wire.Limits` whose every numeric field is an integer in `1..max`,
+  `max` being `2^32 - 1` for the `*_ms` timeouts and `2^31 - 1` for the byte
+  counts and socket buffer sizes, and whose relations `Limits.new/1`
+  accepts), `:gate`, and optionally `:terminal_deadline` equal to the gate's
+  deadline; each once. Legacy attempts and the `Limits` defaults are not
+  affected by these checks. `:lane`, `:recorder`, `:rid`, `:path` and
   any other key are refused: the destination, trust and transport options
   come only from the target and the limits, and no Recorder runs.
   `:gate` is exactly `[target: t, deadline: d]`:
@@ -121,14 +127,17 @@ defmodule Telelem.Wire.Upstream do
       (fixture CA, `verify_peer`; no OS trust store fallback).
     * `d` is the coordinator's absolute `:terminal_deadline`
       (`System.monotonic_time(:millisecond)`). The same integer is passed as
-      `deadline:` to `Handoff.attach/3`, `Handoff.begin_dispatch/3` and
+      `deadline:` to `Handoff.attach_grant/3`, `Handoff.begin_dispatch/3` and
       `Handoff.finish/4`.
 
   **Order.**
 
-    1. `attach(h, id, deadline: d)`. With `coordinator_grant` its `:ok`
-       comes only after the authority reserved the grant for this pid, so
-       nothing is dialed before the reservation.
+    1. `attach_grant(h, id, deadline: d)`. Its `:ok` comes only from a
+       `coordinator_grant` coordinator, after the authority reserved the
+       grant for this pid, so nothing is dialed before the reservation. A
+       coordinator without `coordinator_grant` replies
+       `{:error, :grant_required}` (controller:
+       `{:ended, {:attach, :error, :grant_required}, stats}`).
     2. Check, without waiting: a coordinator `{:cancel, _}`, the
        coordinator's `:DOWN` (the attach monitor) and `now < d`. Any of them
        stops the attempt before dialing.
@@ -170,7 +179,7 @@ defmodule Telelem.Wire.Upstream do
   Not clamped: the request write (`Mint.HTTP.request/5` -> `:ssl.send/2` has
   no per-call timeout; it can block on the kernel send buffer), `ready/2`,
   `transfer/2` and `cleaned/3` (the coordinator's 5 s call timeout),
-  `attach/3`, `begin_dispatch/3` and `finish/4` (`d` plus the coordinator's
+  `attach_grant/3`, `begin_dispatch/3` and `finish/4` (`d` plus the coordinator's
   grace), `Mint.HTTP.close/1` (OTP's own close behaviour), parsing of one
   delivery, and scheduling. A blocked call delays the next check; nothing
   here proves socket teardown timing or slot quiescence.
@@ -209,24 +218,66 @@ defmodule Telelem.Wire.Upstream do
   closed option set.
   """
   def start_link(opts) do
-    if Keyword.get(opts, :gate) == nil do
-      case Keyword.get(opts, :terminal_deadline) do
-        d when is_nil(d) or is_integer(d) ->
-          :ok
+    case mode!(opts) do
+      :legacy ->
+        case Keyword.get(opts, :terminal_deadline) do
+          d when is_nil(d) or is_integer(d) ->
+            :ok
 
-        other ->
-          raise ArgumentError,
-                "Upstream :terminal_deadline must be an integer or nil, got: #{inspect(other)}"
-      end
-    else
-      _ = gate!(opts)
+          other ->
+            raise ArgumentError,
+                  "Upstream :terminal_deadline must be an integer or nil, got: #{inspect(other)}"
+        end
+
+      :gated ->
+        _ = gate!(opts)
     end
 
     {:ok, :proc_lib.spawn_link(__MODULE__, :init, [opts])}
   end
 
+  # Mode selection. Every `:gate` entry is counted first, so a duplicate
+  # (`[gate: nil, gate: [...]]` included) is refused before either mode is
+  # chosen; no `:gate`, or exactly one `gate: nil`, is legacy.
+  defp mode!(opts) do
+    gates = if is_list(opts), do: for({:gate, g} <- opts, do: g), else: []
+
+    case gates do
+      [] -> :legacy
+      [nil] -> :legacy
+      [_] -> :gated
+      _ -> gate_error(":gate must be given at most once")
+    end
+  end
+
   @gate_keys [:handoff, :id, :controller, :body, :limits, :gate, :terminal_deadline]
   @gate_required [:handoff, :id, :controller, :body, :limits, :gate]
+
+  # Gated attempts only: every numeric field of `Limits`, an integer in
+  # 1..max. Timeouts fit an Erlang `receive ... after` / timer (2^32 - 1 ms);
+  # byte counts and socket buffer sizes fit a signed 32-bit int. Checked
+  # before `Limits.new/1`, whose relations compare terms of any type.
+  @max_timeout_ms 4_294_967_295
+  @max_bytes 2_147_483_647
+  @gate_limit_ranges [
+    window: @max_bytes,
+    max_event: @max_bytes,
+    high_water: @max_bytes,
+    hard_cap: @max_bytes,
+    cleanup_timeout_ms: @max_timeout_ms,
+    cleanup_deadline_ms: @max_timeout_ms,
+    connect_timeout_ms: @max_timeout_ms,
+    register_timeout_ms: @max_timeout_ms,
+    response_timeout_ms: @max_timeout_ms,
+    max_request_body: @max_bytes,
+    upstream_recbuf: @max_bytes,
+    upstream_read_buffer: @max_bytes,
+    downstream_sndbuf: @max_bytes
+  ]
+
+  @doc false
+  # The gated numeric limit ranges, `[{field, max}]` (min is always 1).
+  def gate_limit_ranges, do: @gate_limit_ranges
 
   # The gated interface: a closed key set, each key once, and a target that
   # VerifiedTarget re-validates. Messages name the field, never its value.
@@ -278,21 +329,23 @@ defmodule Telelem.Wire.Upstream do
 
     limits =
       case opts[:limits] do
-        %Limits{} = l ->
-          try do
-            Limits.new(l |> Map.from_struct() |> Map.to_list())
-          rescue
-            _ -> gate_error(":limits are inconsistent")
-          end
-
-        _ ->
-          gate_error(":limits must be a Telelem.Wire.Limits")
+        %Limits{} = l -> l
+        _ -> gate_error(":limits must be a Telelem.Wire.Limits")
       end
 
-    for k <- [:connect_timeout_ms, :response_timeout_ms, :max_request_body] do
-      v = Map.fetch!(limits, k)
-      unless is_integer(v) and v > 0, do: gate_error(":limits #{k} must be a positive integer")
+    for {k, max} <- @gate_limit_ranges do
+      v = Map.get(limits, k)
+
+      unless is_integer(v) and v >= 1 and v <= max,
+        do: gate_error(":limits #{k} must be an integer in 1..#{max}")
     end
+
+    limits =
+      try do
+        Limits.new(limits |> Map.from_struct() |> Map.to_list())
+      rescue
+        _ -> gate_error(":limits are inconsistent")
+      end
 
     body = opts[:body]
 
@@ -306,7 +359,7 @@ defmodule Telelem.Wire.Upstream do
 
   @doc false
   def init(opts) do
-    gate = if Keyword.get(opts, :gate) != nil, do: gate!(opts)
+    gate = if mode!(opts) == :gated, do: gate!(opts)
 
     %Limits{} = limits = Keyword.fetch!(opts, :limits)
 
@@ -387,8 +440,11 @@ defmodule Telelem.Wire.Upstream do
   defp gate_lane(%VerifiedTarget{} = t),
     do: %{name: t.deployment_id, host: t.host, port: t.port}
 
+  # Grant-specific attach: a coordinator without `coordinator_grant` answers
+  # {:error, :grant_required} before registering anything, so the attempt
+  # ends here, before any dial, and does not acknowledge.
   defp gated_attach(s) do
-    case Handoff.attach(s.h, s.id, deadline: s.gate.deadline) do
+    case Handoff.attach_grant(s.h, s.id, deadline: s.gate.deadline) do
       {:ok, hmon} ->
         s = %{s | hmon: hmon}
 
@@ -1114,6 +1170,7 @@ defmodule Telelem.Wire.Upstream do
     :pending,
     :duplicate,
     :deadline_required,
+    :grant_required,
     :already_attached,
     :not_attached,
     :unknown_attempt,

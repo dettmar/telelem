@@ -141,7 +141,10 @@ defmodule Telelem.Handoff do
     1. `attach(h, id, deadline: d)` registers the caller, then reserves
        `units` with **exactly that pid** as owner (the authority monitors it).
        The reply is deferred: `{:ok, mref}` only on `{:ok, grant}`. The
-       attempt connects only after that.
+       attempt connects only after that. An attempt that must not run
+       without this reservation calls `attach_grant(h, id, deadline: d)`
+       instead: the same step here, but `{:error, :grant_required}` (no
+       change at all) from a coordinator without `coordinator_grant`.
     2. After connect, `begin_dispatch(h, id, deadline: d)` sends one authorize
        for that grant. Its deferred reply `:ok` is the only send permission,
        given at most once and only for a fresh `{:ok, same_grant}` reply to
@@ -420,15 +423,37 @@ defmodule Telelem.Handoff do
   authority reserved this attempt's grant (see "Coordinator grant").
   """
   def attach(h, id, opts \\ []) when is_list(opts) do
+    case deadline_opt(opts, "attach/3") do
+      nil -> attach_result(h, &call(&1, {:attach, id}))
+      d -> attach_result(h, &bounded_call(&1, {:attach, id, d}, d))
+    end
+  end
+
+  @doc """
+  The grant-specific attach: `attach/3` that succeeds **only** on a
+  coordinator started with `coordinator_grant` (see "Coordinator grant").
+  `deadline:` (an integer, the shared `:terminal_deadline`) is required;
+  anything else raises `ArgumentError` in the caller before any call.
+
+  The coordinator checks its mode in the same step that would register the
+  caller, before anything else: a coordinator without `coordinator_grant`
+  (whatever its attempt ids, `[:primary]` included) replies
+  `{:error, :grant_required}` and changes nothing (no registration, monitor,
+  trace or reservation). With `coordinator_grant` it behaves exactly as
+  `attach(h, id, deadline: d)`: `{:ok, mref}` only after the authority
+  reserved this attempt's grant for the calling pid.
+  """
+  def attach_grant(h, id, opts) when is_list(opts) do
+    case deadline_opt(opts, "attach_grant/3") do
+      d when is_integer(d) -> attach_result(h, &bounded_call(&1, {:attach, id, d, :grant}, d))
+      nil -> raise ArgumentError, "attach_grant/3 requires an integer :deadline"
+    end
+  end
+
+  defp attach_result(h, fun) do
     mref = Process.monitor(h)
 
-    result =
-      case deadline_opt(opts, "attach/3") do
-        nil -> call(h, {:attach, id})
-        d -> bounded_call(h, {:attach, id, d}, d)
-      end
-
-    case result do
+    case fun.(h) do
       :ok ->
         {:ok, mref}
 
@@ -800,6 +825,14 @@ defmodule Telelem.Handoff do
 
   @impl true
   def handle_call({:attach, id}, from, s), do: handle_call({:attach, id, nil}, from, s)
+
+  # attach_grant/3: the mode is checked first, in this one step, so a
+  # coordinator without a grant refuses before any registration or trace.
+  def handle_call({:attach, _id, _deadline, :grant}, _from, %{grant: nil} = s),
+    do: {:reply, {:error, :grant_required}, s}
+
+  def handle_call({:attach, id, deadline, :grant}, from, s),
+    do: handle_call({:attach, id, deadline}, from, s)
 
   def handle_call({:attach, id, deadline}, {pid, _} = from, s) do
     case Map.fetch(s.attempts, id) do
