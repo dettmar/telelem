@@ -56,6 +56,16 @@ defmodule Telelem.Receipts.Store do
   array remain readable through `Producer.stats/1`. A restarted store is a new
   store with new handles and no memory of earlier receipts.
 
+  ## Binding descriptor
+
+  At start the store also creates a second, unnamed, `:protected` ETS table
+  with no heir, owned by this process like the pending table, and writes
+  one row into it once: `{:binding, producer, mode, limits}`, with the exact
+  handle `producer/1` returns, the actual mode and the actual configured
+  `max_pending`, `max_retained`, `max_event_bytes` and `loss_slots`. Only
+  this process can write it; it disappears when this process exits.
+  `Telelem.Receipts.Producer.binding/2` reads it without messaging the store.
+
   The pending table is `:public` so writers can insert without a message;
   code holding the handle is trusted in-VM code. The store still re-validates
   every row it takes and discards (and counts as `rejected`) malformed ones.
@@ -114,14 +124,22 @@ defmodule Telelem.Receipts.Store do
     end
 
     table = :ets.new(__MODULE__, [:set, :public, write_concurrency: true])
+    # Binding descriptor (see Producer.binding/2): unnamed, protected (only
+    # this process writes it), no heir (it dies with this process), same
+    # owner as the pending table. Written once, here, never changed.
+    descriptor = :ets.new(__MODULE__.Binding, [:set, :protected, {:heir, :none}])
 
     producer = %Producer{
       table: table,
+      descriptor: descriptor,
       ref: :atomics.new(Producer.counters_size(opts[:loss_slots]), signed: true),
       max_pending: opts[:max_pending],
       max_event_bytes: opts[:max_event_bytes],
       loss_slots: opts[:loss_slots]
     }
+
+    limits = Map.new(Keyword.delete(opts, :sweep_ms))
+    true = :ets.insert_new(descriptor, {:binding, producer, mode, limits})
 
     schedule(opts[:sweep_ms])
 

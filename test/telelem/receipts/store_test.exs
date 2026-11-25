@@ -411,6 +411,150 @@ defmodule Telelem.Receipts.StoreTest do
     end
   end
 
+  describe "binding descriptor" do
+    test "is an unnamed protected no-heir table of the store holding the exact handle, mode and limits" do
+      {store, p} = start(max_pending: 7, max_retained: 9, max_event_bytes: 300, loss_slots: 5)
+      d = p.descriptor
+
+      assert :ets.info(d, :owner) == store and :ets.info(p.table, :owner) == store
+      assert :ets.info(d, :protection) == :protected
+      assert :ets.info(d, :named_table) == false and :ets.info(d, :heir) == :none
+      limits = %{max_pending: 7, max_retained: 9, max_event_bytes: 300, loss_slots: 5}
+      assert :ets.tab2list(d) == [{:binding, p, :sandbox, limits}]
+      assert Store.producer(store) === p
+
+      assert {:ok, %{mode: :sandbox, limits: ^limits}} = Producer.binding(p, store)
+      assert %{limits: %{max_retained: 9}} = Store.stats(store)
+
+      # Only the store writes it.
+      assert_raise ArgumentError, fn -> :ets.insert(d, {:binding, p, :serving, limits}) end
+      assert_raise ArgumentError, fn -> :ets.delete(d) end
+      assert {:ok, %{mode: :sandbox}} = Producer.binding(p, store)
+    end
+
+    test "reports the actual mode and default limits" do
+      store = start_supervised!({Store, mode: :serving})
+      p = Store.producer(store)
+
+      assert {:ok,
+              %{
+                mode: :serving,
+                limits: %{
+                  max_pending: 256,
+                  max_retained: 1_024,
+                  max_event_bytes: 512,
+                  loss_slots: 1_024
+                }
+              }} = Producer.binding(p, store)
+    end
+
+    test "accepts only the exact handle of the pinned store; malformed input fails closed" do
+      {a, pa} = start()
+      b = start_supervised!({Store, mode: :sandbox}, id: :b)
+      pb = Store.producer(b)
+
+      assert {:ok, _} = Producer.binding(pb, b)
+      assert :error = Producer.binding(pb, a)
+      assert :error = Producer.binding(pa, b)
+      assert :error = Producer.binding(pa, self())
+
+      for bad <- [
+            %{pa | max_pending: 1},
+            %{pa | max_event_bytes: 1},
+            %{pa | loss_slots: 1},
+            %{pa | ref: pb.ref},
+            %{pa | table: pb.table},
+            %{pa | descriptor: pb.descriptor},
+            %{pa | table: pa.descriptor, descriptor: pa.table},
+            %{pa | descriptor: :ets.new(:forged, [:set, :protected])},
+            %{pa | table: :nope},
+            %{pa | descriptor: make_ref()},
+            Map.put(pa, :extra, 1),
+            Map.from_struct(pa),
+            nil
+          ] do
+        assert :error = Producer.binding(bad, a), inspect(bad, limit: 4)
+      end
+
+      assert :error = Producer.binding(pa, :not_a_pid)
+      assert :error = Producer.binding(pa, nil)
+    end
+
+    test "a forged descriptor owned by another process does not bind to the store" do
+      {store, p} = start()
+      d = :ets.new(:forged, [:set, :protected])
+      t = :ets.new(:forged_pending, [:set, :public])
+      forged = %{p | table: t, descriptor: d}
+      limits = %{max_pending: 256, max_retained: 1_024, max_event_bytes: 512, loss_slots: 1_024}
+      true = :ets.insert(d, {:binding, forged, :sandbox, limits})
+
+      assert :error = Producer.binding(forged, store)
+    end
+
+    test "a stopped store's handle fails closed, also against a replacement" do
+      {store, p} = start()
+      :ok = stop_supervised(Store)
+      refute Process.alive?(store)
+      assert :error = Producer.binding(p, store)
+
+      {store2, p2} = start()
+      assert :error = Producer.binding(p, store2)
+      assert :error = Producer.binding(p2, store)
+      assert {:ok, _} = Producer.binding(p2, store2)
+    end
+
+    test "never messages or inspects the store: answers while it is suspended" do
+      {store, p} = start()
+      test = self()
+      # Load every module the check uses first, so the traced run does not
+      # talk to the code server (interactive-mode lazy loading).
+      assert {:ok, _} = Producer.binding(p, store)
+
+      checker =
+        spawn_link(fn ->
+          receive do: (:go -> send(test, {:bound, Producer.binding(p, store)}))
+          receive do: (:control -> send(test, {:control, Process.info(store, :status)}))
+        end)
+
+      session = :trace.session_create(:receipts_binding, self(), [])
+      1 = :trace.process(session, checker, true, [:send, :call])
+      assert :trace.function(session, {:erlang, :process_info, :_}, true, []) >= 1
+
+      :ok = :sys.suspend(store)
+
+      try do
+        send(checker, :go)
+        assert_receive {:bound, {:ok, %{mode: :sandbox}}}, 1_000
+        # Positive control: the trace session does see a process_info call.
+        send(checker, :control)
+        assert_receive {:control, {:status, _}}, 1_000
+      after
+        :sys.resume(store)
+      end
+
+      ref = :trace.delivered(session, checker)
+      assert_receive {:trace_delivered, ^checker, ^ref}, 1_000
+      :trace.session_destroy(session)
+      seen = drain(checker, [])
+
+      # Before the control: exactly one send (the result to the test).
+      {before, [_ | _] = control} =
+        Enum.split_while(seen, &(not match?({:call, {:erlang, :process_info, _}}, &1)))
+
+      assert [{:send, {:bound, _}, ^test}] = before
+      assert [{:call, {:erlang, :process_info, [^store, :status]}} | _] = control
+    end
+  end
+
+  defp drain(pid, acc) do
+    receive do
+      {:trace, ^pid, :send, msg, to} -> drain(pid, [{:send, msg, to} | acc])
+      {:trace, ^pid, :call, mfa} -> drain(pid, [{:call, mfa} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
   describe "store death" do
     test "publication to a dead store is explicit loss, never a crash or a wait" do
       {store, p} = start()

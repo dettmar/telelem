@@ -1,7 +1,7 @@
 defmodule Telelem.HandoffReceiptsTest do
   @moduledoc """
   TEL-013: coordinator-owned receipt publication of `Telelem.Handoff`
-  (`receipts: [producer:, store_mode:, meta:]`, opt-in on top of
+  (`receipts: [store:, producer:, store_mode:, meta:]`, opt-in on top of
   `coordinator_grant: {:one_primary, units}` and `terminal_ack: true`).
 
   Listener-free. One `Telelem.Instance` with no workers and its real
@@ -70,7 +70,7 @@ defmodule Telelem.HandoffReceiptsTest do
        ctx do
     p = Store.producer(ctx.store)
     meta = meta("opts")
-    good = [producer: p, store_mode: :sandbox, meta: meta]
+    good = [store: ctx.store, producer: p, store_mode: :sandbox, meta: meta]
     d = now() + 60_000
 
     base = [
@@ -87,19 +87,21 @@ defmodule Telelem.HandoffReceiptsTest do
     refute Map.has_key?(Handoff.status(h0), :receipts)
     Process.exit(h0, :kill)
 
-    big = start_store!(:big, max_pending: 1_000)
-    stopped = start_store!(:stopped)
-    stale = Store.producer(stopped)
-    stop_supervised!(:stopped)
     forged_table = :ets.new(:forged, [:set, :public])
     forged = %{p | table: forged_table}
     ref_bad = %{p | ref: :atomics.new(3, signed: true)}
 
+    # Shape and handle-field cases; genuine other stores are in "store binding".
     bad_receipts = [
       false,
       p,
-      [producer: p, store_mode: :sandbox],
+      [producer: p, store_mode: :sandbox, meta: meta],
+      Keyword.delete(good, :store_mode),
       Keyword.put(good, :extra, 1),
+      Keyword.put(good, :store, nil),
+      # A registered-name style atom, not a pin.
+      Keyword.put(good, :store, :ets.info(p.table, :name)),
+      Keyword.put(good, :store, idle()),
       Keyword.put(good, :store_mode, :serving),
       Keyword.put(good, :meta, Map.put(meta, :body, "{}")),
       Keyword.put(good, :meta, Map.delete(meta, :mode)),
@@ -107,15 +109,18 @@ defmodule Telelem.HandoffReceiptsTest do
       Keyword.put(good, :meta, %{meta | route_rev: 0}),
       Keyword.put(good, :meta, %{meta | deployment_id: :none}),
       Keyword.put(good, :producer, Map.from_struct(p)),
-      Keyword.put(good, :producer, stale),
+      Keyword.put(good, :producer, Map.put(p, :extra, 1)),
       Keyword.put(good, :producer, forged),
       Keyword.put(good, :producer, ref_bad),
       Keyword.put(good, :producer, %{p | max_pending: 257}),
       Keyword.put(good, :producer, %{p | max_event_bytes: 4_096}),
+      # Smaller than the store's actual limits: still not the canonical handle.
+      Keyword.put(good, :producer, %{p | max_pending: 8}),
+      Keyword.put(good, :producer, %{p | max_event_bytes: 128}),
       Keyword.put(good, :producer, %{p | loss_slots: p.loss_slots + 1}),
       Keyword.put(good, :producer, %{p | table: :not_a_table}),
-      # Genuine, but configured above the contract ceiling.
-      Keyword.put(good, :producer, Store.producer(big))
+      Keyword.put(good, :producer, %{p | descriptor: :not_a_table}),
+      Keyword.put(good, :producer, %{p | table: p.descriptor, descriptor: p.table})
     ]
 
     for r <- bad_receipts do
@@ -143,6 +148,124 @@ defmodule Telelem.HandoffReceiptsTest do
 
     assert [{:ingress, 0, :none, :none, :none}] = events!(ctx.store, "opts")
     assert %{completeness: :incomplete, gaps: [:no_terminal]} = lookup!(ctx.store, "opts")
+  end
+
+  # ── store binding (separate genuine stores, no listener) ────────────────
+
+  test "binding: only the pinned store's own handle, with its actual mode and limits within the ceilings",
+       ctx do
+    a = ctx.store
+    b = start_store!(:other_sandbox)
+    serving = start_store!(:serving, mode: :serving)
+    [pa, pb, ps] = Enum.map([a, b, serving], &Store.producer/1)
+
+    # Same-mode mix-up, both directions, with unaltered genuine handles.
+    refused!(ctx, "mix", a, pb)
+    refused!(ctx, "mix", b, pa)
+
+    # One field of the pinned store's handle taken from another genuine store.
+    for field <- [:table, :descriptor, :ref] do
+      refused!(ctx, "splice", a, Map.put(pa, field, Map.fetch!(pb, field)))
+    end
+
+    # The store's actual mode differs from the trusted statement and meta.
+    refused!(ctx, "mode", serving, ps, :sandbox)
+    refused!(ctx, "mode", a, pa, :serving)
+
+    # Each actual ceiling exceeded alone (the handle is the genuine one).
+    over =
+      for {id, opt} <- [
+            over_pending: [max_pending: 257],
+            over_retained: [max_retained: 1_025],
+            over_bytes: [max_event_bytes: 513]
+          ] do
+        st = start_store!(id, opt)
+        refused!(ctx, "ceiling", st, Store.producer(st))
+        st
+      end
+
+    for st <- [a, b, serving | over] do
+      assert %{pending: 0, retained: 0, receipts: 0, rejected: 0} = Store.stats(st)
+    end
+
+    # Positive controls: exactly at the ceilings, and each store with its own
+    # handle and actual mode. Evidence lands only in the pinned store.
+    at = start_store!(:at_ceiling, max_pending: 256, max_retained: 1_024, max_event_bytes: 512)
+    {:ok, _} = try_h(ctx, "at", at, Store.producer(at))
+    {:ok, _} = try_h(ctx, "own-b", b, pb)
+    {:ok, _} = try_h(ctx, "own-s", serving, ps, :serving)
+
+    assert [{:ingress, 0, :none, :none, :none}] = events!(at, "at")
+    assert [{:ingress, 0, :none, :none, :none}] = events!(b, "own-b")
+    assert {:error, :not_found} = Store.lookup(a, @reader, "own-b")
+
+    assert {:ok, %Receipt{events: [%{kind: :ingress}]}} =
+             Store.lookup(serving, %{@reader | mode: :serving}, "own-s")
+
+    assert %{receipts: 0} = Store.stats(a)
+  end
+
+  test "binding: a stopped or replaced store fails closed in every pairing", ctx do
+    old = start_store!(:replaced)
+    p_old = Store.producer(old)
+    stop_supervised!(:replaced)
+    new = start_store!(:replaced)
+    p_new = Store.producer(new)
+
+    refused!(ctx, "stale", old, p_old)
+    refused!(ctx, "stale", new, p_old)
+    refused!(ctx, "stale", old, p_new)
+    assert %{pending: 0, receipts: 0, rejected: 0} = Store.stats(new)
+
+    {:ok, _} = try_h(ctx, "fresh", new, p_new)
+    assert [{:ingress, 0, :none, :none, :none}] = events!(new, "fresh")
+  end
+
+  test "binding reads only ETS: a suspended store delays neither the start nor ingress", ctx do
+    store = start_store!(:suspended)
+    p = Store.producer(store)
+    true = :erlang.suspend_process(store)
+
+    r =
+      try do
+        # start_h! asserts {:ok, _}: a call to the store would block init.
+        # The handle was resolved before the suspension.
+        r = start_h!(ctx, "suspended", store: store, producer: p)
+        assert_receive {:tr, {:receipt, :ingress, :ok}}, @t
+        assert %{receipts: :recording} = Handoff.status(r.h)
+        # Published straight into the pending table; the store cannot sweep.
+        assert :ets.info(p.table, :size) == 1
+        r
+      after
+        true = :erlang.resume_process(store)
+      end
+
+    assert [{:ingress, 0, :none, :none, :none}] = events!(store, "suspended")
+    done!(r)
+    assert %{completeness: :complete, observed_outcome: :done} = lookup!(store, "suspended")
+  end
+
+  # The killed store is reported by the test supervisor; keep it out of the output.
+  @tag :capture_log
+  test "store killed after a valid binding: later records drop, the request completes, no rebinding",
+       ctx do
+    store = start_supervised!({Store, mode: :sandbox}, id: :lost, restart: :temporary)
+    r = start_h!(ctx, "lost", store: store)
+    assert_receive {:tr, {:receipt, :ingress, :ok}}, @t
+    p = Store.producer(store)
+
+    mon = Process.monitor(store)
+    Process.exit(store, :kill)
+    assert_receive {:DOWN, ^mon, :process, ^store, :killed}, @t
+    # A genuine same-mode store is available, but the coordinator never asks.
+    replacement = start_store!(:replacement)
+
+    done!(r)
+    for k <- [:commit, :terminal], do: assert_receive({:tr, {:receipt, ^k, :dropped}}, @t)
+    assert %{store_down: 3, loss?: true} = Producer.stats(p)
+    assert %{receipts: :recording, outcome: {:done, @terminal}} = Handoff.status(r.h)
+    assert %{pending: 0, retained: 0, receipts: 0, rejected: 0} = Store.stats(replacement)
+    assert {:error, :not_found} = Store.lookup(replacement, @reader, "lost")
   end
 
   test "receipt_meta/1 projects only identifiers from a consistent Prepared" do
@@ -639,7 +762,12 @@ defmodule Telelem.HandoffReceiptsTest do
       terminal_deadline: d,
       coordinator_grant: {:one_primary, @units},
       terminal_ack: true,
-      receipts: [producer: Store.producer(store), store_mode: :sandbox, meta: meta(request_id)],
+      receipts: [
+        store: store,
+        producer: Keyword.get_lazy(opts, :producer, fn -> Store.producer(store) end),
+        store_mode: :sandbox,
+        meta: meta(request_id)
+      ],
       trace: col,
       on_event: fn ev -> send(col, {:ev, ev}) end,
       cleanup_timeout: 60_000,
@@ -647,6 +775,28 @@ defmodule Telelem.HandoffReceiptsTest do
     ]
 
     {hopts, %{req: req, col: col, d: d, auth: ctx.auth, store: store}}
+  end
+
+  # A handoff with an explicit pin, handle and mode (trusted statement and
+  # meta agree); returns Handoff.start/1's result.
+  defp try_h(ctx, request_id, pin, producer, mode \\ :sandbox) do
+    {hopts, _} = h_opts(ctx, request_id, [])
+
+    receipts = [
+      store: pin,
+      producer: producer,
+      store_mode: mode,
+      meta: %{meta(request_id) | mode: mode}
+    ]
+
+    with {:ok, h} <- Handoff.start(Keyword.put(hopts, :receipts, receipts)) do
+      on_exit(fn -> Process.exit(h, :kill) end)
+      {:ok, h}
+    end
+  end
+
+  defp refused!(ctx, request_id, pin, producer, mode \\ :sandbox) do
+    assert {:error, {:bad_option, :receipts}} = try_h(ctx, request_id, pin, producer, mode)
   end
 
   # Attached, reserved, connected, permitted (one fake send). The dispatch

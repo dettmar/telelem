@@ -4,7 +4,9 @@ defmodule Telelem.Receipts.Producer do
 
   Coordinators do not call this module directly; they publish through a
   per-request `Telelem.Receipts.Writer`, which adds the private sequence
-  metadata. `Store.producer/1` returns the handle.
+  metadata. `Store.producer/1` returns the handle; `binding/2` checks it
+  against a separately pinned store pid and reads that store's actual mode
+  and limits from the store's binding descriptor.
 
   ## Atomic admission + publication
 
@@ -50,11 +52,12 @@ defmodule Telelem.Receipts.Producer do
   the receipt's own entry instead (`Telelem.Receipts.Store`).
   """
 
-  @enforce_keys [:table, :ref, :max_pending, :max_event_bytes, :loss_slots]
+  @enforce_keys [:table, :descriptor, :ref, :max_pending, :max_event_bytes, :loss_slots]
   defstruct @enforce_keys
 
   @type t :: %__MODULE__{
           table: :ets.tid(),
+          descriptor: :ets.tid(),
           ref: :atomics.atomics_ref(),
           max_pending: pos_integer(),
           max_event_bytes: pos_integer(),
@@ -128,6 +131,86 @@ defmodule Telelem.Receipts.Producer do
     mark_lost(p, key)
     {:dropped, reason}
   end
+
+  @limit_keys [:loss_slots, :max_event_bytes, :max_pending, :max_retained]
+
+  @doc """
+  The actual mode and limits of `store`, if `producer` is exactly the
+  canonical handle of that store; otherwise `:error`.
+
+  `store` must be the store's pid as pinned by trusted setup (for example
+  from `start_link/1` or the supervisor), obtained independently of
+  `producer`: this function only confirms that the two belong together and
+  never derives the expected store from the handle. ETS reads only: no
+  message, no call, no `process_info`, so a busy or suspended store cannot
+  delay it. Every check fails closed (`:error`, never a raise):
+
+    * the handle's descriptor table exists, is unnamed, `:protected`, a
+      `:set` with no heir and exactly one row, owned by `store`;
+    * the handle's pending table exists, is a `:public` `:set` (key
+      position 1) owned by the same `store`;
+    * the descriptor's row is `{:binding, canonical, mode, limits}` with
+      `canonical` exactly equal to `producer` (every field), `mode` in
+      `:sandbox | :serving` and `limits` exactly
+      `max_pending`/`max_retained`/`max_event_bytes`/`loss_slots`, positive
+      integers consistent with the handle.
+
+  A handle of a store that has exited is `:error` (its tables are gone). The
+  result is a snapshot: if the store exits afterwards, publication through
+  the handle drops as `{:dropped, :store_down}`, as for any handle.
+
+  Trust limit: `store` is trusted. A non-store process that owns tables of
+  this exact shape would be accepted if it were pinned; the check does not
+  identify the pinned process's code.
+  """
+  @spec binding(t(), pid()) ::
+          {:ok,
+           %{
+             mode: :sandbox | :serving,
+             limits: %{
+               max_pending: pos_integer(),
+               max_retained: pos_integer(),
+               max_event_bytes: pos_integer(),
+               loss_slots: pos_integer()
+             }
+           }}
+          | :error
+  def binding(%__MODULE__{table: t, descriptor: d} = p, store)
+      when is_reference(t) and is_reference(d) and is_pid(store) do
+    with true <- descriptor?(d, store) and pending?(t, store),
+         [{:binding, ^p, mode, limits}] when mode in [:sandbox, :serving] <-
+           :ets.lookup(d, :binding),
+         true <- limits?(limits, p) do
+      {:ok, %{mode: mode, limits: limits}}
+    else
+      _ -> :error
+    end
+  rescue
+    # A table that is gone (or was never a table) between the checks.
+    ArgumentError -> :error
+  end
+
+  def binding(_, _), do: :error
+
+  defp descriptor?(d, store) do
+    :ets.info(d, :owner) == store and :ets.info(d, :protection) == :protected and
+      :ets.info(d, :named_table) == false and :ets.info(d, :heir) == :none and
+      :ets.info(d, :type) == :set and :ets.info(d, :keypos) == 1 and :ets.info(d, :size) == 1
+  end
+
+  defp pending?(t, store) do
+    :ets.info(t, :owner) == store and :ets.info(t, :protection) == :public and
+      :ets.info(t, :type) == :set and :ets.info(t, :keypos) == 1
+  end
+
+  defp limits?(%{} = l, p) when not is_struct(l) do
+    l |> Map.keys() |> Enum.sort() == @limit_keys and
+      Enum.all?(l, fn {_, v} -> is_integer(v) and v > 0 end) and
+      l.max_pending == p.max_pending and l.max_event_bytes == p.max_event_bytes and
+      l.loss_slots == p.loss_slots
+  end
+
+  defp limits?(_, _), do: false
 
   @doc """
   Loss counters from the shared array; does not contact the store.

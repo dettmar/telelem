@@ -176,24 +176,32 @@ defmodule Telelem.Handoff do
   `:reserved`, `:authorizing`, `:authorized`, `:refused`, `:abandoned`),
   never the grant token, op id or a raw authority reply.
 
-  ## Receipts (opt-in: `receipts: [producer:, store_mode:, meta:]`)
+  ## Receipts (opt-in: `receipts: [store:, producer:, store_mode:, meta:]`)
 
   Off by default; without it nothing is published and every shape above is
   unchanged. It requires `coordinator_grant` and `terminal_ack: true`.
 
-    * `producer`: a `Telelem.Receipts.Producer` resolved beforehand with
-      `Telelem.Receipts.Store.producer/1`. The coordinator never calls the
-      store. At start it checks, without messaging anyone, that the pending
-      table exists, is a public `:set` owned by a live local
-      `Telelem.Receipts.Store`, that the counters array has the size and sign
-      the store creates, and that `max_pending <= 256` and
-      `max_event_bytes <= 512` (the §2 ceilings). A handle failing any check
-      (including one whose store has exited) is `{:bad_option, :receipts}`.
-      These checks do not authenticate the handle: the store's own
-      configured limits and its mode are not observable through the existing
-      API.
+    * `store`: the local pid of the `Telelem.Receipts.Store` the trusted
+      setup chose for this request (from its start or supervisor), pinned
+      independently of `producer`. The expected store is never derived from
+      the handle.
+    * `producer`: the handle resolved beforehand with
+      `Telelem.Receipts.Store.producer/1`. The coordinator never calls,
+      monitors or waits on the store. As the last step of `init/1`, right
+      before it opens its writer, it checks once with
+      `Telelem.Receipts.Producer.binding/2` (ETS reads only) that the handle
+      is exactly the canonical handle in the pinned store's binding
+      descriptor, and that the store's **actual** mode equals `meta.mode` and
+      its actual `max_pending <= 256`, `max_retained <= 1024` and
+      `max_event_bytes <= 512` (the §2 ceilings). Any other handle (another
+      store's, even of the same mode; an altered copy; one whose store has
+      exited) is `{:bad_option, :receipts}`. If the store exits after this
+      check, the coordinator keeps the same writer, its later records drop as
+      `:store_down`, and the request is unaffected; it never rebinds to
+      another store. The pin is trusted: the check does not identify the code
+      of the pinned process.
     * `store_mode`: the trusted configuration's statement of the store's
-      mode; it must equal `meta.mode`. It is not verified against the store.
+      mode; it must equal `meta.mode` (and so the store's actual mode).
     * `meta`: exactly `receipt_meta/1` of the trusted `Prepared` value
       (`tenant_id`, gateway `request_id`, `route_rev`, `deployment_id` of the
       primary, `mode`).
@@ -361,7 +369,7 @@ defmodule Telelem.Handoff do
     * `:coordinator_grant`. Default `nil`. `{:one_primary, units}` opts in to
       "Coordinator grant". Requires `:admission_authority`,
       `:terminal_deadline` and `attempts: [:primary]` exactly.
-    * `:receipts`. Default `nil`. `[producer:, store_mode:, meta:]` opts in
+    * `:receipts`. Default `nil`. `[store:, producer:, store_mode:, meta:]` opts in
       to "Receipts". Requires `:coordinator_grant` and `terminal_ack: true`.
   """
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
@@ -760,8 +768,12 @@ defmodule Telelem.Handoff do
           receipts: nil
         }
 
-        # Last step of a successful init: open the one writer, record ingress.
-        {:ok, open_receipts(s, receipts_cfg)}
+        # Last step of a successful init: check the store binding, then open
+        # the one writer and record ingress.
+        case open_receipts(s, receipts_cfg) do
+          {:ok, s} -> {:ok, s}
+          :error -> {:stop, {:bad_option, :receipts}}
+        end
     end
   end
 
@@ -1581,25 +1593,27 @@ defmodule Telelem.Handoff do
 
   def receipt_meta(_), do: {:error, :invalid_prepared}
 
-  # Contract §2 initial ceilings. A handle claiming more is refused: its
-  # fields alone cannot raise the bounds.
+  # Contract §2 initial ceilings, checked against the store's actual
+  # configuration (Producer.binding/2), not against the handle's fields.
   @receipt_max_pending 256
+  @receipt_max_retained 1_024
   @receipt_max_event_bytes 512
   @int64_max 0x7FFFFFFFFFFFFFFF
 
-  # `[producer:, store_mode:, meta:]` (keyword list or map, exactly these
-  # keys). Every check is contained: a malformed handle is :error, never a
-  # crash of init.
+  # `[store:, producer:, store_mode:, meta:]` (keyword list or map, exactly
+  # these keys). Shape only; the binding is checked once, in open_receipts/2.
+  # Every check is contained: a malformed option is :error, never a crash.
   defp receipts_config(opt) do
     opt = if is_list(opt) and Keyword.keyword?(opt), do: Map.new(opt), else: opt
 
     with %{} <- opt,
          false <- is_struct(opt),
-         [:meta, :producer, :store_mode] <- opt |> Map.keys() |> Enum.sort(),
-         %{producer: p, store_mode: mode, meta: meta} <- opt,
-         true <- mode in [:sandbox, :serving] and valid_meta?(meta) and meta.mode == mode,
-         true <- genuine_producer?(p) do
-      %{producer: p, meta: meta}
+         [:meta, :producer, :store, :store_mode] <- opt |> Map.keys() |> Enum.sort(),
+         %{store: store, producer: %Telelem.Receipts.Producer{} = p, store_mode: mode, meta: meta} <-
+           opt,
+         true <- is_pid(store) and node(store) == node(),
+         true <- mode in [:sandbox, :serving] and valid_meta?(meta) and meta.mode == mode do
+      %{store: store, producer: p, meta: meta}
     else
       _ -> :error
     end
@@ -1617,55 +1631,48 @@ defmodule Telelem.Handoff do
 
   defp valid_meta?(_), do: false
 
-  # A handle resolved beforehand with Telelem.Receipts.Store.producer/1. The
-  # coordinator never calls the store; it checks what the existing APIs show
-  # without a message: the pending table exists, is a public :set owned by a
-  # live local Telelem.Receipts.Store, the counters array has the size and
-  # sign the store creates, and the ceilings are within the contract's. The
-  # store's own configured limits and its mode are not observable this way.
-  defp genuine_producer?(
-         %Telelem.Receipts.Producer{
-           table: t,
-           ref: ref,
-           max_pending: mp,
-           max_event_bytes: mb,
-           loss_slots: ls
-         } = p
-       )
-       when map_size(p) == 6 and is_reference(t) and is_integer(mp) and is_integer(mb) and
-              is_integer(ls) and ls > 0 do
-    owner = :ets.info(t, :owner)
+  # The handle must be exactly the canonical producer of the pinned store
+  # (ETS reads only, see Producer.binding/2), and that store's actual mode
+  # and limits must be the request's mode and within the contract ceilings.
+  # The expected store is the trusted `store:` pin, never the handle.
+  defp receipts_bound?(p, store, mode) do
+    case Telelem.Receipts.Producer.binding(p, store) do
+      {:ok, %{mode: ^mode, limits: l}} ->
+        l.max_pending <= @receipt_max_pending and l.max_retained <= @receipt_max_retained and
+          l.max_event_bytes <= @receipt_max_event_bytes
 
-    mp in 1..@receipt_max_pending and mb in 1..@receipt_max_event_bytes and is_pid(owner) and
-      node(owner) == node() and
-      :proc_lib.translate_initial_call(owner) == {Telelem.Receipts.Store, :init, 1} and
-      :ets.info(t, :protection) == :public and :ets.info(t, :type) == :set and
-      :ets.info(t, :keypos) == 1 and counters_match?(:atomics.info(ref), ls)
+      _ ->
+        false
+    end
   end
 
-  defp genuine_producer?(_), do: false
+  defp open_receipts(s, nil), do: {:ok, s}
 
-  defp counters_match?(%{size: size, min: min}, loss_slots),
-    do: min < 0 and size == Telelem.Receipts.Producer.counters_size(loss_slots)
+  # Checks the binding once, then opens exactly one writer per coordinator,
+  # owned by this process; ingress is its sequence one. Nothing waits on or
+  # calls the store in between. A failed binding is :error (init stops).
+  defp open_receipts(s, %{producer: p, store: store, meta: m}) do
+    if receipts_bound?(p, store, m.mode) do
+      r =
+        case Telelem.Receipts.Writer.open(p, m.tenant_id, m.request_id) do
+          {:ok, w} ->
+            %{
+              writer: w,
+              route_rev: m.route_rev,
+              deployment_id: m.deployment_id,
+              state: :recording
+            }
 
-  defp counters_match?(_, _), do: false
+          {:error, _} ->
+            %{writer: nil, route_rev: nil, deployment_id: nil, state: :disabled}
+        end
 
-  defp open_receipts(s, nil), do: s
-
-  # Exactly one writer per coordinator, owned by this process; ingress is
-  # its sequence one.
-  defp open_receipts(s, %{producer: p, meta: m}) do
-    r =
-      case Telelem.Receipts.Writer.open(p, m.tenant_id, m.request_id) do
-        {:ok, w} ->
-          %{writer: w, route_rev: m.route_rev, deployment_id: m.deployment_id, state: :recording}
-
-        {:error, _} ->
-          %{writer: nil, route_rev: nil, deployment_id: nil, state: :disabled}
-      end
-
-    %{s | receipts: Map.merge(r, %{permitted: false, terminal: false})}
-    |> receipt(:ingress)
+      {:ok,
+       %{s | receipts: Map.merge(r, %{permitted: false, terminal: false})}
+       |> receipt(:ingress)}
+    else
+      :error
+    end
   end
 
   # The permission bit: set when the one dispatch permission is released.
