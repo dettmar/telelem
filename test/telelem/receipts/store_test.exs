@@ -432,6 +432,29 @@ defmodule Telelem.Receipts.StoreTest do
       assert {:ok, %{mode: :sandbox}} = Producer.binding(p, store)
     end
 
+    test "duplicate options: handle, descriptor, stats and retention all use the first value" do
+      {store, p} =
+        start(
+          max_pending: 7,
+          max_retained: 2,
+          max_event_bytes: 300,
+          loss_slots: 5,
+          max_pending: 8,
+          max_retained: 9,
+          max_event_bytes: 301,
+          loss_slots: 6
+        )
+
+      limits = %{max_pending: 7, max_retained: 2, max_event_bytes: 300, loss_slots: 5}
+      assert :ets.tab2list(p.descriptor) == [{:binding, p, :sandbox, limits}]
+      assert {:ok, %{limits: ^limits}} = Producer.binding(p, store)
+      assert %{limits: ^limits} = Store.stats(store)
+
+      # Retention enforces the same max_retained the descriptor states.
+      _ = open(p, "r") |> ok(:ingress) |> ok(:dispatch) |> ok(:terminal)
+      assert %{retained: 2, evicted: 1} = Store.stats(store)
+    end
+
     test "reports the actual mode and default limits" do
       store = start_supervised!({Store, mode: :serving})
       p = Store.producer(store)

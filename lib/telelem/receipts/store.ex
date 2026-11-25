@@ -123,6 +123,11 @@ defmodule Telelem.Receipts.Store do
         do: raise(ArgumentError, "invalid receipts store option #{inspect(k)}")
     end
 
+    # One set of effective values (the first occurrence of each key, as
+    # `Keyword.get/2` reads it) feeds the handle, the descriptor and the
+    # state alike, so a duplicate option can never make them disagree.
+    opts = for {k, _} <- @defaults, do: {k, Keyword.fetch!(opts, k)}
+
     table = :ets.new(__MODULE__, [:set, :public, write_concurrency: true])
     # Binding descriptor (see Producer.binding/2): unnamed, protected (only
     # this process writes it), no heir (it dies with this process), same

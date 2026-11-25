@@ -177,6 +177,9 @@ defmodule Telelem.HandoffReceiptsTest do
       for {id, opt} <- [
             over_pending: [max_pending: 257],
             over_retained: [max_retained: 1_025],
+            # The effective (first) value is over the ceiling; a later
+            # in-ceiling duplicate must not make the descriptor say otherwise.
+            over_retained_dup: [max_retained: 1_025, max_retained: 4],
             over_bytes: [max_event_bytes: 513]
           ] do
         st = start_store!(id, opt)
