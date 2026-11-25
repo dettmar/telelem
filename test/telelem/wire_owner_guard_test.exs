@@ -1,549 +1,627 @@
 defmodule Telelem.WireOwnerGuardTest do
   @moduledoc """
-  TEL-012 `Telelem.Wire.OwnerGuard`, listener-free.
+  TEL-012 `Telelem.Wire.OwnerGuard`: one gated `Telelem.Wire.Upstream`
+  launched at its fixed guarded entry under a real `DynamicSupervisor`, with
+  a real `Telelem.Handoff` (`coordinator_grant`, and a denying legacy one) and
+  its real pinned `Telelem.Admission.Authority`.
 
-  No socket, listener, TLS, real `Upstream`, `Handoff` or authority is used.
-  The pinned "Handoff" is a plain fake process; the supervisor is a real
-  `DynamicSupervisor` per test (or, for caller-side start failures, a fake
-  GenServer that answers `DynamicSupervisor.start_child/2`'s
-  `{:start_child, _}` call).
+  Listener-free: no socket is opened. The target is a `VerifiedTarget` for
+  `127.0.0.1` port 1 and every owner ends before it dials: the authority is
+  held with `:sys.suspend/1` so `attach_grant/3` waits for its reservation,
+  or the coordinator refuses the grant attach (a dial would surface as
+  `{:connect_failed, _, _}`, which each case refutes).
 
-  What this covers: the closed option interface and its limits (refused in
-  the caller, nothing started), the metadata-only child entry (any other shape
-  refused before init ack), the temporary finite-shutdown child spec, startup
-  shape (trapping guard, non-trapping inert owner linked and monitored only by
-  the guard), one-shot activation after the start return and its bounded wait
-  on both sides, refusal before activation (timeout, cutoff, caller, Handoff,
-  supervisor), cancellation while active (caller `:DOWN`, Handoff `:DOWN`,
-  supervisor shutdown and kill), natural owner exit, the absolute cutoff,
-  per-turn bound checks with a busy mailbox, the unconfirmed kill-to-DOWN
-  path, non-exact signals being ignored, reports only after the owner's
-  `:DOWN`, and no restart.
+  Covers: the closed option interface; equality expiry of the one activation
+  limit; the metadata-only child entry and late (queued) child start; the
+  helper killed by the witness on expiry, launcher loss (`:normal` included)
+  and abandonment; positive attach by the exact owner pid; the owner's GO
+  rechecks at the real entry (token, limit, pinned coordinator, deadline,
+  pending stop); cooperative stop at a checkpoint and the forced fence while
+  blocked in a call; supervisor shutdown; and the witness's independent
+  confirmation on guard, requester and launcher loss. Reports are asserted
+  only with the exact process already dead.
 
-  Ordering uses `:erlang.suspend_process/1` on the guard and the mailbox
-  read back with `Process.info/2` (ordered after the test's own earlier
-  signals), re-read until the expected state is there, bounded. The only
-  clock waits are for a cutoff instant to pass.
+  Ordering uses `:sys.suspend/1`, `:erlang.suspend_process/1` and mailboxes
+  read back with `Process.info/2`, re-read until the expected message is
+  there, bounded. The only clock waits are for an activation limit or fence
+  instant to pass.
 
-  What it does not cover: socket/TLS teardown, successor ordering, a slow
-  kill-to-DOWN in the runtime itself, a supervisor that never answers.
+  Not covered: TLS/socket teardown, streaming checkpoints (need a
+  handshake), the deadline trigger, durability or successor ordering.
 
       scripts/mix test test/telelem/wire_owner_guard_test.exs --seed 0
   """
   use ExUnit.Case, async: true
 
-  alias Telelem.Wire.OwnerGuard
+  alias Telelem.Admission.{Authority, Ledger}
+  alias Telelem.{Handoff, Instance}
+  alias Telelem.Instance.Directory
+  alias Telelem.Sandbox.VerifiedTarget
+  alias Telelem.Wire.{Limits, OwnerGuard, Upstream}
 
-  @tag_ :telelem_owner_guard
-  @junk 300_000
+  @moduletag :tmp_dir
+  @t 2_000
+  @limit 10
+  @units 4
+  @secret "sk-test-SECRET-body-marker"
 
-  defmodule FakeSupervisor do
-    @moduledoc false
-    use GenServer
+  setup %{tmp_dir: dir} do
+    isup =
+      start_supervised!({
+        Instance,
+        id: :wire_owner_guard_gw,
+        limits: %{slots: 2, units: @limit},
+        spool_dir: Path.join(dir, "spool"),
+        transport: {:unused_no_workers, nil},
+        reserve_ttl: nil
+      })
 
-    def start_link(arg), do: GenServer.start_link(__MODULE__, arg)
-
-    @impl true
-    def init(arg), do: {:ok, arg}
-
-    @impl true
-    def handle_call({:start_child, _child}, _from, {test, :silent_child} = s) do
-      child =
-        spawn(fn ->
-          receive do
-            :never -> :ok
-          end
-        end)
-
-      send(test, {:fake_child, child})
-      {:reply, {:ok, child}, s}
-    end
-
-    def handle_call({:start_child, _child}, _from, {_test, {:reply, reply}} = s),
-      do: {:reply, reply, s}
-  end
-
-  setup do
+    inst = Instance.handle(isup)
+    :ok = Instance.subscribe(inst)
+    auth = Instance.authority(inst)
     sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one}, id: :guard_sup)
-    h = fake()
-    on_exit(fn -> Process.exit(h, :kill) end)
-    %{sup: sup, h: h}
+
+    on_exit(fn ->
+      for p <- [auth, sup] do
+        try do
+          if Process.alive?(p), do: :sys.resume(p)
+        catch
+          :exit, _ -> :ok
+        end
+      end
+    end)
+
+    %{cert: der} = :public_key.pkix_test_root_cert(~c"telelem guard test CA", [])
+    {:ok, target} = VerifiedTarget.build("a", "127.0.0.1", 1, [der])
+    %{inst: inst, auth: auth, tag: inst.tag, target: target, sup: sup}
   end
 
-  # ── Options and limits ───────────────────────────────────────────────────
+  # ── interface ───────────────────────────────────────────────────────────
 
-  test "the closed option interface is refused in the caller; nothing starts", %{sup: sup, h: h} do
-    good = opts(h)
+  test "the closed option interface is refused in the launcher; nothing starts", ctx do
+    r = start_h!(ctx)
+    good = gopts(ctx, r, idle())
+    up = good[:upstream]
+    {:monitors, mons} = Process.info(self(), :monitors)
 
     bad = [
       {:not_a_list, "keyword list"},
-      {[{"handoff", h}], "keyword list"},
+      {[{"upstream", up}], "keyword list"},
       {good ++ [grace_ms: 5], "at most once"},
       {good ++ [extra: 1], ":extra is not accepted"},
-      {Keyword.delete(good, :cutoff), ":cutoff is required"},
-      {Keyword.delete(good, :activation_ms), ":activation_ms is required"},
-      {Keyword.put(good, :handoff, :name), ":handoff must be a local pid"},
+      {Keyword.delete(good, :observer), ":observer is required"},
+      {Keyword.delete(good, :upstream), ":upstream is required"},
+      {Keyword.put(good, :upstream, %{}), ":upstream must be a keyword list"},
+      {Keyword.put(good, :upstream, Keyword.delete(up, :gate)), ":gate is required"},
+      {Keyword.put(good, :upstream, Keyword.put(up, :gate, nil)), ":gate is required"},
+      {Keyword.put(good, :upstream, Keyword.put(up, :body, 1)), ":body must be a binary"},
+      {Keyword.put(good, :upstream, up ++ [lane: %{}]), ":lane is not accepted"},
+      {Keyword.put(good, :requester, :name), ":requester must be a local pid"},
+      {Keyword.put(good, :observer, nil), ":observer must be a local pid"},
       {Keyword.put(good, :grace_ms, 0), ":grace_ms must be an integer"},
       {Keyword.put(good, :grace_ms, OwnerGuard.bounds().grace_ms + 1), ":grace_ms"},
-      {Keyword.put(good, :grace_ms, 1.5), ":grace_ms"},
-      {Keyword.put(good, :activation_ms, 0), ":activation_ms must be an integer"},
-      {Keyword.put(good, :activation_ms, OwnerGuard.bounds().activation_ms + 1),
-       ":activation_ms"},
-      {Keyword.put(good, :cutoff, :soon), ":cutoff must be an integer"},
-      {Keyword.put(good, :cutoff, now() + 4_294_967_295), ":cutoff plus :grace_ms"}
+      {Keyword.put(good, :activation_ms, 1.5), ":activation_ms must be an integer"},
+      {Keyword.put(good, :activation_ms, OwnerGuard.bounds().activation_ms + 1), ":activation_ms"}
     ]
 
     for {o, msg} <- bad do
-      e = assert_raise ArgumentError, fn -> OwnerGuard.start(sup, o) end
-      assert e.message =~ msg
+      e = assert_raise ArgumentError, fn -> OwnerGuard.start(ctx.sup, o) end
+      assert e.message =~ msg, "#{inspect(msg)}: #{e.message}"
+      for s <- [@secret, ctx.target.host], do: refute(e.message =~ s, e.message)
     end
 
-    # Messages name the field, never its value.
-    e =
-      assert_raise ArgumentError, fn ->
-        OwnerGuard.start(sup, Keyword.put(good, :grace_ms, 987_654_321))
+    assert DynamicSupervisor.which_children(ctx.sup) == []
+    assert {:monitors, ^mons} = Process.info(self(), :monitors)
+    assert {:messages, []} = Process.info(self(), :messages)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+  end
+
+  test "one activation limit A = min(now + budget, D): reached (equality included) spawns nothing",
+       ctx do
+    {:ok, h} = Handoff.start(requester: idle(), attempts: [:primary])
+    on_exit(fn -> Process.exit(h, :kill) end)
+
+    for d <- [now(), now() - 1] do
+      r = %{h: h, d: d}
+      assert OwnerGuard.start(ctx.sup, gopts(ctx, r, idle())) == {:error, :expired}
+    end
+
+    assert DynamicSupervisor.which_children(ctx.sup) == []
+    assert {:messages, []} = Process.info(self(), :messages)
+  end
+
+  test "child spec: metadata only, temporary, finite shutdown; the entry refuses other shapes and late starts" do
+    me = self()
+
+    meta = %{
+      ref: make_ref(),
+      witness: me,
+      observer: me,
+      requester: me,
+      handoff: me,
+      deadline: now() + 60_000,
+      until: now() + 60_000,
+      grace_ms: 250
+    }
+
+    spec = OwnerGuard.child_spec(meta)
+    assert %{restart: :temporary, shutdown: 1_500, type: :worker} = spec
+    assert spec.shutdown == 2 * 250 + OwnerGuard.bounds().shutdown_slack_ms
+    assert {OwnerGuard, :start_link, [^meta]} = spec.start
+
+    for junk <- [
+          :junk,
+          Map.put(meta, :body, @secret),
+          Map.delete(meta, :witness),
+          %{meta | until: meta.deadline + 1},
+          %{meta | grace_ms: 0},
+          %{meta | ref: :ref},
+          %{meta | handoff: :name}
+        ] do
+      assert OwnerGuard.start_link(junk) == {:error, :invalid_metadata}
+    end
+
+    # A start processed at or after A does no work.
+    for until <- [now(), now() - 1] do
+      assert OwnerGuard.start_link(%{meta | until: until}) == {:error, :expired}
+    end
+
+    assert {:messages, []} = Process.info(self(), :messages)
+  end
+
+  # ── the owner's fixed entry ─────────────────────────────────────────────
+
+  test "fixed owner entry: no GO, wrong token, other coordinator or deadline, late GO and a pending stop attach nothing",
+       ctx do
+    r = start_h!(ctx, trace: self())
+    payload = payload(ctx, r)
+    {:ok, other_h} = Handoff.start(requester: idle(), attempts: [:primary])
+    on_exit(fn -> Process.exit(other_h, :kill) end)
+
+    entry = fn until, d ->
+      ref = make_ref()
+      meta = %{ref: ref, until: min(until, d), deadline: d, handoff: r.h}
+      {pid, mon} = :erlang.spawn_opt(Upstream, :guarded, [meta], [:monitor])
+      {pid, mon, ref}
+    end
+
+    # No GO by A, or a GO with another token: expires at A.
+    {o, m, _} = entry.(now() + 50, r.d)
+    send(o, {:telelem_owner_go, make_ref(), payload})
+    assert_receive {:DOWN, ^m, :process, ^o, {:shutdown, :expired}}, @t
+
+    # A stop before GO.
+    {o, m, ref} = entry.(now() + 60_000, r.d)
+    send(o, {:telelem_owner_stop, ref})
+    assert_receive {:DOWN, ^m, :process, ^o, {:shutdown, :stopped}}, @t
+
+    # GO for another coordinator, another deadline, or a legacy payload.
+    for p <- [
+          Keyword.put(payload, :handoff, other_h),
+          Keyword.put(payload, :gate, target: ctx.target, deadline: r.d + 1),
+          Keyword.delete(payload, :gate)
+        ] do
+      {o, m, ref} = entry.(now() + 60_000, r.d)
+      send(o, {:telelem_owner_go, ref, p})
+      assert_receive {:DOWN, ^m, :process, ^o, {:shutdown, :refused}}, @t
+    end
+
+    # GO followed by a stop, both queued before the owner runs.
+    {o, m, ref} = entry.(now() + 60_000, r.d)
+    true = :erlang.suspend_process(o)
+    send(o, {:telelem_owner_go, ref, payload})
+    send(o, {:telelem_owner_stop, ref})
+    true = :erlang.resume_process(o)
+    assert_receive {:DOWN, ^m, :process, ^o, {:shutdown, :stopped}}, @t
+
+    # A GO queued before A but handled at or after A.
+    a = now() + 50
+    {o, m, ref} = entry.(a, r.d)
+    true = :erlang.suspend_process(o)
+    send(o, {:telelem_owner_go, ref, payload})
+    sleep_until(a)
+    true = :erlang.resume_process(o)
+    assert_receive {:DOWN, ^m, :process, ^o, {:shutdown, :expired}}, @t
+
+    # Invalid metadata.
+    {o, m} = :erlang.spawn_opt(Upstream, :guarded, [%{ref: make_ref()}], [:monitor])
+    assert_receive {:DOWN, ^m, :process, ^o, {:shutdown, :invalid_meta}}, @t
+
+    # Nothing attached, reserved or reported.
+    assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(r.h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+    refute_received {:telelem_handoff_trace, _, {:attached, _}}
+    refute_received {:telelem_wire, _, _, _}
+  end
+
+  # ── launch ──────────────────────────────────────────────────────────────
+
+  test "positive: the exact owner attaches; the scoped stop at its next checkpoint ends it before the dial",
+       ctx do
+    r = start_h!(ctx)
+    greq = idle()
+    {:monitors, mons} = Process.info(self(), :monitors)
+    :ok = :sys.suspend(ctx.auth)
+
+    assert {:ok, %{guard: g, owner: o, witness: w, ref: ref}} =
+             OwnerGuard.start(ctx.sup, gopts(ctx, r, greq, grace_ms: 10_000))
+
+    # The launcher left no monitor, alias reply or message behind.
+    assert {:monitors, ^mons} = Process.info(self(), :monitors)
+    assert {:messages, []} = Process.info(self(), :messages)
+
+    # The reservation is for exactly this owner, which registered itself.
+    await_reserve!(ctx.auth, r.h, o)
+    assert %{attempts: %{primary: %{pid: ^o}}} = Handoff.status(r.h)
+
+    # Shape: supervised trapping guard; non-trapping owner linked only to it
+    # and monitored by it and the witness; witness linked to nothing.
+    assert [{_, ^g, :worker, _}] = DynamicSupervisor.which_children(ctx.sup)
+    assert {:trap_exit, true} = Process.info(g, :trap_exit)
+    assert {:links, [^g]} = Process.info(o, :links)
+    assert {:trap_exit, false} = Process.info(o, :trap_exit)
+    {:monitored_by, by} = Process.info(o, :monitored_by)
+    assert g in by and w in by
+    assert {:links, []} = Process.info(w, :links)
+
+    # Hold the owner with the attach reply queued, then trigger the guard.
+    true = :erlang.suspend_process(o)
+    :ok = :sys.resume(ctx.auth)
+    await_mailbox!(o, &Enum.any?(&1, fn m -> match?({_, :ok}, m) end))
+    Process.exit(greq, :kill)
+    await_mailbox!(o, &({:telelem_owner_stop, ref} in &1))
+    true = :erlang.resume_process(o)
+
+    assert_receive {:telelem_wire, ^o, :primary,
+                    {:ended, {:stopped, :after_attach, :guard_stop}, stats}},
+                   @t
+
+    assert %{claim: :none, cleaned_ack: :ok} = stats
+
+    assert_receive {:telelem_owner_guard, ^ref, :owner_down, :requester_down, :stopped}, @t
+    refute Process.alive?(o)
+    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    refute Process.alive?(g)
+
+    owner_gone!(ctx, o)
+    {gid, _} = only_grant!(ctx.auth)
+    assert_ledger!(ctx, gid, :released)
+    refute_received {:telelem_wire, _, _, {:connect_failed, _, _}}
+  end
+
+  test "forced: an owner blocked in attach is killed at min(trigger, D) + grace; the witness confirms",
+       ctx do
+    r = start_h!(ctx)
+    greq = idle()
+    grace = 50
+    :ok = :sys.suspend(ctx.auth)
+
+    assert {:ok, %{owner: o, ref: ref}} =
+             OwnerGuard.start(ctx.sup, gopts(ctx, r, greq, grace_ms: grace))
+
+    await_reserve!(ctx.auth, r.h, o)
+    t0 = now()
+    Process.exit(greq, :kill)
+
+    assert_receive {:telelem_owner_guard, ^ref, :owner_down, :requester_down, :killed}, @t
+    assert now() >= t0 + grace
+    refute Process.alive?(o)
+    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    # Killed while blocked: it reported nothing and never dialed.
+    refute_received {:telelem_wire, ^o, _, _}
+
+    :ok = :sys.resume(ctx.auth)
+    owner_gone!(ctx, o)
+    {gid, _} = only_grant!(ctx.auth)
+    assert_ledger!(ctx, gid, :released)
+  end
+
+  test "denying coordinator: the GO'd owner's grant attach is refused before any dial", ctx do
+    {:ok, h} =
+      Handoff.start(
+        requester: idle(),
+        attempts: [:primary],
+        trace: self(),
+        register_timeout: 60_000
+      )
+
+    on_exit(fn -> Process.exit(h, :kill) end)
+    r = %{h: h, d: now() + 60_000}
+
+    assert {:ok, %{owner: o, ref: ref}} = OwnerGuard.start(ctx.sup, gopts(ctx, r, idle()))
+
+    assert_receive {:telelem_wire, ^o, :primary,
+                    {:ended, {:attach, :error, :grant_required}, stats}},
+                   @t
+
+    assert %{claim: :none, cleaned_ack: :not_sent} = stats
+    assert_receive {:telelem_owner_guard, ^ref, :owner_down, :owner_exited, :exited}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(h)
+    refute_received {:telelem_handoff_trace, ^h, _}
+    refute_received {:telelem_wire, _, _, {:connect_failed, _, _}}
+  end
+
+  test "supervisor shutdown: the guard stops and fences the owner, then exits with the supervisor's reason",
+       ctx do
+    r = start_h!(ctx)
+    :ok = :sys.suspend(ctx.auth)
+
+    assert {:ok, %{guard: g, owner: o, ref: ref}} =
+             OwnerGuard.start(ctx.sup, gopts(ctx, r, idle(), grace_ms: 50))
+
+    await_reserve!(ctx.auth, r.h, o)
+    gm = Process.monitor(g)
+    assert :ok = DynamicSupervisor.terminate_child(ctx.sup, g)
+
+    assert_receive {:telelem_owner_guard, ^ref, :owner_down, :parent_exit, :killed}, @t
+    assert_receive {:DOWN, ^gm, :process, ^g, :shutdown}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    :ok = :sys.resume(ctx.auth)
+    owner_gone!(ctx, o)
+  end
+
+  # ── independent confirmation ────────────────────────────────────────────
+
+  test "guard loss: the link ends the owner and the witness confirms without a guard report",
+       ctx do
+    r = start_h!(ctx)
+    :ok = :sys.suspend(ctx.auth)
+
+    assert {:ok, %{guard: g, owner: o, witness: w, ref: ref}} =
+             OwnerGuard.start(ctx.sup, gopts(ctx, r, idle(), grace_ms: 10_000))
+
+    await_reserve!(ctx.auth, r.h, o)
+    wm = Process.monitor(w)
+    Process.exit(g, :kill)
+
+    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    refute Process.alive?(o)
+    assert_receive {:DOWN, ^wm, :process, ^w, :normal}, @t
+    refute_received {:telelem_owner_guard, ^ref, :owner_down, _, _}
+    :ok = :sys.resume(ctx.auth)
+    owner_gone!(ctx, o)
+  end
+
+  test "launcher loss after GO (normal exit): the witness outlives it and confirms the later owner end",
+       ctx do
+    r = start_h!(ctx)
+    greq = idle()
+    :ok = :sys.suspend(ctx.auth)
+    opts = gopts(ctx, r, greq, grace_ms: 50)
+    {l, lm} = launcher(fn -> OwnerGuard.start(ctx.sup, opts) end)
+
+    assert_receive {:launched, ^l, {:ok, %{owner: o, witness: w, ref: ref}}}, @t
+    send(l, :exit)
+    assert_receive {:DOWN, ^lm, :process, ^l, :normal}, @t
+
+    await_reserve!(ctx.auth, r.h, o)
+    assert Process.alive?(w) and Process.alive?(o)
+
+    Process.exit(greq, :kill)
+    assert_receive {:telelem_owner_guard, ^ref, :owner_down, :requester_down, :killed}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    :ok = :sys.resume(ctx.auth)
+    owner_gone!(ctx, o)
+  end
+
+  test "launcher loss while the supervisor is busy: the witness kills the exact helper before A; the queued child never gets an owner",
+       ctx do
+    r = start_h!(ctx)
+    act = 1_000
+    :ok = :sys.suspend(ctx.sup)
+    t0 = now()
+    opts = gopts(ctx, r, idle(), activation_ms: act)
+    {l, lm} = launcher(fn -> OwnerGuard.start(ctx.sup, opts) end)
+
+    [{:"$gen_call", {helper, _}, {:start_child, _} = call}] =
+      await_mailbox!(ctx.sup, &match?([{:"$gen_call", _, {:start_child, _}}], &1))
+
+    # The supervisor got metadata only, never the payload.
+    refute contains?(call, @secret)
+    refute contains?(call, ctx.target)
+    hm = Process.monitor(helper)
+    assert {:links, []} = Process.info(helper, :links)
+
+    Process.exit(l, :kill)
+    assert_receive {:DOWN, ^lm, :process, ^l, :killed}, @t
+    assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t
+    assert now() < t0 + act, "the helper must go on launcher loss, not at A"
+    assert_receive {:telelem_owner_witness, _, :confirmed, :no_owner}, @t
+
+    # The queued request still starts a guard before A; never activated, it
+    # gets no owner and expires at A.
+    :ok = :sys.resume(ctx.sup)
+    assert [{_, g, :worker, _}] = DynamicSupervisor.which_children(ctx.sup)
+    gm = Process.monitor(g)
+    assert {:links, [_sup]} = Process.info(g, :links)
+    assert_receive {:DOWN, ^gm, :process, ^g, {:shutdown, :expired}}, act + @t
+    assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(r.h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+  end
+
+  test "late queued start: the launcher expires at A, the witness kills the helper, the late child does no work",
+       ctx do
+    r = start_h!(ctx)
+    :ok = :sys.suspend(ctx.sup)
+    sup = ctx.sup
+    t0 = now()
+
+    assert OwnerGuard.start(ctx.sup, gopts(ctx, r, idle(), activation_ms: 100)) ==
+             {:error, :expired}
+
+    assert now() >= t0 + 100
+    [{:"$gen_call", {helper, _}, {:start_child, _}}] = mailbox(ctx.sup)
+    assert_receive {:telelem_owner_witness, _, :confirmed, :no_owner}, @t
+    refute Process.alive?(helper)
+
+    # Processed after A: the child's init refuses and spawns nothing.
+    1 = :erlang.trace(sup, true, [:procs, :set_on_spawn, {:tracer, self()}])
+    :ok = :sys.resume(sup)
+    assert DynamicSupervisor.which_children(sup) == []
+    1 = :erlang.trace(sup, false, [:procs, :set_on_spawn])
+
+    assert_receive {:trace, ^sup, :spawn, g, {:proc_lib, :init_p, _}}, @t
+    assert_receive {:trace, ^g, :exit, :normal}, @t
+    refute_received {:trace, ^g, :spawn, _, _}
+
+    assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(r.h)
+    # The alias was deactivated and drained: no late reply reached the launcher.
+    refute_received {:telelem_owner_guard, _, _, _}
+  end
+
+  test "witness: the exact helper is killed on launcher :normal exit, on abandonment and at A" do
+    for name <- [:normal, :abandon, :expiry] do
+      ref = make_ref()
+      l = spawn(fn -> receive do: (:exit -> :ok) end)
+      test = self()
+
+      helper =
+        spawn(fn ->
+          receive do
+            {:telelem_owner_guard, ^ref, :run, w} -> send(test, {:run, w})
+          end
+
+          receive do: (:never -> :ok)
+        end)
+
+      hm = Process.monitor(helper)
+      until = if name == :expiry, do: now() + 50, else: now() + 60_000
+
+      w =
+        spawn(OwnerGuard, :witness, [
+          %{launcher: l, helper: helper, alias: self(), ref: ref, until: until, observer: self()}
+        ])
+
+      assert_receive {:run, ^w}, @t
+
+      case name do
+        :normal -> send(l, :exit)
+        :abandon -> send(w, {:telelem_owner_guard, ref, :abandon})
+        :expiry -> :ok
       end
 
-    refute e.message =~ "987654321"
-    refute e.message =~ "987_654_321"
-
-    assert DynamicSupervisor.which_children(sup) == []
-    assert {:messages, []} = Process.info(self(), :messages)
+      assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t, inspect(name)
+      assert_receive {:telelem_owner_witness, ^ref, :confirmed, :no_owner}, @t
+      Process.exit(l, :kill)
+    end
   end
 
-  test "a passed cutoff starts nothing", %{sup: sup, h: h} do
-    assert {:error, :cutoff} = OwnerGuard.start(sup, opts(h, cutoff: now()))
-    assert {:error, :cutoff} = OwnerGuard.start(sup, opts(h, cutoff: now() - 10))
-    assert DynamicSupervisor.which_children(sup) == []
+  # ── helpers ─────────────────────────────────────────────────────────────
+
+  defp start_h!(ctx, opts \\ []) do
+    d = Keyword.get(opts, :deadline, now() + 60_000)
+
+    {:ok, h} =
+      Handoff.start(
+        [
+          requester: idle(),
+          attempts: [:primary],
+          admission_authority: ctx.auth,
+          terminal_deadline: d,
+          coordinator_grant: {:one_primary, @units},
+          cleanup_timeout: 60_000,
+          register_timeout: 60_000
+        ] ++ Keyword.take(opts, [:trace])
+      )
+
+    on_exit(fn -> Process.exit(h, :kill) end)
+    %{h: h, d: d}
   end
 
-  test "child spec: temporary with a finite shutdown of grace + slack" do
-    spec = OwnerGuard.child_spec(meta(self(), self(), grace_ms: 250))
-    assert spec.restart == :temporary
-    assert spec.shutdown == 250 + OwnerGuard.bounds().shutdown_slack_ms
-    assert {OwnerGuard, :start_link, [%{grace_ms: 250}]} = spec.start
-
-    # An invalid shape still gets a finite shutdown (init refuses it anyway).
-    assert OwnerGuard.child_spec(:junk).shutdown == OwnerGuard.bounds().shutdown_slack_ms
-  end
-
-  test "the child entry accepts only the exact metadata shape", %{sup: sup, h: h} do
-    m = meta(self(), h)
-
-    bad = [
-      Map.put(m, :extra, 1),
-      Map.delete(m, :activation_until),
-      %{m | caller: fn -> :ok end},
-      %{m | handoff: {:via, :x, :y}},
-      %{m | ref: :not_a_ref},
-      %{m | grace_ms: 0},
-      %{m | grace_ms: OwnerGuard.bounds().grace_ms + 1},
-      %{m | activation_until: m.cutoff + 1},
-      %{m | cutoff: now() + 4_294_967_295},
-      Map.to_list(m),
-      {OwnerGuard, :inert, []}
+  defp payload(ctx, r) do
+    [
+      handoff: r.h,
+      id: :primary,
+      controller: self(),
+      body: ~s({"marker":"#{@secret}"}),
+      limits: Limits.new(),
+      gate: [target: ctx.target, deadline: r.d]
     ]
-
-    for b <- bad do
-      assert {:error, :invalid_metadata} =
-               DynamicSupervisor.start_child(sup, OwnerGuard.child_spec(b))
-    end
-
-    assert DynamicSupervisor.which_children(sup) == []
-    refute_received {@tag_, _, _, _}
   end
 
-  # ── Startup ──────────────────────────────────────────────────────────────
-
-  test "startup: trapping guard, fixed inert non-trapping owner, linked and monitored",
-       %{sup: sup, h: h} do
-    assert {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h))
-    assert is_reference(r)
-
-    assert [{:undefined, ^g, :worker, [OwnerGuard]}] = DynamicSupervisor.which_children(sup)
-    assert {:trap_exit, true} = Process.info(g, :trap_exit)
-    assert {:trap_exit, false} = Process.info(o, :trap_exit)
-    assert {:initial_call, {OwnerGuard, :inert, 0}} = Process.info(o, :initial_call)
-
-    {:links, glinks} = Process.info(g, :links)
-    assert Enum.sort(glinks) == Enum.sort([sup, o])
-    assert {:links, [^g]} = Process.info(o, :links)
-    assert {:monitored_by, [^g]} = Process.info(o, :monitored_by)
-
-    {:monitors, mons} = Process.info(g, :monitors)
-    assert Enum.sort(for {:process, p} <- mons, do: p) == Enum.sort([self(), h, o])
-
-    # Inert: messages are discarded; a :normal exit signal is ignored.
-    send(o, :hello)
-    Process.exit(o, :normal)
-    assert Process.alive?(o)
-    eventually(fn -> Process.info(o, :message_queue_len) == {:message_queue_len, 0} end)
-
-    assert {:messages, []} = Process.info(self(), :messages)
+  defp gopts(ctx, r, requester, extra \\ []) do
+    Keyword.merge(
+      [
+        upstream: payload(ctx, r),
+        requester: requester,
+        observer: self(),
+        grace_ms: 50,
+        activation_ms: 5_000
+      ],
+      extra
+    )
   end
 
-  test "activation is one-shot, exact-ref and spawns the owner only then", %{sup: sup, h: h} do
-    m = meta(self(), h)
-    {:ok, g} = DynamicSupervisor.start_child(sup, OwnerGuard.child_spec(m))
-    ref = m.ref
-
-    # Started, not active: no owner exists.
-    assert {:links, [^sup]} = Process.info(g, :links)
-
-    send(g, {@tag_, make_ref(), :activate})
-    send(g, {@tag_, ref, :activate})
-    assert_receive {@tag_, ^ref, :active, o}
-    assert {:links, links} = Process.info(g, :links)
-    assert Enum.sort(links) == Enum.sort([sup, o])
-
-    send(g, {@tag_, ref, :activate})
-    eventually(fn -> Process.info(g, :message_queue_len) == {:message_queue_len, 0} end)
-    assert {:links, ^links} = Process.info(g, :links)
-    refute_received {@tag_, _, :active, _}
-
-    # Still one owner and one report.
-    send(h, :stop)
-    assert_receive {@tag_, ^ref, :owner_down, :handoff_down}
-    refute Process.alive?(o)
-    refute_received {@tag_, _, _, _}
-  end
-
-  test "guard-side activation wait is bounded; no owner is spawned", %{sup: sup, h: h} do
-    t0 = now()
-    m = meta(self(), h, activation_until: t0 + 50)
-    {:ok, g} = DynamicSupervisor.start_child(sup, OwnerGuard.child_spec(m))
-    gmon = Process.monitor(g)
-    ref = m.ref
-    assert {:links, [^sup]} = Process.info(g, :links)
-
-    assert_receive {@tag_, ^ref, :refused, :activation_timeout}, 2_000
-    assert_receive {:DOWN, ^gmon, :process, ^g, {:shutdown, :activation_timeout}}
-    assert now() >= t0 + 50
-    assert DynamicSupervisor.which_children(sup) == []
-    assert Process.alive?(h)
-
-    # A late activation reaches nobody.
-    send(g, {@tag_, ref, :activate})
-    refute_received {@tag_, ^ref, :active, _}
-  end
-
-  test "activation bounded by the cutoff refuses with :cutoff", %{sup: sup, h: h} do
-    c = now() + 50
-    m = meta(self(), h, cutoff: c, activation_until: c)
-    {:ok, g} = DynamicSupervisor.start_child(sup, OwnerGuard.child_spec(m))
-    gmon = Process.monitor(g)
-    ref = m.ref
-    assert_receive {@tag_, ^ref, :refused, :cutoff}, 2_000
-    assert_receive {:DOWN, ^gmon, :process, ^g, {:shutdown, :cutoff}}
-  end
-
-  test "caller-side activation wait is bounded; the silent child is killed" do
-    fsup = start_supervised!({FakeSupervisor, {self(), :silent_child}})
-    h = fake()
-    t0 = now()
-
-    assert {:error, :activation_timeout} =
-             OwnerGuard.start(fsup, opts(h, activation_ms: 50, grace_ms: 200))
-
-    assert now() >= t0 + 50
-    assert_received {:fake_child, child}
-    refute Process.alive?(child)
-    # The activation message went to the exact returned pid, nothing else did.
-    refute_received {@tag_, _, _, _}
-    assert Process.alive?(h)
-  end
-
-  test "caller-side start failures map to :start_failed" do
-    h = fake()
-
-    for reply <- [{:error, :boom}, :ignore] do
-      fsup = start_supervised!({FakeSupervisor, {self(), {:reply, reply}}}, id: make_ref())
-      assert {:error, :start_failed} = OwnerGuard.start(fsup, opts(h))
-    end
-
-    dead = fake()
-    Process.exit(dead, :kill)
-    refute Process.alive?(dead)
-    assert {:error, :start_failed} = OwnerGuard.start(dead, opts(h))
-  end
-
-  # ── Cancellation before activation ───────────────────────────────────────
-
-  test "a Handoff already down refuses the start", %{sup: sup} do
-    h = fake()
-    Process.exit(h, :kill)
-    refute Process.alive?(h)
-    assert {:error, :handoff_down} = OwnerGuard.start(sup, opts(h))
-    eventually(fn -> DynamicSupervisor.which_children(sup) == [] end)
-  end
-
-  test "caller down before activation ends the guard without an owner", %{sup: sup, h: h} do
-    caller = fake()
-    m = meta(caller, h)
-    {:ok, g} = DynamicSupervisor.start_child(sup, OwnerGuard.child_spec(m))
-    gmon = Process.monitor(g)
-    Process.exit(caller, :kill)
-    assert_receive {:DOWN, ^gmon, :process, ^g, {:shutdown, :caller_down}}
-    assert Process.alive?(h)
-  end
-
-  test "supervisor shutdown before activation refuses with :parent_exit", %{h: h} do
-    sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one}, id: :pre_sup)
-    m = meta(self(), h)
-    {:ok, g} = DynamicSupervisor.start_child(sup, OwnerGuard.child_spec(m))
-    gmon = Process.monitor(g)
-    ref = m.ref
-    :ok = stop_supervised(:pre_sup)
-    assert_receive {@tag_, ^ref, :refused, :parent_exit}
-    assert_receive {:DOWN, ^gmon, :process, ^g, :shutdown}
-  end
-
-  # ── Active: natural exit, cancellation, cutoff ───────────────────────────
-
-  test "natural owner exit is reported after its :DOWN; no restart", %{sup: sup, h: h} do
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h))
-    gmon = Process.monitor(g)
-
-    Process.exit(o, :boom)
-    assert_receive {@tag_, ^r, :owner_down, :owner_exited}
-    refute Process.alive?(o)
-    assert_receive {:DOWN, ^gmon, :process, ^g, :normal}
-    assert DynamicSupervisor.which_children(sup) == []
-    assert Process.alive?(h)
-    refute_received {@tag_, _, _, _}
-  end
-
-  test "Handoff :DOWN forces the owner; report only after its :DOWN", %{sup: sup, h: h} do
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h))
-    gmon = Process.monitor(g)
-    omon = Process.monitor(o)
-
-    send(h, :stop)
-    assert_receive {@tag_, ^r, :owner_down, :handoff_down}
-    refute Process.alive?(o)
-    assert_receive {:DOWN, ^omon, :process, ^o, :killed}
-    assert_receive {:DOWN, ^gmon, :process, ^g, :normal}
-    assert DynamicSupervisor.which_children(sup) == []
-  end
-
-  test "caller :DOWN forces the owner and signals nothing else", %{sup: sup, h: h} do
+  defp launcher(fun) do
     test = self()
 
-    caller =
-      spawn(fn ->
-        send(test, {:started, OwnerGuard.start(sup, opts(h))})
-
-        receive do
-          :never -> :ok
-        end
-      end)
-
-    assert_receive {:started, {:ok, %{guard: g, owner: o}}}
-    gmon = Process.monitor(g)
-    omon = Process.monitor(o)
-
-    Process.exit(caller, :kill)
-    assert_receive {:DOWN, ^omon, :process, ^o, :killed}
-    assert_receive {:DOWN, ^gmon, :process, ^g, :normal}
-    assert Process.alive?(h)
-    assert Process.alive?(sup)
+    :erlang.spawn_opt(
+      fn ->
+        send(test, {:launched, self(), fun.()})
+        receive do: (:exit -> :ok)
+      end,
+      [:monitor]
+    )
   end
 
-  test "supervisor shutdown: owner forced, reported, guard exits :shutdown in time", %{h: h} do
-    sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one}, id: :act_sup)
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h, grace_ms: 500))
-    gmon = Process.monitor(g)
-    omon = Process.monitor(o)
-
-    t0 = now()
-    :ok = stop_supervised(:act_sup)
-    # Well inside the declared finite shutdown (grace + slack), no supervisor kill.
-    assert now() - t0 < 500 + OwnerGuard.bounds().shutdown_slack_ms
-
-    assert_receive {@tag_, ^r, :owner_down, :parent_exit}
-    assert_receive {:DOWN, ^gmon, :process, ^g, :shutdown}
-    assert_receive {:DOWN, ^omon, :process, ^o, :killed}
-    assert Process.alive?(h)
+  defp await_reserve!(auth, h, o) do
+    await_mailbox!(
+      auth,
+      &Enum.any?(&1, fn m -> match?({:"$gen_call", {^h, _}, {:reserve, _, ^o, @units}}, m) end)
+    )
   end
 
-  @tag :capture_log
-  test "supervisor killed: owner forced, reported, guard exits with its reason", %{h: h} do
-    {:ok, sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
-    Process.unlink(sup)
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h))
-    gmon = Process.monitor(g)
-
-    Process.exit(sup, :kill)
-    assert_receive {@tag_, ^r, :owner_down, :parent_exit}
-    refute Process.alive?(o)
-    assert_receive {:DOWN, ^gmon, :process, ^g, :killed}
+  defp owner_gone!(%{tag: tag}, o) do
+    assert_receive {:telelem_admission, ^tag, {:owner_down, ^o, [{_gid, {:ok, _}}]}}, @t
   end
 
-  test "non-exact EXIT and DOWN are ignored; a forged parent EXIT only ends early",
-       %{sup: sup} do
-    test = self()
-
-    h =
-      spawn(fn ->
-        receive do
-          {:go, g} ->
-            Process.exit(g, :shutdown)
-            Process.exit(g, :normal)
-            send(g, {:EXIT, test, :shutdown})
-            send(g, {:DOWN, make_ref(), :process, test, :forged})
-            send(g, {:DOWN, make_ref(), :process, self(), :forged})
-            send(g, {@tag_, make_ref(), :activate})
-            # Then exit for real: signals from one sender keep their order.
-        end
-      end)
-
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h))
-    send(h, {:go, g})
-    assert_receive {@tag_, ^r, :owner_down, :handoff_down}
-    refute Process.alive?(o)
-
-    # Documented: `{:EXIT, parent, _}` as a plain message cannot be told apart.
-    h2 = fake()
-    {:ok, %{guard: g2, owner: o2, ref: r2}} = OwnerGuard.start(sup, opts(h2))
-    gmon2 = Process.monitor(g2)
-    send(g2, {:EXIT, sup, :shutdown})
-    assert_receive {@tag_, ^r2, :owner_down, :parent_exit}
-    refute Process.alive?(o2)
-    assert_receive {:DOWN, ^gmon2, :process, ^g2, :shutdown}
-    assert Process.alive?(sup)
-    assert Process.alive?(h2)
+  defp only_grant!(auth) do
+    assert [{gid, g}] = Map.to_list(Authority.snapshot(auth).grants)
+    {gid, g}
   end
 
-  test "the absolute cutoff forces the owner", %{sup: sup, h: h} do
-    c = now() + 100
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h, cutoff: c))
-    gmon = Process.monitor(g)
-    omon = Process.monitor(o)
+  defp assert_ledger!(ctx, gid, state) do
+    snap = Authority.snapshot(ctx.auth)
+    assert snap.grants[gid].state == state
 
-    assert_receive {:DOWN, ^omon, :process, ^o, :killed}, 2_000
-    assert now() >= c
-    assert_receive {@tag_, ^r, :owner_down, :cutoff}
-    assert now() <= c + 1_000
-    assert_receive {:DOWN, ^gmon, :process, ^g, :normal}
-    assert Process.alive?(h)
+    assert %{active: 0, reserved_units: 0, encumbered_units: 0, available_units: @limit} =
+             Map.take(snap, [:active, :reserved_units, :encumbered_units, :available_units])
+
+    assert Ledger.consistent?(Directory.ledger(ctx.inst.table))
   end
 
-  # ── Busy mailbox and the grace bound ─────────────────────────────────────
+  defp await_mailbox!(pid, pred, until \\ nil) do
+    until = until || now() + @t
+    msgs = mailbox(pid)
 
-  test "busy mailbox: the cutoff is checked at every turn, not after the backlog",
-       %{sup: sup, h: h} do
-    c = now() + 50
-
-    {:ok, %{guard: g, owner: o, ref: r}} =
-      OwnerGuard.start(sup, opts(h, cutoff: c, grace_ms: 10_000))
-
-    omon = Process.monitor(o)
-
-    :erlang.suspend_process(g)
-    for _ <- 1..@junk, do: send(g, :junk)
-    wait_until(c + 1)
-    :erlang.resume_process(g)
-
-    assert_receive {:DOWN, ^omon, :process, ^o, :killed}, 5_000
-    {:message_queue_len, left} = Process.info(g, :message_queue_len)
-    assert left > 0, "owner was killed only after the backlog was drained"
-
-    assert_receive {@tag_, ^r, :owner_down, :cutoff}, 10_000
+    cond do
+      pred.(msgs) -> msgs
+      now() >= until -> flunk("mailbox of #{inspect(pid)}: #{inspect(msgs)}")
+      true -> await_mailbox!(pid, pred, until)
+    end
   end
 
-  test "kill-to-DOWN past the grace: no report, unconfirmed exit", %{sup: sup, h: h} do
-    {:ok, %{guard: g, owner: o, ref: r}} = OwnerGuard.start(sup, opts(h, grace_ms: 1))
-    gmon = Process.monitor(g)
-    omon = Process.monitor(o)
+  defp mailbox(pid), do: elem(Process.info(pid, :messages), 1)
 
-    :erlang.suspend_process(g)
-    send(h, :stop)
-    eventually(fn -> queued?(g, &match?({:DOWN, _, :process, ^h, _}, &1)) end)
-    # The owner's :DOWN will queue behind this backlog.
-    for _ <- 1..@junk, do: send(g, :junk)
-    :erlang.resume_process(g)
-
-    assert_receive {:DOWN, ^omon, :process, ^o, :killed}, 5_000
-    assert_receive {:DOWN, ^gmon, :process, ^g, {:shutdown, :owner_down_unconfirmed}}, 10_000
-    refute_received {@tag_, ^r, _, _}
+  defp sleep_until(t) do
+    left = t - now()
+    if left > 0, do: Process.sleep(left)
+    if now() < t, do: sleep_until(t)
   end
 
-  test "a parent EXIT while waiting keeps the cause and sets the exit reason",
-       %{sup: sup, h: h} do
-    {:ok, %{guard: g, ref: r}} = OwnerGuard.start(sup, opts(h))
-    gmon = Process.monitor(g)
+  defp contains?(term, needle) when term === needle, do: true
+  defp contains?(b, n) when is_binary(b) and is_binary(n), do: String.contains?(b, n)
+  defp contains?(t, n) when is_tuple(t), do: t |> Tuple.to_list() |> contains?(n)
+  defp contains?([h | t], n), do: contains?(h, n) or contains?(t, n)
+  defp contains?(%{} = m, n), do: m |> Map.to_list() |> contains?(n)
+  defp contains?(_, _), do: false
 
-    :erlang.suspend_process(g)
-    send(h, :stop)
-    eventually(fn -> queued?(g, &match?({:DOWN, _, :process, ^h, _}, &1)) end)
-    send(g, {:EXIT, sup, :shutdown})
-    :erlang.resume_process(g)
-
-    assert_receive {@tag_, ^r, :owner_down, :handoff_down}
-    assert_receive {:DOWN, ^gmon, :process, ^g, :shutdown}
+  defp idle do
+    pid = spawn(fn -> receive do: (:never -> :ok) end)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
   end
-
-  # ── Helpers ──────────────────────────────────────────────────────────────
 
   defp now, do: System.monotonic_time(:millisecond)
-
-  defp fake do
-    spawn(fn ->
-      receive do
-        :stop -> :ok
-      end
-    end)
-  end
-
-  defp opts(h, kw \\ []) do
-    Keyword.merge(
-      [handoff: h, cutoff: now() + 60_000, grace_ms: 1_000, activation_ms: 5_000],
-      kw
-    )
-  end
-
-  defp meta(caller, h, kw \\ []) do
-    t = now()
-
-    Map.merge(
-      %{
-        caller: caller,
-        ref: make_ref(),
-        handoff: h,
-        cutoff: t + 60_000,
-        grace_ms: 1_000,
-        activation_until: t + 5_000
-      },
-      Map.new(kw)
-    )
-  end
-
-  defp queued?(pid, pred) do
-    {:messages, ms} = Process.info(pid, :messages)
-    Enum.any?(ms, pred)
-  end
-
-  defp eventually(fun, bound \\ 2_000), do: eventually(fun, now() + bound, :go)
-
-  defp eventually(fun, until, :go) do
-    cond do
-      fun.() ->
-        :ok
-
-      now() > until ->
-        flunk("condition not reached in time")
-
-      true ->
-        :erlang.yield()
-        eventually(fun, until, :go)
-    end
-  end
-
-  # Waits for a clock instant (not a synchronisation point).
-  defp wait_until(t) do
-    receive do
-    after
-      max(t - now(), 0) -> :ok
-    end
-  end
 end

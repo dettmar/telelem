@@ -186,6 +186,23 @@ defmodule Telelem.Wire.Upstream do
   grace), `Mint.HTTP.close/1` (OTP's own close behaviour), parsing of one
   delivery, and scheduling. A blocked call delays the next check; nothing
   here proves socket teardown timing or slot quiescence.
+
+  ## Guarded owner (TEL-012, `Telelem.Wire.OwnerGuard` only)
+
+  `guarded/1` is the fixed entry the guard spawns (linked and monitored, not
+  trapping exits). It takes only metadata (token, activation limit `A`,
+  deadline `D`, pinned coordinator) and waits for one GO with the exact
+  token until `A` (at `A` it has expired). On GO it rechecks the token, `A`,
+  that the payload is a valid gated attempt pinned to the same coordinator
+  and to the same `D`, and that no scoped stop is pending; only then does it
+  run the gated attempt above. Otherwise it exits without attaching.
+
+  The guard's scoped stop (`{:telelem_owner_stop, token}`) is consumed only
+  at the gated checkpoints (step 2, 3 and 5 above, as `{:stopped, stage,
+  :guard_stop}`) and in the streaming receive (`:guard_stop`). It is
+  cooperative: a call that blocks (for example `attach_grant/3` waiting for
+  a reservation) does not see it; the guard then kills the exact pid at its
+  fence. Legacy and unguarded gated attempts never match it.
   """
 
   alias Telelem.Handoff
@@ -366,8 +383,72 @@ defmodule Telelem.Wire.Upstream do
 
   defp gate_error(msg), do: raise(ArgumentError, "Upstream gate: " <> msg)
 
+  # ── guarded owner entry (TEL-012, `Telelem.Wire.OwnerGuard`) ────────────
+
+  @go_tag :telelem_owner_go
+  @stop_tag :telelem_owner_stop
+
   @doc false
-  def init(opts) do
+  # Launcher-side check of a guarded payload: gated mode only (one non-nil
+  # `:gate`), the full gated interface. Raises `ArgumentError` naming the
+  # field. Returns the pinned coordinator and the gate deadline.
+  def validate_guarded!(opts) do
+    unless mode!(opts) == :gated, do: gate_error(":gate is required")
+    %{deadline: d} = gate!(opts)
+    %{handoff: Keyword.fetch!(opts, :handoff), deadline: d}
+  end
+
+  @doc false
+  # The fixed owner entry, spawned only by `Telelem.Wire.OwnerGuard` (linked
+  # and monitored by the guard, not trapping exits). Waits for one GO carrying
+  # the exact token until the activation limit `until` (equality expires),
+  # then rechecks the token, the limit, the pinned coordinator and the gate
+  # deadline before the gated attach. A scoped stop or no GO ends it without
+  # attaching. No result is sent anywhere before the attach.
+  def guarded(%{ref: ref, until: a, deadline: d, handoff: h} = meta)
+      when is_reference(ref) and is_integer(a) and is_integer(d) and a <= d and is_pid(h) and
+             map_size(meta) == 4 do
+    left = a - System.monotonic_time(:millisecond)
+
+    if left <= 0 do
+      exit({:shutdown, :expired})
+    else
+      receive do
+        {@go_tag, ^ref, opts} -> go(opts, meta)
+        {@stop_tag, ^ref} -> exit({:shutdown, :stopped})
+      after
+        min(left, @max_timeout_ms) -> guarded(meta)
+      end
+    end
+  end
+
+  def guarded(_), do: exit({:shutdown, :invalid_meta})
+
+  defp go(opts, %{ref: ref, until: a, deadline: d, handoff: h}) do
+    pinned =
+      try do
+        validate_guarded!(opts)
+      rescue
+        ArgumentError -> :refused
+      end
+
+    receive do
+      {@stop_tag, ^ref} -> exit({:shutdown, :stopped})
+    after
+      0 -> :ok
+    end
+
+    cond do
+      System.monotonic_time(:millisecond) >= a -> exit({:shutdown, :expired})
+      pinned != %{handoff: h, deadline: d} -> exit({:shutdown, :refused})
+      true -> run(opts, ref)
+    end
+  end
+
+  @doc false
+  def init(opts), do: run(opts, nil)
+
+  defp run(opts, stop_token) do
     gate = if mode!(opts) == :gated, do: gate!(opts)
 
     %Limits{} = limits = Keyword.fetch!(opts, :limits)
@@ -390,6 +471,8 @@ defmodule Telelem.Wire.Upstream do
       terminal_deadline: if(gate, do: gate.deadline, else: Keyword.get(opts, :terminal_deadline)),
       # nil = legacy; else %{target:, deadline:} (see "Gated attempt").
       gate: gate,
+      # nil, or the OwnerGuard token of a guarded owner's scoped stop.
+      stop_token: stop_token,
       hmon: nil,
       conn: nil,
       ref: nil,
@@ -485,8 +568,21 @@ defmodule Telelem.Wire.Upstream do
         receive do
           {:DOWN, ^hmon, :process, _, _} -> {:stop, :handoff_down}
         after
-          0 -> if expired?(s), do: {:stop, :deadline}, else: :ok
+          0 -> if guard_stop?(s), do: {:stop, :guard_stop}, else: clock(s)
         end
+    end
+  end
+
+  defp clock(s), do: if(expired?(s), do: {:stop, :deadline}, else: :ok)
+
+  # A guarded owner's scoped cooperative stop, consumed without waiting.
+  defp guard_stop?(%{stop_token: nil}), do: false
+
+  defp guard_stop?(%{stop_token: tok}) do
+    receive do
+      {@stop_tag, ^tok} -> true
+    after
+      0 -> false
     end
   end
 
@@ -664,8 +760,13 @@ defmodule Telelem.Wire.Upstream do
     sock = s.sock
     h = s.h
     hmon = s.hmon
+    # nil outside a guarded owner: the clause below never matches then.
+    stop_tok = s.stop_token
 
     receive do
+      {@stop_tag, t} when t === stop_tok and stop_tok != nil ->
+        stop(s, :guard_stop)
+
       {:ssl, ^sock, data} = msg ->
         st = s.stats
         n = byte_size(data)
@@ -1223,6 +1324,7 @@ defmodule Telelem.Wire.Upstream do
     :finished,
     :finish_unconfirmed,
     :deadline,
+    :guard_stop,
     :upstream_ended_without_done,
     :no_semantic_content
   ]
@@ -1275,7 +1377,7 @@ defmodule Telelem.Wire.Upstream do
   def public_reason(_), do: :other
 
   defp public_cause({:cancelled, r}), do: {:cancelled, kind(r)}
-  defp public_cause(c) when c in [:handoff_down, :deadline], do: c
+  defp public_cause(c) when c in [:handoff_down, :deadline, :guard_stop], do: c
   defp public_cause(_), do: :other
 
   defp snapshot(s) do

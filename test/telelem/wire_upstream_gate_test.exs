@@ -525,6 +525,9 @@ defmodule Telelem.WireUpstreamGateTest do
        {:stopped, :after_attach, {:cancelled, :other}}},
       {{:stopped, :before_request, :deadline}, {:stopped, :before_request, :deadline}},
       {{:stopped, :elsewhere, :deadline}, :other},
+      # OwnerGuard's scoped cooperative stop (guarded owners only).
+      {{:stopped, :after_attach, :guard_stop}, {:stopped, :after_attach, :guard_stop}},
+      {:guard_stop, :guard_stop},
       {:finished, :finished},
       {:deadline, :deadline},
       {secret, :other},
