@@ -446,6 +446,35 @@ defmodule Telelem.Serve.HTTPTest do
     end
   end
 
+  test "a negative completion chunk count is rejected and aborts with no status and no terminator",
+       ctx do
+    # `chunks: -1` after only the header write satisfies `calls == chunks + 2`;
+    # the nonnegative check rejects it. The header-plus-marker case is also
+    # rejected by the call count alone.
+    header_only = fn _cfg, _auth, rd, {w, st}, _o ->
+      {:ok, _} = rd.(4096, 1_000)
+      {:ok, _} = w.header(st)
+      {:complete, %{header: :ok, terminal: :written, chunks: -1}, %{}}
+    end
+
+    header_marker = fn _cfg, _auth, rd, {w, st}, _o ->
+      {:ok, _} = rd.(4096, 1_000)
+      {:ok, st} = w.header(st)
+      {:ok, _} = w.chunk(st, @marker)
+      {:complete, %{header: :ok, terminal: :written, chunks: -1}, %{}}
+    end
+
+    for runner <- [header_only, header_marker] do
+      sock = Transport.new([@body])
+      res = pipeline(sock, head(cl: byte_size(@body)), plug(ctx, runner))
+      assert {:error, %Aborted{message: "telelem response aborted"}} = res
+      assert {"HTTP/1.1 200 OK", _, body} = split(Transport.log(sock).out)
+      refute body =~ "0\r\n\r\n"
+      refute body =~ "HTTP/1.1 5"
+      assert slot_keys() == []
+    end
+  end
+
   test "the installed sentinel suppresses the server's error status; control: a bare raise gets Bandit's 500",
        ctx do
     aborted = fn _cfg, _auth, _rd, _w, _o -> {:aborted, :x, %{}, %{}} end

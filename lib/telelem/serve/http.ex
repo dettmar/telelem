@@ -204,10 +204,11 @@ defmodule Telelem.Serve.HTTP do
 
     * `{:complete, evidence, _}` returns the slot's latest conn normally, and
       only if it is consistent: evidence `header: :ok` and `terminal:
-      :written`; the body was read once; every invoked writer call
-      succeeded, exactly `evidence.chunks + 2` of them (header, data chunks,
-      marker); the latest conn is in state `:chunked` with status 200, with
-      the request's adapter module and owner. This module writes no empty
+      :written`; `evidence.chunks` a nonnegative integer; the body was read
+      once; every invoked writer call succeeded, exactly `evidence.chunks +
+      2` of them (header, data chunks, marker); the latest conn is in state
+      `:chunked` with status 200, with the request's adapter module and
+      owner. This module writes no empty
       chunk; returning the chunked conn lets the server end it (Bandit's
       `commit_response!` writes the terminator).
     * `{:no_write, why, ...}` with no writer call invoked: one fixed
@@ -229,14 +230,18 @@ defmodule Telelem.Serve.HTTP do
 
   ## Not covered
 
-  Diagnostics are not contained here, and must be before production: Bandit
-  logs the `Aborted` exception (with a stack trace) at error level with
-  metadata that includes the original `Plug.Conn` (request headers, the
-  `authorization` value included) and the plug options, and logs its own
-  protocol errors. Messages left in the owner's mailbox by Requester's
-  protocol are left for the server process. Nothing here claims real
-  chunked framing on a socket, peer receipt of any byte, TLS, or anything
-  beyond the pinned Bandit/Plug behaviour cited above.
+  Diagnostics are not contained here, and must be before binding any
+  listener: Bandit logs the `Aborted` exception (with a stack trace) at
+  error level with metadata that includes the original `Plug.Conn` (request
+  headers, the `authorization` value included) and the plug options, and
+  logs its own protocol errors. Bandit's `[:bandit, :request, ...]`
+  telemetry metadata carries the `Plug.Conn` too, and Thousand Island's
+  `:recv`/`:send` (and `:send_error`) telemetry carries the raw bytes read
+  and written (request headers and body, response bytes). Messages left in
+  the owner's mailbox by Requester's protocol are left for the server
+  process. Nothing here claims real chunked framing on a socket, peer
+  receipt of any byte, TLS, or anything beyond the pinned Bandit/Plug
+  behaviour cited above.
   """
 
   @behaviour Plug
@@ -427,7 +432,8 @@ defmodule Telelem.Serve.HTTP do
   defp finish(_other, %{calls: 0} = slot), do: respond(slot.conn, :internal)
   defp finish(_other, _slot), do: abort!()
 
-  defp complete?(%{header: :ok, terminal: :written, chunks: c}, slot) when is_integer(c) do
+  defp complete?(%{header: :ok, terminal: :written, chunks: c}, slot)
+       when is_integer(c) and c >= 0 do
     slot.read == :ok and slot.header == :ok and slot.calls == slot.ok_calls and
       slot.ok_calls == c + 2 and
       chunked_conn?(slot.conn, slot.adapter, slot.owner)
