@@ -409,9 +409,8 @@ defmodule RouteStore.BootCheck do
   # must name the start tenant and the locked store, and every target's CA must be the
   # manifested fixture CA file. Sandbox.Bootstrap then builds the bindings. It rereads
   # that CA file itself, by path, once per target, and those rereads are not hashed.
-  # So each VerifiedTarget it returns must carry exactly the certificates in the hashed
-  # CA bytes; a different CA file at any of those reads is refused
-  # (bootstrap_ca_not_pinned).
+  # If a returned target’s ordered DER certificate list differs from the list decoded
+  # from the originally hashed PEM, boot fails with `bootstrap_ca_not_pinned`.
   defp bootstrap(files, sb, boot, store, tenant) do
     ca_path = Path.join(boot, @roles["fixture_ca"])
 
