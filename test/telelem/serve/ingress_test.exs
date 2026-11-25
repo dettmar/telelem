@@ -56,7 +56,11 @@ defmodule Telelem.Serve.IngressTest do
   calls (nothing is cancelled; see the module's *Cancellation limits*),
   admission, receipts, dispatch.
   """
-  use ExUnit.Case, async: true
+  # Synchronous: `capture_log/1` sees every process's log events, and the
+  # `log == ""` / no-marker assertions below must not pick up deliberate
+  # crash logs from concurrently running async modules (e.g. FileStoreTest).
+  # Sync modules start only after all async modules have finished.
+  use ExUnit.Case, async: false
 
   import ExUnit.CaptureLog
 

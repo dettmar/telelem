@@ -93,7 +93,7 @@ defmodule Telelem.HandoffTest do
 
     %{
       h: h,
-      hmon: Process.monitor(h),
+      hmon: monitor!(h),
       req: req,
       auth: auth,
       obs: obs,
@@ -119,6 +119,19 @@ defmodule Telelem.HandoffTest do
   end
 
   defp traced(c, ev), do: assert_receive({:telelem_handoff_trace, h, ^ev} when h == c.h, @t)
+
+  # A monitor request is a signal; cleanup driven through another process
+  # (an attempt's call, a killed requester's :DOWN, a parent's link exit) can
+  # reach the handoff first and close it, and the late request then yields
+  # :noproc. A process_info request from this process is ordered after the
+  # monitor request, so seeing ourselves in :monitored_by proves the monitor
+  # is in place before anything else is triggered.
+  defp monitor!(pid) do
+    mon = Process.monitor(pid)
+    assert {:monitored_by, by} = Process.info(pid, :monitored_by)
+    assert self() in by
+    mon
+  end
 
   defp assert_stopped(c),
     do: assert_receive({:DOWN, ref, :process, _, :normal} when ref == c.hmon, @t)
@@ -585,7 +598,7 @@ defmodule Telelem.HandoffTest do
       for chunk <- @chunks, do: assert(do!(c, :a, {:transfer, chunk}) == :ok)
       assert do!(c, :b, {:clean, :none}) == :ok
 
-      hmon = Process.monitor(h)
+      hmon = monitor!(h)
       kill_and_observe(parent)
       assert_receive {:DOWN, ^hmon, _, _, :killed}, @t
 
