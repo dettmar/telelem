@@ -501,6 +501,25 @@ defmodule Telelem.Handoff do
   @doc "Requester-initiated end, such as a downstream disconnect or write failure."
   def cancel(h, reason), do: call(h, {:cancel, reason})
 
+  @doc """
+  Requester only: submits the same request as `cancel/2` to the pid `h`
+  **without waiting**. It is sent once with `:gen_server.send_request/2` and
+  abandoned at once with `:gen_server.receive_response(req, 0)`, which
+  removes its monitor and deactivates its reply alias, so a later reply is
+  discarded by the runtime (a reply or `:DOWN` already delivered is consumed
+  and discarded too). Nothing else in the caller's mailbox is touched.
+
+  Returns `:submitted`: the request was sent, nothing more. It says nothing
+  about whether `h` was alive, handled it or what it decided; any outcome
+  reaches the requester as the usual `{:telelem_handoff, h, msg}` messages.
+  Never retries, kills or waits.
+  """
+  def submit_cancel(h, reason) when is_pid(h) do
+    req = :gen_server.send_request(h, {:cancel, reason})
+    _ = :gen_server.receive_response(req, 0)
+    :submitted
+  end
+
   @doc "Snapshot of the coordinator state for tests and diagnostics."
   def status(h), do: call(h, :status)
 
