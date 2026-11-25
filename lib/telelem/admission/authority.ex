@@ -10,7 +10,9 @@ defmodule Telelem.Admission.Authority do
     * all-or-none `reserve/4` (slot + units, idempotent by op id)
     * `authorize/2` dispatch, `cancel/2`, `settle/3`, `reconcile/3`
       (`reserve/5` and `authorize/3` take an explicit caller wait; a timeout
-      there neither cancels nor rolls back the queued request)
+      there neither cancels nor rolls back the queued request;
+      `send_reserve/4` and `send_authorize/2` send the same requests
+      asynchronously, for a caller that must not block)
     * reservation TTL timers armed through the injected clock
     * **monitored owner death**: a live reserved grant is released, and a
       dispatched grant becomes `:unresolved` (slot freed, spend still encumbered)
@@ -142,6 +144,28 @@ defmodule Telelem.Admission.Authority do
   @spec authorize(GenServer.server(), grant_id(), timeout()) :: result()
   def authorize(auth, gid, timeout) when is_wait(timeout),
     do: GenServer.call(auth, {:authorize, gid}, timeout)
+
+  @doc """
+  Asynchronous `reserve/5`: sends the same request to the pinned authority
+  pid `auth` with `:gen_server.send_request/2` and returns its request id.
+  The caller matches the reply (`result()`) or the request monitor's `:DOWN`
+  with `:gen_server.check_response/2`, and gives the request up with
+  `:gen_server.receive_response(request_id, 0)`. Giving it up only discards
+  the reply. Like a timed-out `reserve/5`, it neither cancels nor rolls back
+  the request: unless `auth` dies first, it is still applied in mailbox order.
+  """
+  @spec send_reserve(pid(), term(), pid(), pos_integer()) :: :gen_server.request_id()
+  def send_reserve(auth, op_id, owner, units) when is_pid(auth) and is_pid(owner),
+    do: :gen_server.send_request(auth, {:reserve, op_id, owner, units})
+
+  @doc """
+  Asynchronous `authorize/3` to the pinned authority pid `auth`, with the same
+  reply handling as `send_reserve/4`. Abandoning the request does not stop
+  it: treat an abandoned authorize as possibly dispatched.
+  """
+  @spec send_authorize(pid(), grant_id()) :: :gen_server.request_id()
+  def send_authorize(auth, gid) when is_pid(auth),
+    do: :gen_server.send_request(auth, {:authorize, gid})
 
   @spec cancel(GenServer.server(), grant_id()) :: result()
   def cancel(auth, gid), do: GenServer.call(auth, {:cancel, gid})
