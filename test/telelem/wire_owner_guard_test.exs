@@ -14,12 +14,18 @@ defmodule Telelem.WireOwnerGuardTest do
   Covers: the closed option interface; equality expiry of the one activation
   limit; the metadata-only child entry and late (queued) child start; the
   helper killed by the witness on expiry, launcher loss (`:normal` included)
-  and abandonment; positive attach by the exact owner pid; the owner's GO
+  and abandonment, and by the launcher's own failed cleanup when the witness
+  cannot act; a witness `:DOWN` already delivered behind its acknowledgement
+  winning over GO; positive attach by the exact owner pid; the owner's GO
   rechecks at the real entry (token, limit, pinned coordinator, deadline,
   pending stop); cooperative stop at a checkpoint and the forced fence while
-  blocked in a call; supervisor shutdown; and the witness's independent
-  confirmation on guard, requester and launcher loss. Reports are asserted
-  only with the exact process already dead.
+  blocked in a call; supervisor shutdown; the witness as the only releaser of
+  activation (exactly once, to the exact reported guard, never after it
+  closed) and its three reports: `:owner_down` only from its own monitor,
+  `:activation_never_released`, and `:owner_unknown` when a released guard
+  went down without announcing an owner (fake launcher, helper, guard and
+  owner processes). Reports are asserted only with the exact process already
+  dead.
 
   Ordering uses `:sys.suspend/1`, `:erlang.suspend_process/1` and mailboxes
   read back with `Process.info/2`, re-read until the expected message is
@@ -280,7 +286,7 @@ defmodule Telelem.WireOwnerGuardTest do
 
     assert_receive {:telelem_owner_guard, ^ref, :owner_down, :requester_down, :stopped}, @t
     refute Process.alive?(o)
-    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
     refute Process.alive?(g)
 
     owner_gone!(ctx, o)
@@ -306,7 +312,7 @@ defmodule Telelem.WireOwnerGuardTest do
     assert_receive {:telelem_owner_guard, ^ref, :owner_down, :requester_down, :killed}, @t
     assert now() >= t0 + grace
     refute Process.alive?(o)
-    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
     # Killed while blocked: it reported nothing and never dialed.
     refute_received {:telelem_wire, ^o, _, _}
 
@@ -336,7 +342,7 @@ defmodule Telelem.WireOwnerGuardTest do
 
     assert %{claim: :none, cleaned_ack: :not_sent} = stats
     assert_receive {:telelem_owner_guard, ^ref, :owner_down, :owner_exited, :exited}, @t
-    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
     assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(h)
     refute_received {:telelem_handoff_trace, ^h, _}
     refute_received {:telelem_wire, _, _, {:connect_failed, _, _}}
@@ -356,7 +362,7 @@ defmodule Telelem.WireOwnerGuardTest do
 
     assert_receive {:telelem_owner_guard, ^ref, :owner_down, :parent_exit, :killed}, @t
     assert_receive {:DOWN, ^gm, :process, ^g, :shutdown}, @t
-    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
     :ok = :sys.resume(ctx.auth)
     owner_gone!(ctx, o)
   end
@@ -375,7 +381,7 @@ defmodule Telelem.WireOwnerGuardTest do
     wm = Process.monitor(w)
     Process.exit(g, :kill)
 
-    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
     refute Process.alive?(o)
     assert_receive {:DOWN, ^wm, :process, ^w, :normal}, @t
     refute_received {:telelem_owner_guard, ^ref, :owner_down, _, _}
@@ -400,7 +406,7 @@ defmodule Telelem.WireOwnerGuardTest do
 
     Process.exit(greq, :kill)
     assert_receive {:telelem_owner_guard, ^ref, :owner_down, :requester_down, :killed}, @t
-    assert_receive {:telelem_owner_witness, ^ref, :confirmed, {:owner_down, ^o}}, @t
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
     :ok = :sys.resume(ctx.auth)
     owner_gone!(ctx, o)
   end
@@ -427,7 +433,7 @@ defmodule Telelem.WireOwnerGuardTest do
     assert_receive {:DOWN, ^lm, :process, ^l, :killed}, @t
     assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t
     assert now() < t0 + act, "the helper must go on launcher loss, not at A"
-    assert_receive {:telelem_owner_witness, _, :confirmed, :no_owner}, @t
+    assert_receive {:telelem_owner_witness, _, :activation_never_released}, @t
 
     # The queued request still starts a guard before A; never activated, it
     # gets no owner and expires at A.
@@ -452,7 +458,7 @@ defmodule Telelem.WireOwnerGuardTest do
 
     assert now() >= t0 + 100
     [{:"$gen_call", {helper, _}, {:start_child, _}}] = mailbox(ctx.sup)
-    assert_receive {:telelem_owner_witness, _, :confirmed, :no_owner}, @t
+    assert_receive {:telelem_owner_witness, _, :activation_never_released}, @t
     refute Process.alive?(helper)
 
     # Processed after A: the child's init refuses and spawns nothing.
@@ -470,41 +476,196 @@ defmodule Telelem.WireOwnerGuardTest do
     refute_received {:telelem_owner_guard, _, _, _}
   end
 
-  test "witness: the exact helper is killed on launcher :normal exit, on abandonment and at A" do
+  test "launcher expiry while the witness cannot act: the launcher itself kills the exact helper blocked in start_child",
+       ctx do
+    r = start_h!(ctx)
+    act = 200
+    :ok = :sys.suspend(ctx.sup)
+    opts = gopts(ctx, r, idle(), activation_ms: act)
+    {l, lm} = launcher(fn -> OwnerGuard.start(ctx.sup, opts) end)
+
+    [{:"$gen_call", {helper, _}, {:start_child, call}}] =
+      await_mailbox!(ctx.sup, &match?([{:"$gen_call", _, {:start_child, _}}], &1))
+
+    %{witness: w} = find_meta(call)
+    await_monitors!(l, w)
+    hm = Process.monitor(helper)
+    wm = Process.monitor(w)
+    # The witness can neither kill the helper at A nor process the abandon.
+    true = :erlang.suspend_process(w)
+
+    assert_receive {:launched, ^l, {:error, :expired}}, act + @t
+    # The launcher's own failed cleanup ended the exact helper.
+    assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t
+    assert Process.alive?(w)
+    assert {:status, :suspended} = Process.info(w, :status)
+
+    # The witness then goes before ever acting: nobody else was needed.
+    Process.exit(w, :kill)
+    assert_receive {:DOWN, ^wm, :process, ^w, :killed}, @t
+    send(l, :exit)
+    assert_receive {:DOWN, ^lm, :process, ^l, :normal}, @t
+
+    # The queued request is processed after A: no work.
+    :ok = :sys.resume(ctx.sup)
+    assert DynamicSupervisor.which_children(ctx.sup) == []
+    assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(r.h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+  end
+
+  test "a witness :DOWN already delivered behind its acknowledgement wins over GO; the guard is killed and nothing attaches",
+       ctx do
+    r = start_h!(ctx, trace: self())
+    :ok = :sys.suspend(ctx.sup)
+    opts = gopts(ctx, r, idle(), grace_ms: 10_000)
+    {l, lm} = launcher(fn -> OwnerGuard.start(ctx.sup, opts) end)
+
+    [{:"$gen_call", _, {:start_child, call}}] =
+      await_mailbox!(ctx.sup, &match?([{:"$gen_call", _, {:start_child, _}}], &1))
+
+    %{witness: w, ref: ref} = find_meta(call)
+    # The launcher's own witness monitor exists before it is held.
+    await_monitors!(l, w)
+
+    # Hold the launcher in its receive, let the witness release activation
+    # and acknowledge the exact owner, then kill the witness.
+    true = :erlang.suspend_process(l)
+    :ok = :sys.resume(ctx.sup)
+
+    [{:telelem_owner_guard, ^ref, :watching, g, o}] =
+      for {:telelem_owner_guard, ^ref, :watching, _, _} = m <-
+            await_mailbox!(
+              l,
+              &Enum.any?(&1, fn m -> match?({:telelem_owner_guard, ^ref, :watching, _, _}, m) end)
+            ),
+          do: m
+
+    om = Process.monitor(o)
+    gm = Process.monitor(g)
+    Process.exit(w, :kill)
+    await_mailbox!(l, &Enum.any?(&1, fn m -> match?({:DOWN, _, :process, ^w, :killed}, m) end))
+    true = :erlang.resume_process(l)
+
+    assert_receive {:launched, ^l, {:error, :witness_down}}, @t
+    assert_receive {:DOWN, ^gm, :process, ^g, :killed}, @t
+    assert_receive {:DOWN, ^om, :process, ^o, :killed}, @t
+
+    # No GO was sent: the owner never attached and nothing was reserved.
+    assert %{attempts: %{primary: %{pid: nil}}} = Handoff.status(r.h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+    refute_received {:telelem_handoff_trace, _, {:attached, _}}
+    refute_received {:telelem_wire, _, _, _}
+    refute_received {:telelem_owner_witness, _, _, _}
+    send(l, :exit)
+    assert_receive {:DOWN, ^lm, :process, ^l, :normal}, @t
+  end
+
+  # ── witness (fake launcher, helper, guard and owner) ───────────────────
+
+  test "witness: closed (launcher :normal exit, abandonment, A) before the helper's result, it never releases activation" do
     for name <- [:normal, :abandon, :expiry] do
       ref = make_ref()
       l = spawn(fn -> receive do: (:exit -> :ok) end)
-      test = self()
+      g = recorder()
+      until = if name == :expiry, do: now() + 300, else: now() + 60_000
+      %{w: w, helper: helper, hm: hm} = fake_witness(ref, l, until)
 
-      helper =
-        spawn(fn ->
-          receive do
-            {:telelem_owner_guard, ^ref, :run, w} -> send(test, {:run, w})
-          end
-
-          receive do: (:never -> :ok)
-        end)
-
-      hm = Process.monitor(helper)
-      until = if name == :expiry, do: now() + 50, else: now() + 60_000
-
-      w =
-        spawn(OwnerGuard, :witness, [
-          %{launcher: l, helper: helper, alias: self(), ref: ref, until: until, observer: self()}
-        ])
-
-      assert_receive {:run, ^w}, @t
+      # The witness is held while it is closed and the helper's {:ok, guard}
+      # is queued behind that.
+      true = :erlang.suspend_process(w)
+      assert Process.alive?(helper), "#{name}: the witness closed before it was held"
 
       case name do
         :normal -> send(l, :exit)
         :abandon -> send(w, {:telelem_owner_guard, ref, :abandon})
-        :expiry -> :ok
+        :expiry -> sleep_until(until)
       end
 
+      if name == :normal,
+        do: await_mailbox!(w, &Enum.any?(&1, fn m -> match?({:DOWN, _, :process, ^l, _}, m) end))
+
+      send(helper, {:send, w, {:telelem_owner_guard, ref, :started, {:ok, g}}})
+      await_mailbox!(w, &Enum.any?(&1, fn m -> match?({_, ^ref, :started, _}, m) end))
+      true = :erlang.resume_process(w)
+
       assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t, inspect(name)
-      assert_receive {:telelem_owner_witness, ^ref, :confirmed, :no_owner}, @t
+      # It watches the exact guard it learned of, but never activates it.
+      await_watched!(w, g)
+      no_activation!(g, ref)
+      Process.exit(g, :kill)
+      assert_receive {:telelem_owner_witness, ^ref, :activation_never_released}, @t
+      refute_received {:telelem_owner_guard, ^ref, :watching, _, _}
       Process.exit(l, :kill)
     end
+  end
+
+  test "witness: one activation to the exact reported guard; owner death only from its own exact monitor" do
+    ref = make_ref()
+    l = spawn(fn -> receive do: (:exit -> :ok) end)
+    on_exit(fn -> Process.exit(l, :kill) end)
+    g = recorder()
+    other = recorder()
+    %{w: w, helper: helper} = fake_witness(ref, l, now() + 60_000)
+
+    send(helper, {:send, w, {:telelem_owner_guard, ref, :started, {:ok, g}}})
+    assert_receive {:recorded, ^g, {:telelem_owner_guard, ^ref, :activate}}, @t
+
+    # A second result, or an announcement from any other guard, is ignored.
+    send(w, {:telelem_owner_guard, ref, :started, {:ok, other}})
+    o = idle()
+    send(w, {:telelem_owner_guard, ref, :owner, other, o})
+    send(w, {:telelem_owner_guard, make_ref(), :owner, g, o})
+
+    # The announcement from the exact guard is acknowledged, once.
+    send(w, {:telelem_owner_guard, ref, :owner, g, o})
+    assert_receive {:telelem_owner_guard, ^ref, :watching, ^g, ^o}, @t
+    send(w, {:telelem_owner_guard, ref, :owner, g, idle()})
+
+    await_idle!(w)
+    no_activation!(other, ref)
+
+    # The helper and the guard go; the owner is still up: no report.
+    for {p, stop} <- [
+          {helper, fn -> send(helper, :exit) end},
+          {g, fn -> Process.exit(g, :kill) end}
+        ] do
+      m = Process.monitor(p)
+      stop.()
+      assert_receive {:DOWN, ^m, :process, ^p, _}, @t
+    end
+
+    {:monitored_by, by} = Process.info(o, :monitored_by)
+    assert w in by
+
+    # A guard report or a forged :DOWN for another reference is not evidence.
+    send(w, {:telelem_owner_guard, ref, :owner_down, :owner_exited, :exited})
+    send(w, {:DOWN, make_ref(), :process, o, :normal})
+    await_idle!(w)
+    assert Process.alive?(w)
+    refute_received {:telelem_owner_witness, ^ref, _}
+    refute_received {:telelem_owner_witness, ^ref, _, _}
+
+    Process.exit(o, :kill)
+    assert_receive {:telelem_owner_witness, ^ref, :owner_down, ^o}, @t
+  end
+
+  test "witness: activation released but the guard went down without announcing an owner: owner state unknown" do
+    ref = make_ref()
+    l = spawn(fn -> receive do: (:exit -> :ok) end)
+    on_exit(fn -> Process.exit(l, :kill) end)
+    g = recorder()
+    %{w: w, helper: helper} = fake_witness(ref, l, now() + 60_000)
+    wm = Process.monitor(w)
+
+    send(helper, {:send, w, {:telelem_owner_guard, ref, :started, {:ok, g}}})
+    assert_receive {:recorded, ^g, {:telelem_owner_guard, ^ref, :activate}}, @t
+    send(helper, :exit)
+    Process.exit(g, :kill)
+
+    assert_receive {:telelem_owner_witness, ^ref, :owner_unknown}, @t
+    assert_receive {:DOWN, ^wm, :process, ^w, :normal}, @t
+    refute_received {:telelem_owner_witness, ^ref, :owner_down, _}
+    refute_received {:telelem_owner_witness, ^ref, :activation_never_released}
   end
 
   # ── helpers ─────────────────────────────────────────────────────────────
@@ -609,6 +770,104 @@ defmodule Telelem.WireOwnerGuardTest do
     if left > 0, do: Process.sleep(left)
     if now() < t, do: sleep_until(t)
   end
+
+  # A witness over a fake helper that forwards on request; the test is the
+  # launcher's alias and the observer.
+  defp fake_witness(ref, l, until) do
+    test = self()
+
+    helper =
+      spawn(fn ->
+        receive do
+          {:telelem_owner_guard, ^ref, :run, w} -> send(test, {:run, w})
+        end
+
+        fake_helper()
+      end)
+
+    hm = Process.monitor(helper)
+
+    w =
+      spawn(OwnerGuard, :witness, [
+        %{launcher: l, helper: helper, alias: test, ref: ref, until: until, observer: test}
+      ])
+
+    assert_receive {:run, ^w}, @t
+    %{w: w, helper: helper, hm: hm}
+  end
+
+  defp fake_helper do
+    receive do
+      {:send, to, msg} ->
+        send(to, msg)
+        fake_helper()
+
+      :exit ->
+        :ok
+    end
+  end
+
+  # Forwards everything it receives to the test, tagged with its pid.
+  defp recorder do
+    test = self()
+    pid = spawn(fn -> record(test) end)
+    on_exit(fn -> Process.exit(pid, :kill) end)
+    pid
+  end
+
+  defp record(test) do
+    receive do
+      m -> send(test, {:recorded, self(), m})
+    end
+
+    record(test)
+  end
+
+  defp await_monitors!(pid, target, until \\ nil) do
+    until = until || now() + @t
+    {:monitors, ms} = Process.info(pid, :monitors)
+
+    cond do
+      {:process, target} in ms -> :ok
+      now() >= until -> flunk("#{inspect(pid)} does not monitor #{inspect(target)}")
+      true -> await_monitors!(pid, target, until)
+    end
+  end
+
+  # The witness has processed everything delivered to it so far.
+  defp await_idle!(w, until \\ nil) do
+    until = until || now() + @t
+
+    case Process.info(w, [:message_queue_len, :status]) do
+      [message_queue_len: 0, status: :waiting] ->
+        :ok
+
+      other ->
+        if now() >= until, do: flunk("witness not idle: #{inspect(other)}")
+        await_idle!(w, until)
+    end
+  end
+
+  defp await_watched!(w, g) do
+    await_idle!(w)
+    {:monitored_by, by} = Process.info(g, :monitored_by)
+    assert w in by
+  end
+
+  # Anything the idle witness sent `g` is already in g's queue, ahead of
+  # this marker.
+  defp no_activation!(g, ref) do
+    send(g, :marker)
+    assert_receive {:recorded, ^g, :marker}, @t
+    refute_received {:recorded, ^g, {:telelem_owner_guard, ^ref, :activate}}
+  end
+
+  # The guard metadata inside a queued start_child call.
+  defp find_meta(%{ref: _, witness: _} = m), do: m
+  defp find_meta(%{} = m), do: m |> Map.values() |> find_meta()
+  defp find_meta(t) when is_tuple(t), do: t |> Tuple.to_list() |> find_meta()
+  defp find_meta([h | t]), do: find_meta(h) || find_meta(t)
+  defp find_meta(_), do: nil
 
   defp contains?(term, needle) when term === needle, do: true
   defp contains?(b, n) when is_binary(b) and is_binary(n), do: String.contains?(b, n)

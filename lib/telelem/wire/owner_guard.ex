@@ -2,9 +2,10 @@ defmodule Telelem.Wire.OwnerGuard do
   @moduledoc """
   TEL-012 guarded owner launch: one gated `Telelem.Wire.Upstream` attempt
   (the **owner**) started under a `DynamicSupervisor`, held by a temporary
-  **guard**, and watched by an independent **witness**. Legacy M1 attempts
-  (`Upstream.start_link/1` without `:gate`) do not go through here and are
-  unchanged.
+  **guard**, and watched by an independent **witness**. This is the only
+  supported launch of a gated attempt: `Upstream.start_link/1` refuses any
+  gated payload without spawning. Legacy M1 attempts (`Upstream.start_link/1`
+  without `:gate`) do not go through here and are unchanged.
 
   ## Roles
 
@@ -15,7 +16,8 @@ defmodule Telelem.Wire.OwnerGuard do
       alias.
     * **witness**: a plain unlinked process outside every supervisor and
       link set of the launcher, requester and guard. It holds its own private
-      monitors on the launcher, the helper, the guard and the owner.
+      monitors on the launcher, the helper, the guard and the owner, and is
+      the only process that sends the guard its activation.
     * **guard**: the temporary supervised child. It monitors the requester and
       the pinned coordinator, traps exits, and owns the owner by link and
       monitor.
@@ -54,32 +56,46 @@ defmodule Telelem.Wire.OwnerGuard do
        coordinator, `D`, `A`, `grace_ms`. The guard's entry re-validates that
        exact shape. A child whose start is processed at or after `A` (for
        example queued behind a busy supervisor) fails its init with
-       `{:error, :expired}` and does no work.
-    3. On a timely `{:ok, guard}` the launcher monitors the guard and sends it
-       one activation. The guard (before `A`) spawns the owner, waiting at
-       the fixed entry, and announces its exact pid to the witness. The
-       guard never sends GO.
-    4. The witness monitors the exact owner with its own reference and then
-       acknowledges to the launcher's alias.
-    5. Only after that acknowledgement, and before `A`, the launcher sends
-       the owner one GO with the token and the payload, and returns
-       `{:ok, %{guard:, owner:, witness:, ref:}}` without waiting for anything
-       further. The owner rechecks the token, `A`, the pinned coordinator and
-       `D` (see `Upstream`) before it attaches with `attach_grant/3`. A GO
-       that is late, wrongly tagged or for another coordinator or deadline
-       attaches nothing.
+       `{:error, :expired}` and does no work. The helper sends its sanitized
+       result to the witness first, then to the launcher's alias.
+    3. **The witness is the only releaser of activation.** On the helper's
+       `{:ok, guard}`, before `A` and only if it has not closed (see below),
+       it monitors that exact guard and sends it the one activation. It
+       never activates any other guard (a late child the supervisor started
+       after the helper was killed is never activated; it expires at `A`).
+       The launcher monitors the guard and sends it nothing.
+    4. The activated guard (before `A`) spawns the owner, waiting at the
+       fixed entry, and announces its exact pid to the witness. The guard
+       never sends GO. The witness accepts an announcement only from the
+       guard it activated, monitors the exact owner with its own reference
+       and then acknowledges `{:watching, guard, owner}` to the launcher's
+       alias.
+    5. On that acknowledgement the launcher first takes any already
+       delivered `:DOWN` of the witness or the guard as a failure (no GO),
+       then checks `A`, and only then sends the owner one GO with the token
+       and the payload and returns `{:ok, %{guard:, owner:, witness:, ref:}}`
+       without waiting for anything further. The owner validates the payload
+       once, then, directly before `attach_grant/3`, rechecks a pending
+       scoped stop and `A` (see `Upstream`). A GO that is late, wrongly
+       tagged or for another coordinator or deadline attaches nothing.
 
-  On every return the launcher deactivates its alias, then drains exact
-  replies already delivered, and flushes its helper, witness and guard
-  monitors. On failure it first tells the witness to abandon. Failures:
-  `:expired` (`A` reached), `:start_failed` (sanitized `:error`, or the
-  helper gone without a result), `:guard_down` and `:witness_down` (then the
-  launcher kills the exact helper and the exact guard itself, since no one
-  watches them).
+  The witness **closes** (it will never release activation) on the
+  launcher's abandonment, on the launcher's `:DOWN` whatever its reason
+  (`:normal` included), and at `A`; it kills the exact helper then if it is
+  still up. An owner that gets no GO exits at `A` without attaching.
 
-  The witness kills the exact helper on abandonment, on `A`, and on the
-  launcher's `:DOWN` whatever its reason (`:normal` included). An owner that
-  gets no GO exits at `A` without attaching.
+  On every return the launcher deactivates its alias, drains exact replies
+  already delivered, and flushes its helper, witness and guard monitors.
+  On **success** it kills nothing (the helper has delivered its result and
+  is ending; the witness watches it). On **failure** it first tells the
+  witness to abandon and kills the exact helper itself, whatever won (the
+  helper may be blocked in `start_child/2`, and the witness may already be
+  gone with its `:DOWN` still queued behind an expiry). If the witness is
+  gone (`:witness_down`, or its `:DOWN` already delivered), it also kills
+  every exact guard it learned of, from its own state or from a drained
+  `{:ok, guard}`. Failures: `:expired` (`A` reached), `:start_failed`
+  (sanitized `:error`, or the helper gone without a result), `:guard_down`,
+  `:witness_down`.
 
   ## While running: triggers and fence
 
@@ -108,14 +124,26 @@ defmodule Telelem.Wire.OwnerGuard do
       or `:killed`. If no `:DOWN` arrives within the second grace the guard
       sends nothing and exits `{:shutdown, :owner_down_unconfirmed}`; its
       link still kills the owner.
-    * witness: `{:telelem_owner_witness, ref, :confirmed, what}` once, after
-      the helper's `:DOWN`, the guard's `:DOWN` (if it learned of a guard)
-      and the owner's `:DOWN` (if it watched one). `what` is
-      `{:owner_down, owner}` (its own monitor saw that exact pid go down) or
-      `:no_owner` (no owner was announced to it, so none was ever sent GO).
+    * witness: exactly one of the following, from its own records only,
+      once the helper's `:DOWN`, the guard's `:DOWN` (if it learned of a
+      guard) and the owner's `:DOWN` (if it watched one) have all arrived.
       It then exits `:normal`.
+        * `{:telelem_owner_witness, ref, :owner_down, owner}`: its own
+          monitor on that exact owner pid reported it down. This is the only
+          report of an owner's death.
+        * `{:telelem_owner_witness, ref, :activation_never_released}`: it
+          never sent the activation (it is the only sender), so this launch
+          never started an owner. It says nothing about any process being
+          gone besides the helper and the guard it learned of.
+        * `{:telelem_owner_witness, ref, :owner_unknown}`: it released the
+          activation, but the guard went down without announcing an owner
+          to it. Whether an owner was spawned (and, if so, that its link
+          ended it) is not known to the witness; this is not a confirmation.
 
-  The witness does not kill the guard or the owner and decides nothing else.
+      No report is a claim of socket, slot or supervisor quiescence.
+
+  The witness releases the one activation and kills the helper; it does not
+  kill the guard or the owner and decides nothing else.
 
   ## Supervisor shutdown
 
@@ -130,15 +158,18 @@ defmodule Telelem.Wire.OwnerGuard do
       here proves when the socket is released.
     * **durability, ledger, successor policy**: no report is stored, nothing
       is accounted, and nothing orders a successor attempt after this one.
-    * the observer receiving anything (it is only sent to), or any report
-      after the guard itself is killed (the link kills the owner; the
-      witness still confirms).
+    * the observer receiving anything (it is only sent to), or any guard
+      report after the guard itself is killed (the link kills the owner; the
+      witness still reports, `:owner_down` only if it monitored the owner).
+    * authenticity of the activation message: any process that knows the
+      token could send one. In this module only the witness does.
     * a cooperative stop while the owner is blocked in a call (it reaches no
       checkpoint): the fence applies.
     * authenticity of a parent `:EXIT`: any process can send one as a plain
       message. That can only end the owner early.
-    * a supervisor that never answers: the helper is killed at `A`; its
-      queued request then starts a child that expires (see step 2).
+    * a supervisor that never answers: the helper is killed at `A` (by the
+      witness and by the launcher's failed return); its queued request then
+      starts a child that is never activated and expires (see step 2).
   """
 
   alias Telelem.Wire.Upstream
@@ -221,7 +252,7 @@ defmodule Telelem.Wire.OwnerGuard do
       gmon: nil
     }
 
-    st |> await(o.upstream) |> finish(st)
+    st |> await(o.upstream) |> finish()
   end
 
   # One receive loop up to A, re-checked every turn.
@@ -237,24 +268,22 @@ defmodule Telelem.Wire.OwnerGuard do
       gmon = st.gmon
 
       receive do
-        {@tag, ^ref, :started, {:ok, g}} when st.guard == nil ->
-          if now() >= st.until do
-            {:error, :expired, st}
-          else
-            st = %{st | guard: g, gmon: Process.monitor(g)}
-            send(g, {@tag, ref, :activate})
-            await(st, payload)
-          end
+        {@tag, ^ref, :started, {:ok, g}} when st.guard == nil and is_pid(g) ->
+          # Known either way, so a failed cleanup can still end it.
+          if now() >= st.until,
+            do: {:error, :expired, %{st | guard: g}},
+            else: await(%{st | guard: g, gmon: Process.monitor(g)}, payload)
 
         {@tag, ^ref, :started, _} when st.guard == nil ->
           {:error, :start_failed, st}
 
-        {@tag, ^ref, :watching, owner} when st.guard != nil and is_pid(owner) ->
-          if now() >= st.until do
-            {:error, :expired, st}
-          else
-            send(owner, {@go_tag, ref, payload})
-            {:ok, %{guard: st.guard, owner: owner, witness: st.witness, ref: ref}, st}
+        {@tag, ^ref, :watching, g, owner} when is_pid(g) and g == st.guard and is_pid(owner) ->
+          # Evidence already delivered wins over GO; A is checked last.
+          cond do
+            down?(wmon) -> {:error, :witness_down, %{st | wmon: nil}}
+            down?(gmon) -> {:error, :guard_down, %{st | gmon: nil}}
+            now() >= st.until -> {:error, :expired, st}
+            true -> go(st, owner, payload)
           end
 
         {:DOWN, ^hmon, :process, _, _} when st.guard == nil ->
@@ -275,33 +304,60 @@ defmodule Telelem.Wire.OwnerGuard do
     end
   end
 
-  defp finish({:ok, handle, st}, _), do: cleanup(st, {:ok, handle})
+  defp go(st, owner, payload) do
+    send(owner, {@go_tag, st.ref, payload})
+    {:ok, %{guard: st.guard, owner: owner, witness: st.witness, ref: st.ref}, st}
+  end
 
-  defp finish({:error, why, st}, _) do
+  # Success: no kill. The helper has already sent its result and is ending;
+  # the witness watches it, the guard and the owner.
+  defp finish({:ok, handle, st}) do
+    Process.unalias(st.alias)
+    _ = drain(st.ref, [])
+    flush(st)
+    {:ok, handle}
+  end
+
+  # Failure, whatever won (expiry over a pending witness :DOWN included): end
+  # the exact helper here, since it may be blocked in start_child and the
+  # witness may be gone. If the witness is gone, also end every exact guard
+  # this launcher learned of, since no one else watches them.
+  defp finish({:error, why, st}) do
     send(st.witness, {@tag, st.ref, :abandon})
+    Process.exit(st.helper, :kill)
+    Process.unalias(st.alias)
+    late = drain(st.ref, [])
 
-    if why == :witness_down do
-      # Nobody else watches them now: end the exact helper and guard.
-      Process.exit(st.helper, :kill)
-      if st.guard, do: Process.exit(st.guard, :kill)
+    if why == :witness_down or down?(st.wmon) do
+      for g <- Enum.uniq([st.guard | late]), is_pid(g), do: Process.exit(g, :kill)
     end
 
-    cleanup(st, {:error, why})
+    flush(st)
+    {:error, why}
   end
 
-  defp cleanup(st, result) do
-    Process.unalias(st.alias)
-    drain(st.ref)
-    for m <- [st.hmon, st.wmon, st.gmon], m != nil, do: Process.demonitor(m, [:flush])
-    result
-  end
+  defp flush(st),
+    do: for(m <- [st.hmon, st.wmon, st.gmon], m != nil, do: Process.demonitor(m, [:flush]))
 
-  defp drain(ref) do
+  # Exact replies already delivered before the alias was deactivated; any
+  # guard pid among them is returned.
+  defp drain(ref, acc) do
     receive do
-      {@tag, ^ref, :started, _} -> drain(ref)
-      {@tag, ^ref, :watching, _} -> drain(ref)
+      {@tag, ^ref, :started, {:ok, g}} when is_pid(g) -> drain(ref, [g | acc])
+      {@tag, ^ref, :started, _} -> drain(ref, acc)
+      {@tag, ^ref, :watching, _, _} -> drain(ref, acc)
     after
-      0 -> :ok
+      0 -> acc
+    end
+  end
+
+  defp down?(nil), do: false
+
+  defp down?(mon) do
+    receive do
+      {:DOWN, ^mon, :process, _, _} -> true
+    after
+      0 -> false
     end
   end
 
@@ -399,7 +455,10 @@ defmodule Telelem.Wire.OwnerGuard do
       helper: h,
       hmon: hmon,
       helper_up: true,
-      helper_killed: false,
+      # true once it will never release activation (abandon, launcher
+      # :DOWN, A); the helper is killed then if still up.
+      closed: false,
+      released: false,
       guard: nil,
       gmon: nil,
       guard_up: false,
@@ -410,31 +469,28 @@ defmodule Telelem.Wire.OwnerGuard do
   end
 
   defp w_loop(w) do
-    w = if w.helper_up and now() >= w.until, do: kill_helper(w), else: w
+    w = if not w.closed and now() >= w.until, do: close(w), else: w
 
-    if not w.helper_up and not w.guard_up and not w.owner_up do
-      what = if w.owner, do: {:owner_down, w.owner}, else: :no_owner
-      send(w.observer, {@witness_tag, w.ref, :confirmed, what})
-    else
+    if w.helper_up or w.guard_up or w.owner_up do
       %{ref: ref, lmon: lmon, hmon: hmon, gmon: gmon, omon: omon} = w
 
       receive do
         {:DOWN, ^lmon, :process, _, _} ->
-          w_loop(kill_helper(w))
+          w_loop(close(w))
 
         {@tag, ^ref, :abandon} ->
-          w_loop(kill_helper(w))
+          w_loop(close(w))
 
         {:DOWN, ^hmon, :process, _, _} ->
           w_loop(%{w | helper_up: false})
 
-        {@tag, ^ref, :started, {:ok, g}} when is_pid(g) ->
-          w_loop(watch_guard(w, g))
+        {@tag, ^ref, :started, {:ok, g}} when is_pid(g) and w.guard == nil ->
+          w_loop(release(%{w | guard: g, gmon: Process.monitor(g), guard_up: true}))
 
-        {@tag, ^ref, :owner, g, o} when is_pid(g) and is_pid(o) and w.owner == nil ->
-          w = watch_guard(w, g)
+        {@tag, ^ref, :owner, g, o}
+        when is_pid(g) and g == w.guard and w.released and is_pid(o) and w.owner == nil ->
           w = %{w | owner: o, omon: Process.monitor(o), owner_up: true}
-          send(w.alias, {@tag, ref, :watching, o})
+          send(w.alias, {@tag, ref, :watching, g, o})
           w_loop(w)
 
         {:DOWN, ^gmon, :process, _, _} when gmon != nil ->
@@ -448,25 +504,40 @@ defmodule Telelem.Wire.OwnerGuard do
       after
         w_timeout(w) -> w_loop(w)
       end
+    else
+      send(w.observer, w_report(w))
     end
   end
 
-  defp w_timeout(%{helper_up: true, helper_killed: false, until: a}),
-    do: min(max(a - now(), 0), @max_wait)
+  # Only from its own records: the exact owner its own monitor saw go down;
+  # it never released activation (it is the only releaser); or it released
+  # and the exact guard went down without announcing an owner to it.
+  defp w_report(%{owner: o, ref: ref}) when o != nil, do: {@witness_tag, ref, :owner_down, o}
+  defp w_report(%{released: true, ref: ref}), do: {@witness_tag, ref, :owner_unknown}
+  defp w_report(%{ref: ref}), do: {@witness_tag, ref, :activation_never_released}
 
-  defp w_timeout(_), do: :infinity
-
-  defp kill_helper(%{helper_up: true, helper_killed: false} = w) do
-    Process.exit(w.helper, :kill)
-    %{w | helper_killed: true}
+  # The one activation, to the exact guard the helper reported, before A and
+  # only while the launcher has not given up.
+  defp release(%{closed: false, released: false} = w) do
+    if now() < w.until do
+      send(w.guard, {@tag, w.ref, :activate})
+      %{w | released: true}
+    else
+      close(w)
+    end
   end
 
-  defp kill_helper(w), do: w
+  defp release(w), do: w
 
-  defp watch_guard(%{guard: nil} = w, g),
-    do: %{w | guard: g, gmon: Process.monitor(g), guard_up: true}
+  defp w_timeout(%{closed: false, until: a}), do: min(max(a - now(), 0), @max_wait)
+  defp w_timeout(_), do: :infinity
 
-  defp watch_guard(w, _), do: w
+  defp close(%{closed: true} = w), do: w
+
+  defp close(w) do
+    if w.helper_up, do: Process.exit(w.helper, :kill)
+    %{w | closed: true}
+  end
 
   # ── Guard (temporary child, metadata-only fixed entry) ──────────────────
 

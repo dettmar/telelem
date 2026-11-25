@@ -1,15 +1,20 @@
 defmodule Telelem.WireUpstreamGateTest do
   @moduledoc """
   The opt-in gated `Telelem.Wire.Upstream` (`gate: [target:, deadline:]`).
+  Gated attempts run only as guarded owners: every gated attempt here is
+  launched through `Telelem.Wire.OwnerGuard.start/2` under a real
+  `DynamicSupervisor`; ordinary `Upstream.start_link/1` and `init/1` refuse a
+  gated payload without spawning or attaching.
 
   Listener-free: no socket is opened by any test here. The target is a
   `VerifiedTarget` for `127.0.0.1` port 1 with a throwaway test CA; every
   case ends before the attempt dials (a dial would surface as a
   `{:connect_failed, _, _}` message, which each case refutes).
 
-  What this covers: the closed option interface (refused in the caller, no
-  process spawned) including a duplicate `:gate`, the gated numeric limit
-  ranges and Handoff's shared deadline bound, the grant-specific attach (`Handoff.attach_grant/3`: a typed
+  What this covers: ordinary startup refusing gated work; the closed option
+  interface (`Upstream.validate_guarded!/1`, the launcher's check) including a
+  duplicate `:gate`, the gated numeric limit ranges and Handoff's shared
+  deadline bound, the grant-specific attach (`Handoff.attach_grant/3`: a typed
   `:grant_required` refusal from a coordinator without `coordinator_grant`,
   `[:primary]` included, with nothing changed), legacy defaults and ordinary
   attach, the pure timeout clamps and the
@@ -21,7 +26,8 @@ defmodule Telelem.WireUpstreamGateTest do
   (re-read until the expected message is there, bounded). No sleeps.
 
   What it does not cover: TLS/socket behaviour, the post-TLS and pre-request
-  checks (they need a handshake), any SDK, hard expiry, blocked teardown or
+  checks and the streaming stop checkpoints before each transfer and before
+  finish (they need a handshake), any SDK, hard expiry, blocked teardown or
   slot quiescence.
 
       scripts/mix test test/telelem/wire_upstream_gate_test.exs --seed 0
@@ -32,7 +38,7 @@ defmodule Telelem.WireUpstreamGateTest do
   alias Telelem.{Handoff, Instance}
   alias Telelem.Instance.Directory
   alias Telelem.Sandbox.VerifiedTarget
-  alias Telelem.Wire.{Limits, Upstream}
+  alias Telelem.Wire.{Limits, OwnerGuard, Upstream}
 
   @moduletag :tmp_dir
   @t 1_000
@@ -63,14 +69,68 @@ defmodule Telelem.WireUpstreamGateTest do
       end
     end)
 
+    gsup = start_supervised!({DynamicSupervisor, strategy: :one_for_one}, id: :gate_guard_sup)
     %{cert: der} = :public_key.pkix_test_root_cert(~c"telelem gate test CA", [])
     {:ok, target} = VerifiedTarget.build("a", "127.0.0.1", 1, [der])
-    %{inst: inst, auth: auth, tag: inst.tag, target: target, der: der}
+    %{inst: inst, auth: auth, tag: inst.tag, target: target, der: der, gsup: gsup}
+  end
+
+  # ── supported launch only ───────────────────────────────────────────────
+
+  test "ordinary startup never spawns gated work: start_link/1, child_spec/1 and init/1 refuse every gated payload",
+       ctx do
+    r = start_h!(ctx)
+    d = r.d
+
+    good = [
+      handoff: r.h,
+      id: :primary,
+      controller: self(),
+      body: "{}",
+      limits: Limits.new(),
+      gate: [target: ctx.target, deadline: d]
+    ]
+
+    # Valid, invalid and terminal-deadline variants: one fixed refusal.
+    variants = [
+      good,
+      good ++ [terminal_deadline: d],
+      Keyword.put(good, :body, 1),
+      Keyword.put(good, :gate, target: :x, deadline: d),
+      [gate: [target: ctx.target, deadline: d]]
+    ]
+
+    {:links, links} = Process.info(self(), :links)
+    {:ok, tracer} = spawn_tracer()
+
+    for opts <- variants do
+      e = assert_raise ArgumentError, fn -> Upstream.start_link(opts) end
+
+      assert e.message ==
+               "Upstream gate: a gated attempt starts only through Telelem.Wire.OwnerGuard"
+    end
+
+    # The child spec's start is the same refusal.
+    {m, f, a} = Upstream.child_spec(good).start
+    assert_raise ArgumentError, fn -> apply(m, f, a) end
+
+    # Nothing was spawned by this process.
+    assert {:links, ^links} = Process.info(self(), :links)
+    refute_spawned!(tracer)
+
+    # The (public) process entry exits before any call.
+    {pid, mon} = spawn_monitor(Upstream, :init, [good])
+    assert_receive {:DOWN, ^mon, :process, ^pid, {:shutdown, :guarded_only}}, @t
+
+    assert %{grant: :idle, attempts: %{primary: %{pid: nil}}} = Handoff.status(r.h)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+    refute_received {:telelem_wire, _, _, _}
   end
 
   # ── interface ───────────────────────────────────────────────────────────
 
-  test "the gate interface is closed and validated in the caller; nothing is spawned", ctx do
+  test "the gate interface is closed and validated by the launcher's check; nothing is spawned",
+       ctx do
     d = now() + 60_000
     h = idle()
     t = ctx.target
@@ -131,8 +191,10 @@ defmodule Telelem.WireUpstreamGateTest do
 
     {:links, links} = Process.info(self(), :links)
 
+    assert %{handoff: ^h, deadline: ^d} = Upstream.validate_guarded!(good)
+
     for {name, opts} <- bad do
-      e = assert_raise ArgumentError, fn -> Upstream.start_link(opts) end
+      e = assert_raise ArgumentError, fn -> Upstream.validate_guarded!(opts) end
       assert String.starts_with?(e.message, "Upstream gate: "), "#{name}: #{e.message}"
       # Field named, value never copied.
       for secret <- [t.host, hd(t.ca_sha256), "/x", "/v1/other", "r1"],
@@ -154,8 +216,9 @@ defmodule Telelem.WireUpstreamGateTest do
           [gate: gate, gate: nil],
           [gate: gate, gate: gate],
           [gate: nil, terminal_deadline: :soon, gate: nil]
-        ] do
-      e = assert_raise ArgumentError, fn -> Upstream.start_link(opts) end
+        ],
+        check <- [&Upstream.start_link/1, &Upstream.validate_guarded!/1] do
+      e = assert_raise ArgumentError, fn -> check.(opts) end
       assert e.message == "Upstream gate: :gate must be given at most once", inspect(opts)
     end
   end
@@ -203,14 +266,14 @@ defmodule Telelem.WireUpstreamGateTest do
 
     for {k, max} <- ranges, v <- [0, -1, max + 1, 1.0 * Map.fetch!(l, k), :x, nil, "1"] do
       opts = Keyword.put(good, :limits, Map.put(l, k, v))
-      e = assert_raise ArgumentError, fn -> Upstream.start_link(opts) end
+      e = assert_raise ArgumentError, fn -> Upstream.validate_guarded!(opts) end
       assert e.message == "Upstream gate: :limits #{k} must be an integer in 1..#{max}"
     end
 
     # A missing field is refused too (as nil).
     e =
       assert_raise ArgumentError, fn ->
-        Upstream.start_link(Keyword.put(good, :limits, Map.delete(l, :window)))
+        Upstream.validate_guarded!(Keyword.put(good, :limits, Map.delete(l, :window)))
       end
 
     assert e.message =~ ":limits window must be an integer"
@@ -232,16 +295,8 @@ defmodule Telelem.WireUpstreamGateTest do
       )
 
     {:ok, target} = VerifiedTarget.build("a", "127.0.0.1", 1, [ctx.der])
-
-    {:ok, up} =
-      Upstream.start_link(
-        handoff: h,
-        id: :primary,
-        controller: self(),
-        body: "{}",
-        limits: l,
-        gate: [target: target, deadline: now() + 60_000]
-      )
+    r = %{h: h, d: now() + 60_000}
+    up = up!(%{ctx | target: target}, r, limits: l)
 
     assert_receive {:telelem_wire, ^up, :primary,
                     {:ended, {:attach, :error, :grant_required}, _}},
@@ -250,30 +305,31 @@ defmodule Telelem.WireUpstreamGateTest do
     refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
   end
 
-  test "a gate deadline at the shared bound, or already past, spawns; attach_grant's wait does not overflow",
+  test "a gate deadline at the shared bound launches; attach_grant's wait does not overflow; a past one is valid but cannot launch",
        ctx do
     {:ok, h} = Handoff.start(requester: idle(), attempts: [:primary])
     on_exit(fn -> Process.exit(h, :kill) end)
 
-    # The test's `now` is not later than the caller's check, so `at` is at
-    # most the bound ahead there and inside the attempt.
-    for d <- [now() + Handoff.max_deadline_ahead_ms(), now() - 1] do
-      {:ok, up} =
-        Upstream.start_link(
-          handoff: h,
-          id: :primary,
-          controller: self(),
-          body: "{}",
-          limits: Limits.new(),
-          gate: [target: ctx.target, deadline: d]
-        )
+    # The test's `now` is not later than the launcher's check, so `d` is at
+    # most the bound ahead there and inside the owner.
+    d = now() + Handoff.max_deadline_ahead_ms()
+    %{owner: up, guard: g} = launch!(ctx, %{h: h, d: d})
+    gm = Process.monitor(g)
 
-      assert_receive {:telelem_wire, ^up, :primary,
-                      {:ended, {:attach, :error, :grant_required}, _}},
-                     @t
+    assert_receive {:telelem_wire, ^up, :primary,
+                    {:ended, {:attach, :error, :grant_required}, _}},
+                   @t
 
-      refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
-    end
+    refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
+    # That launch's guard is gone before the next one is attempted.
+    assert_receive {:DOWN, ^gm, :process, ^g, :normal}, @t
+
+    # A past deadline passes validation; its activation limit is already
+    # reached, so the supported launch spawns nothing.
+    past = %{h: h, d: now() - 1}
+    assert %{deadline: _} = Upstream.validate_guarded!(payload(ctx, past))
+    assert OwnerGuard.start(ctx.gsup, guard_opts(ctx, past, [])) == {:error, :expired}
+    assert DynamicSupervisor.which_children(ctx.gsup) == []
   end
 
   test "legacy deadlines are not range-checked: a distant legacy :terminal_deadline still spawns",
@@ -362,17 +418,7 @@ defmodule Telelem.WireUpstreamGateTest do
 
     on_exit(fn -> Process.exit(h, :kill) end)
     d = now() + 60_000
-    {:ok, target} = VerifiedTarget.build("a", "127.0.0.1", 1, [ctx.der])
-
-    {:ok, up} =
-      Upstream.start_link(
-        handoff: h,
-        id: :primary,
-        controller: self(),
-        body: "{}",
-        limits: Limits.new(),
-        gate: [target: target, deadline: d]
-      )
+    up = up!(ctx, %{h: h, d: d, req: req})
 
     assert_receive {:telelem_wire, ^up, :primary,
                     {:ended, {:attach, :error, :grant_required}, stats}},
@@ -447,16 +493,7 @@ defmodule Telelem.WireUpstreamGateTest do
     %{h: h, d: d} = start_h!(ctx)
 
     # terminal_deadline equal to the gate's is accepted.
-    {:ok, up} =
-      Upstream.start_link(
-        handoff: h,
-        id: :other,
-        controller: self(),
-        body: "{}",
-        limits: Limits.new(),
-        gate: [target: ctx.target, deadline: d],
-        terminal_deadline: d
-      )
+    up = up!(ctx, %{h: h, d: d}, id: :other, terminal_deadline: d)
 
     assert_receive {:telelem_wire, ^up, :other,
                     {:ended, {:attach, :error, :unknown_attempt}, stats}},
@@ -601,7 +638,7 @@ defmodule Telelem.WireUpstreamGateTest do
     trace_receive!(ctx.auth)
     r = start_h!(ctx)
     %{h: h} = r
-    up = reserved_suspended!(ctx, r)
+    %{owner: up} = reserved_suspended!(ctx, r)
 
     # Reserved for exactly this pid while it has not dialed.
     {gid, g} = only_grant!(ctx.auth)
@@ -635,7 +672,7 @@ defmodule Telelem.WireUpstreamGateTest do
     trace_receive!(ctx.auth)
     r = start_h!(ctx)
     %{h: h} = r
-    up = reserved_suspended!(ctx, r)
+    %{owner: up} = reserved_suspended!(ctx, r)
     {gid, _} = only_grant!(ctx.auth)
 
     Process.exit(h, :kill)
@@ -665,7 +702,10 @@ defmodule Telelem.WireUpstreamGateTest do
     trace_receive!(ctx.auth)
     r = start_h!(ctx, deadline: now() + @window)
     %{h: h, d: d} = r
-    up = reserved_suspended!(ctx, r)
+    %{owner: up, guard: g} = reserved_suspended!(ctx, r)
+    # Hold the guard too, so its deadline trigger's scoped stop cannot reach
+    # the owner first: the owner's own clock check is what is exercised.
+    true = :erlang.suspend_process(g)
     assert now() < d, "setup took longer than the #{@window} ms window"
     {gid, _} = only_grant!(ctx.auth)
 
@@ -690,7 +730,9 @@ defmodule Telelem.WireUpstreamGateTest do
     )
 
     refute Enum.any?(mailbox(up), &match?({:telelem_handoff, ^h, _}, &1))
+    refute Enum.any?(mailbox(up), &match?({:telelem_owner_stop, _}, &1))
     :ok = :sys.resume(h)
+    true = :erlang.resume_process(g)
 
     assert_receive {:telelem_wire, ^up, :primary,
                     {:ended, {:stopped, :after_attach, :deadline}, stats}},
@@ -726,32 +768,77 @@ defmodule Telelem.WireUpstreamGateTest do
     %{h: h, req: req, d: d}
   end
 
-  defp up!(ctx, r) do
-    {:ok, up} =
-      Upstream.start_link(
+  # The gated payload; `extra` replaces or adds upstream options.
+  defp payload(ctx, r, extra \\ []) do
+    Keyword.merge(
+      [
         handoff: r.h,
         id: :primary,
         controller: self(),
         body: "{}",
         limits: Limits.new(),
         gate: [target: ctx.target, deadline: r.d]
-      )
-
-    up
+      ],
+      extra
+    )
   end
 
-  # The attempt is blocked in attach/3 and the reservation is queued at the
-  # suspended authority; the attempt is then suspended, the authority
+  # The supported launch: a long grace keeps the guard's fence out of these
+  # cases; reports go to an idle observer.
+  defp guard_opts(ctx, r, extra) do
+    [
+      upstream: payload(ctx, r, extra),
+      requester: Map.get(r, :req) || idle(),
+      observer: idle(),
+      grace_ms: 10_000,
+      activation_ms: 5_000
+    ]
+  end
+
+  defp launch!(ctx, r, extra \\ []) do
+    assert {:ok, %{owner: o} = handle} = OwnerGuard.start(ctx.gsup, guard_opts(ctx, r, extra))
+    assert is_pid(o)
+    handle
+  end
+
+  defp up!(ctx, r, extra \\ []), do: launch!(ctx, r, extra).owner
+
+  # The owner is blocked in attach_grant/3 and the reservation is queued at
+  # the suspended authority; the owner is then suspended, the authority
   # resumed, and the attach reply (:ok, reserved) sits unread in its mailbox.
   defp reserved_suspended!(ctx, %{h: h} = r) do
     :ok = :sys.suspend(ctx.auth)
-    up = up!(ctx, r)
+    %{owner: up} = handle = launch!(ctx, r)
     await_reserve!(ctx.auth, h, up)
     true = :erlang.suspend_process(up)
     :ok = :sys.resume(ctx.auth)
     await_mailbox!(up, &Enum.any?(&1, fn m -> match?({_, :ok}, m) end))
     assert %{grant: :reserved} = Handoff.status(h)
-    up
+    handle
+  end
+
+  # Spawns made by the test process, observed by tracing it.
+  defp spawn_tracer do
+    1 = :erlang.trace(self(), true, [:procs, {:tracer, self()}])
+    {:ok, self()}
+  end
+
+  defp refute_spawned!(me) do
+    1 = :erlang.trace(me, false, [:procs])
+    ref = :erlang.trace_delivered(me)
+    assert_receive {:trace_delivered, ^me, ^ref}, @t
+    refute_received {:trace, ^me, :spawn, _, _}
+    refute_received {:trace, ^me, :link, _}
+    flush_traces()
+  end
+
+  defp flush_traces do
+    receive do
+      {:trace, _, _, _} -> flush_traces()
+      {:trace, _, _, _, _} -> flush_traces()
+    after
+      0 -> :ok
+    end
   end
 
   defp await_reserve!(auth, h, up) do

@@ -99,15 +99,27 @@ defmodule Telelem.Wire.Upstream do
   Off by default; without `:gate` (or with exactly one `gate: nil`) nothing
   below applies and every shape above is unchanged. More than one `:gate`
   entry (a leading `gate: nil` included) raises `ArgumentError` before either
-  mode is chosen. It requires a coordinator started with `coordinator_grant`
+  mode is chosen.
+
+  **Supported launch only.** A gated attempt runs only as a guarded owner
+  started by `Telelem.Wire.OwnerGuard` (see "Guarded owner" below).
+  `start_link/1` (and so `child_spec/1`) raises `ArgumentError`
+  (`"Upstream gate: a gated attempt starts only through
+  Telelem.Wire.OwnerGuard"`) for any single non-nil `:gate`, valid or not,
+  and spawns nothing; `init/1` given a gated payload exits
+  `{:shutdown, :guarded_only}` before any call. The interface below is
+  validated by `validate_guarded!/1` (the launcher's check, separately
+  testable) and once more in the owner after its GO.
+
+  It requires a coordinator started with `coordinator_grant`
   (see `Telelem.Handoff`): the attempt attaches with
   `Handoff.attach_grant/3`, which any other coordinator refuses with
   `{:error, :grant_required}` before registering it, so the attempt ends
   without dialing.
 
-  **Interface, validated in the caller before the attempt is spawned
-  (`ArgumentError`, naming only the offending field) and again in the
-  attempt.** Exactly the keys `:handoff` (pid), `:id`, `:controller` (pid),
+  **Interface, validated by `validate_guarded!/1` in the launcher before
+  anything is spawned (`ArgumentError`, naming only the offending field) and
+  again in the owner.** Exactly the keys `:handoff` (pid), `:id`, `:controller` (pid),
   `:body` (binary, at most `limits.max_request_body` bytes), `:limits` (a
   `Telelem.Wire.Limits` whose every numeric field is an integer in `1..max`,
   `max` being `2^32 - 1` for the `*_ms` timeouts and `2^31 - 1` for the byte
@@ -191,18 +203,38 @@ defmodule Telelem.Wire.Upstream do
 
   `guarded/1` is the fixed entry the guard spawns (linked and monitored, not
   trapping exits). It takes only metadata (token, activation limit `A`,
-  deadline `D`, pinned coordinator) and waits for one GO with the exact
-  token until `A` (at `A` it has expired). On GO it rechecks the token, `A`,
-  that the payload is a valid gated attempt pinned to the same coordinator
-  and to the same `D`, and that no scoped stop is pending; only then does it
-  run the gated attempt above. Otherwise it exits without attaching.
+  deadline `D`, pinned coordinator; `A <= D`) and waits for one GO with the
+  exact token until `A` (at `A` it has expired; a stop before GO exits
+  `{:shutdown, :stopped}`). On GO, in this order:
 
-  The guard's scoped stop (`{:telelem_owner_stop, token}`) is consumed only
-  at the gated checkpoints (step 2, 3 and 5 above, as `{:stopped, stage,
-  :guard_stop}`) and in the streaming receive (`:guard_stop`). It is
-  cooperative: a call that blocks (for example `attach_grant/3` waiting for
-  a reservation) does not see it; the guard then kills the exact pid at its
-  fence. Legacy and unguarded gated attempts never match it.
+    1. the payload is validated once: a valid gated attempt pinned to the
+       same coordinator and to the same `D`, else `{:shutdown, :refused}`;
+    2. directly before the one `attach_grant/3` call, with nothing in
+       between: a pending scoped stop (`{:shutdown, :stopped}`), then `A`
+       (`now >= A`: `{:shutdown, :expired}`).
+
+  Each of these exits sends nothing anywhere and attaches nothing. `D` stays
+  the independent request deadline of every later step.
+
+  The guard's scoped stop (`{:telelem_owner_stop, token}`) is consumed,
+  without waiting, only at these checkpoints:
+
+    * before the attach (above);
+    * after attach, after connect and before the request (step 2, 3 and 5
+      above, as `{:stopped, stage, :guard_stop}`);
+    * while streaming: in the receive, before each credit-driven
+      `Handoff.transfer/2`, and before the terminal `Handoff.finish/3,4`
+      (the held `[DONE]` is then dropped); all as `:guard_stop`.
+
+  It is cooperative and not an atomic revocation: a stop that arrives after a
+  checkpoint does not undo or interrupt the call that follows it (a
+  `transfer/2` or `finish` already begun may complete), and a call that
+  blocks (for example `attach_grant/3` waiting for a reservation) does not
+  see it; the guard then kills the exact pid at its fence. Legacy attempts
+  never receive or match it.
+
+  Not covered by listener-free tests: the streaming checkpoints (they need a
+  TLS handshake to reach).
   """
 
   alias Telelem.Handoff
@@ -234,8 +266,9 @@ defmodule Telelem.Wire.Upstream do
   `Handoff.finish/3` exactly as before. Any other value raises
   `ArgumentError` in the caller, before the attempt is spawned.
 
-  `:gate` opts in to the gated attempt ("Gated attempt" above), with its own
-  closed option set.
+  A single non-nil `:gate` raises `ArgumentError` here and spawns nothing:
+  gated attempts start only through `Telelem.Wire.OwnerGuard` ("Gated
+  attempt" above). A duplicate `:gate` raises before either mode is chosen.
   """
   def start_link(opts) do
     case mode!(opts) do
@@ -250,7 +283,8 @@ defmodule Telelem.Wire.Upstream do
         end
 
       :gated ->
-        _ = gate!(opts)
+        # Ordinary startup never spawns gated work, valid payload or not.
+        gate_error("a gated attempt starts only through Telelem.Wire.OwnerGuard")
     end
 
     {:ok, :proc_lib.spawn_link(__MODULE__, :init, [opts])}
@@ -402,9 +436,10 @@ defmodule Telelem.Wire.Upstream do
   # The fixed owner entry, spawned only by `Telelem.Wire.OwnerGuard` (linked
   # and monitored by the guard, not trapping exits). Waits for one GO carrying
   # the exact token until the activation limit `until` (equality expires),
-  # then rechecks the token, the limit, the pinned coordinator and the gate
-  # deadline before the gated attach. A scoped stop or no GO ends it without
-  # attaching. No result is sent anywhere before the attach.
+  # validates the payload once against the pinned coordinator and gate
+  # deadline, then rechecks a pending stop and the limit directly before the
+  # gated attach. A scoped stop or no GO ends it without attaching. No result
+  # is sent anywhere before the attach.
   def guarded(%{ref: ref, until: a, deadline: d, handoff: h} = meta)
       when is_reference(ref) and is_integer(a) and is_integer(d) and a <= d and is_pid(h) and
              map_size(meta) == 4 do
@@ -424,33 +459,38 @@ defmodule Telelem.Wire.Upstream do
 
   def guarded(_), do: exit({:shutdown, :invalid_meta})
 
+  # One validation of the payload, pinned to this owner's coordinator and
+  # request deadline D. The pending stop and A are rechecked later, directly
+  # before the attach (`gated_attach/1`), so validation time cannot pass A.
   defp go(opts, %{ref: ref, until: a, deadline: d, handoff: h}) do
-    pinned =
+    gate =
       try do
-        validate_guarded!(opts)
+        if mode!(opts) == :gated, do: gate!(opts)
       rescue
-        ArgumentError -> :refused
+        ArgumentError -> nil
       end
 
-    receive do
-      {@stop_tag, ^ref} -> exit({:shutdown, :stopped})
-    after
-      0 -> :ok
-    end
+    case gate do
+      %{deadline: ^d} ->
+        if Keyword.fetch!(opts, :handoff) === h,
+          do: run(opts, gate, %{token: ref, until: a}),
+          else: exit({:shutdown, :refused})
 
-    cond do
-      System.monotonic_time(:millisecond) >= a -> exit({:shutdown, :expired})
-      pinned != %{handoff: h, deadline: d} -> exit({:shutdown, :refused})
-      true -> run(opts, ref)
+      _ ->
+        exit({:shutdown, :refused})
     end
   end
 
   @doc false
-  def init(opts), do: run(opts, nil)
+  # Ordinary (legacy M1) startup only. A gated payload never runs from here:
+  # gated work is reachable only through `guarded/1`.
+  def init(opts) do
+    if mode!(opts) == :gated, do: exit({:shutdown, :guarded_only})
+    run(opts, nil, nil)
+  end
 
-  defp run(opts, stop_token) do
-    gate = if mode!(opts) == :gated, do: gate!(opts)
-
+  # `gate` and `guard` are both nil (legacy) or both set (guarded owner).
+  defp run(opts, gate, guard) do
     %Limits{} = limits = Keyword.fetch!(opts, :limits)
 
     s = %{
@@ -472,7 +512,9 @@ defmodule Telelem.Wire.Upstream do
       # nil = legacy; else %{target:, deadline:} (see "Gated attempt").
       gate: gate,
       # nil, or the OwnerGuard token of a guarded owner's scoped stop.
-      stop_token: stop_token,
+      stop_token: if(guard, do: guard.token),
+      # nil, or the guarded owner's activation limit A.
+      until: if(guard, do: guard.until),
       hmon: nil,
       conn: nil,
       ref: nil,
@@ -535,7 +577,15 @@ defmodule Telelem.Wire.Upstream do
   # Grant-specific attach: a coordinator without `coordinator_grant` answers
   # {:error, :grant_required} before registering anything, so the attempt
   # ends here, before any dial, and does not acknowledge.
-  defp gated_attach(s) do
+  #
+  # Guarded owners only. Directly before the real attach, after the one
+  # payload validation: a pending scoped stop, then the activation limit A
+  # (equality expires). D was pinned in go/2 and is checked on its own from
+  # here on; A <= D holds at the entry.
+  defp gated_attach(%{stop_token: tok, until: a} = s) when tok != nil and is_integer(a) do
+    if guard_stop?(s), do: exit({:shutdown, :stopped})
+    if System.monotonic_time(:millisecond) >= a, do: exit({:shutdown, :expired})
+
     case Handoff.attach_grant(s.h, s.id, deadline: s.gate.deadline) do
       {:ok, hmon} ->
         s = %{s | hmon: hmon}
@@ -554,6 +604,8 @@ defmodule Telelem.Wire.Upstream do
         report_end(s, {:attach, :error, reason}, :not_sent)
     end
   end
+
+  defp gated_attach(_), do: exit({:shutdown, :guarded_only})
 
   # Non-blocking: a cancel or the coordinator's :DOWN already delivered, then
   # the clock. Consumed messages end the attempt, so nothing is lost.
@@ -999,6 +1051,11 @@ defmodule Telelem.Wire.Upstream do
 
     case :queue.peek(s.pending) do
       {:value, {_kind, ev}} when byte_size(ev) <= s.credit ->
+        # Guarded owners: a scoped stop already delivered prevents this
+        # transfer (legacy: never matches, no receive). One arriving after
+        # this check is seen only at the next checkpoint.
+        if guard_stop?(s), do: stop(s, :guard_stop)
+
         case Handoff.transfer(s.h, ev) do
           :ok ->
             {_, q} = :queue.out(s.pending)
@@ -1074,6 +1131,9 @@ defmodule Telelem.Wire.Upstream do
   end
 
   defp authorize_done(%{held_done: done, terminal: {:ok, reason}} = s) do
+    # Guarded owners: a scoped stop already delivered prevents the terminal
+    # finish; the held [DONE] is then dropped (legacy: never matches).
+    if guard_stop?(s), do: stop(s, :guard_stop)
     note(s, {:done_released, %{terminal: s.terminal}})
 
     case finish(s, {:upstream_done, reason}, done) do
