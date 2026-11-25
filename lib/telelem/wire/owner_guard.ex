@@ -16,8 +16,9 @@ defmodule Telelem.Wire.OwnerGuard do
       other than its helper's, is dropped), holds its own private monitors
       on the launcher, the guard and the owner, is linked only to the
       helper, and is the only process that sends the guard its activation.
-    * **helper**: a non-trapping process spawned and linked atomically by the
-      witness (and linked to nothing else), so it dies with the witness. It
+    * **helper**: a non-trapping process spawned, linked and privately
+      monitored atomically by the witness (and linked to nothing else), so it
+      dies with an abnormally exiting witness. It
       wraps the public `DynamicSupervisor.start_child/2` and sends only a
       sanitized result (`{:ok, guard_pid}` or `:error`), to the witness only.
     * **guard**: the temporary supervised child. It monitors the requester and
@@ -55,7 +56,7 @@ defmodule Telelem.Wire.OwnerGuard do
        traps exits, then (unless it already knows it is closed: `A` reached,
        or the launcher's `:DOWN` or abandonment already delivered, in which
        case it spawns no helper) spawns the helper with
-       `spawn_opt(..., [:link])` and sends its exact pid to the launcher's
+       `spawn_opt(..., [:link, :monitor])` and sends its exact pid to the launcher's
        alias. The helper waits, doing nothing, until the launcher releases
        it; it exits without work at `A`.
     2. The launcher records that exact helper pid first, then, only if no
@@ -70,10 +71,15 @@ defmodule Telelem.Wire.OwnerGuard do
     3. **The witness relays the result and is the only releaser of
        activation.** It takes the first result only. On `{:ok, guard}` it
        records and monitors that exact guard and relays the result to the
-       launcher's alias, all before any activation; then, before `A` and
-       only if it has not closed (see below), it sends that guard the one
-       activation. On `:error`, or on the helper's exact `EXIT` without a
-       result, it relays `:error` while not closed. It never activates any
+       launcher's alias, all before any activation; then it takes a launcher
+       `:DOWN` or abandonment already delivered (even one queued behind the
+       result) as a closure, and only if it has not closed (see below) and
+       `A` is not reached sends that guard the one activation. A closure
+       arriving after that check cannot be excluded (no check-and-send is
+       atomic): the launcher, abandoned or gone, then sends no GO and the
+       owner expires at `A`. On `:error`, or on its helper monitor's `:DOWN`
+       without a result, it relays `:error` while not closed. It never
+       activates any
        other guard (a late child the supervisor started after the helper was
        killed is never activated; it expires at `A`). The launcher monitors
        the relayed guard and sends it nothing.
@@ -95,19 +101,21 @@ defmodule Telelem.Wire.OwnerGuard do
   The witness **closes** (it will never release activation) on the
   launcher's abandonment, on the launcher's `:DOWN` whatever its reason
   (`:normal` included), and at `A`; it kills the exact helper then if it is
-  still up. It returns (normally) only after the helper's exact `EXIT`, and
-  kills that exact pid on that `EXIT` too (a no-op if it is gone; a forged
-  `EXIT` message can only end the helper early), so a normal witness exit
-  never leaves a helper behind its link. If the witness dies abnormally, the
-  link ends the helper. An owner that gets no GO exits at `A` without
-  attaching.
+  still up. It returns (normally) only after its private helper monitor's
+  `:DOWN`, so a normal witness exit never leaves a helper behind (a
+  `:normal` exit does not travel the link). An `EXIT` message from the
+  helper's pid is no evidence (any process can send one): the witness kills
+  that exact pid on it (a forged one can only end the helper early) and
+  still waits for the `:DOWN`; a kill it sends is no evidence either. If the
+  witness dies abnormally, the link ends the helper. An owner that gets no
+  GO exits at `A` without attaching.
 
   On every return the launcher deactivates its alias, drains exact replies
   already delivered, and flushes its witness and guard monitors. On
   **success** it kills nothing (the helper has delivered its result and is
-  ending; the witness waits for its `EXIT`). On **failure** it first tells
-  the witness to abandon and kills the exact helper itself if it recorded
-  one (or drained one), whatever won: the helper may be blocked in
+  ending; the witness waits for its monitor's `:DOWN`). On **failure** it
+  first tells the witness to abandon and kills the exact helper itself if it
+  recorded one (or drained one), whatever won: the helper may be blocked in
   `start_child/2`, and the witness may be suspended, or gone with its
   `:DOWN` still queued behind an expiry. A helper it never recorded was
   never released by it and does no work. If the witness is gone
@@ -151,7 +159,7 @@ defmodule Telelem.Wire.OwnerGuard do
       sends nothing and exits `{:shutdown, :owner_down_unconfirmed}`; its
       link still kills the owner.
     * witness: exactly one of the following, from its own records only,
-      once the helper's exact `EXIT` (if it spawned one), the guard's
+      once its helper monitor's `:DOWN` (if it spawned one), the guard's
       `:DOWN` (if it learned of a guard) and the owner's `:DOWN` (if it
       watched one) have all arrived. It then exits `:normal`.
         * `{:telelem_owner_witness, ref, :owner_down, owner}`: its own
@@ -199,11 +207,11 @@ defmodule Telelem.Wire.OwnerGuard do
       expires (see step 2).
     * a failure type while the witness cannot run (for example suspended):
       the launcher then returns `:expired` at `A`, not `:start_failed`.
-    * authenticity of the helper's result or `EXIT`: any process that knows
-      the token could forge a result, and any process can send an `EXIT`
-      message. The witness takes the first result only; a forged one can
-      fail the launch or take the real guard's place, and the real guard is
-      then never activated and expires at `A`.
+    * authenticity of the helper's result: any process that knows the token
+      could forge a result (and any process can send an `EXIT` message, which
+      only ends the helper early). The witness takes the first result only;
+      a forged one can fail the launch or take the real guard's place, and
+      the real guard is then never activated and expires at `A`.
   """
 
   alias Telelem.Wire.Upstream
@@ -364,7 +372,8 @@ defmodule Telelem.Wire.OwnerGuard do
   end
 
   # Success: no kill. The helper has already sent its result and is ending;
-  # the witness waits for its exact EXIT and watches the guard and the owner.
+  # the witness waits for its helper monitor's :DOWN and watches the guard
+  # and the owner.
   defp finish({:ok, handle, st}) do
     Process.unalias(st.alias)
     _ = drain(st.ref, [])
@@ -510,6 +519,9 @@ defmodule Telelem.Wire.OwnerGuard do
       observer: obs,
       lmon: lmon,
       helper: nil,
+      hmon: nil,
+      # true until the helper monitor's exact :DOWN (never an EXIT message
+      # or a kill sent).
       helper_up: false,
       result: nil,
       # true once it will never release activation (abandon, launcher
@@ -528,13 +540,17 @@ defmodule Telelem.Wire.OwnerGuard do
     if closed_at_start?(w) do
       w_loop(%{w | closed: true})
     else
-      h =
+      # Linked (its abnormal death ends the helper) and privately monitored,
+      # atomically: that monitor's :DOWN is the only evidence of the helper's
+      # death this process accepts.
+      {h, hmon} =
         :erlang.spawn_opt(__MODULE__, :helper, [%{sup: sup, meta: %{meta | witness: self()}}], [
-          :link
+          :link,
+          :monitor
         ])
 
       send(al, {@tag, ref, :helper, h})
-      w_loop(%{w | helper: h, helper_up: true})
+      w_loop(%{w | helper: h, hmon: hmon, helper_up: true})
     end
   end
 
@@ -552,7 +568,7 @@ defmodule Telelem.Wire.OwnerGuard do
     w = if not w.closed and now() >= w.until, do: close(w), else: w
 
     if w.helper_up or w.guard_up or w.owner_up do
-      %{ref: ref, lmon: lmon, helper: helper, gmon: gmon, omon: omon} = w
+      %{ref: ref, lmon: lmon, helper: helper, hmon: hmon, gmon: gmon, omon: omon} = w
 
       receive do
         {:DOWN, ^lmon, :process, _, _} ->
@@ -562,10 +578,16 @@ defmodule Telelem.Wire.OwnerGuard do
           w_loop(close(w))
 
         {:EXIT, ^helper, _} when w.helper_up ->
-          # Exact by pid, but a plain message could forge it: end that exact
-          # pid either way (a no-op if it is gone), so no helper outlives a
-          # normal return.
+          # Exact by pid, but a plain message could forge it, so it is not
+          # evidence of anything: the helper stays up until its monitor's
+          # :DOWN. The exact pid is ended either way (a forged EXIT can only
+          # end it early); that kill is asynchronous and proves nothing.
           Process.exit(helper, :kill)
+          w_loop(w)
+
+        {:DOWN, ^hmon, :process, _, _} when hmon != nil and w.helper_up ->
+          # The private monitor set atomically at spawn: the helper is gone.
+          # Its result, if it sent one, was delivered before this :DOWN.
           w = %{w | helper_up: false}
 
           # Gone without a result: a start failure, while not closed.
@@ -616,18 +638,37 @@ defmodule Telelem.Wire.OwnerGuard do
   defp w_report(%{released: true, ref: ref}), do: {@witness_tag, ref, :owner_unknown}
   defp w_report(%{ref: ref}), do: {@witness_tag, ref, :activation_never_released}
 
-  # The one activation, to the exact guard the helper reported, before A and
-  # only while the launcher has not given up.
+  # The one activation, to the exact guard the helper reported (already
+  # relayed), before A and only while the launcher has not given up. A
+  # launcher :DOWN or abandonment already delivered closes it here, even if
+  # queued behind the helper's result. One arriving after this check cannot
+  # be excluded (no check-and-send is atomic); the launcher then sends no GO
+  # and the owner expires at A.
   defp release(%{closed: false, released: false} = w) do
-    if now() < w.until do
-      send(w.guard, {@tag, w.ref, :activate})
-      %{w | released: true}
-    else
-      close(w)
+    w = take_pending_close(w)
+
+    cond do
+      w.closed -> w
+      now() >= w.until -> close(w)
+      true -> activate_guard(w)
     end
   end
 
   defp release(w), do: w
+
+  defp activate_guard(w) do
+    send(w.guard, {@tag, w.ref, :activate})
+    %{w | released: true}
+  end
+
+  defp take_pending_close(%{ref: ref, lmon: lmon} = w) do
+    receive do
+      {:DOWN, ^lmon, :process, _, _} -> close(w)
+      {@tag, ^ref, :abandon} -> close(w)
+    after
+      0 -> w
+    end
+  end
 
   defp w_timeout(%{closed: false, until: a}), do: min(max(a - now(), 0), @max_wait)
   defp w_timeout(_), do: :infinity

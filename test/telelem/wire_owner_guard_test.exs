@@ -26,7 +26,10 @@ defmodule Telelem.WireOwnerGuardTest do
   pending stop); cooperative stop at a checkpoint and the forced fence while
   blocked in a call; supervisor shutdown; the witness as the only releaser of
   activation (exactly once, to the exact reported guard, never after it
-  closed) and its three reports: `:owner_down` only from its own monitor,
+  closed, including a launcher `:DOWN` or abandonment queued behind the
+  helper's `{:ok, guard}`), the helper's death taken only from the witness's
+  private helper monitor (the helper gone at every report and loss relay,
+  also after a forged `EXIT`), and its three reports: `:owner_down` only from its own monitor,
   `:activation_never_released`, and `:owner_unknown` when a released guard
   went down without announcing an owner (fake launcher, helper, guard and
   owner processes). Reports are asserted only with the exact process already
@@ -769,6 +772,89 @@ defmodule Telelem.WireOwnerGuardTest do
     end
   end
 
+  test "witness: a launcher :DOWN or abandonment queued behind the helper's {:ok, guard} still closes it before release" do
+    for name <- [:normal, :killed, :abandon] do
+      ref = make_ref()
+      l = spawn(fn -> receive do: (:exit -> :ok) end)
+      g = recorder()
+      %{w: w, helper: helper, hm: hm, from: from} = fake_witness(ref, l, now() + 60_000)
+      wm = Process.monitor(w)
+
+      # The helper's result is delivered first, then the closure, both while
+      # the witness is held.
+      true = :erlang.suspend_process(w)
+      GenServer.reply(from, {:ok, g})
+      await_mailbox!(w, &Enum.any?(&1, fn m -> match?({_, ^ref, :started, {:ok, ^g}}, m) end))
+
+      case name do
+        :normal -> send(l, :exit)
+        :killed -> Process.exit(l, :kill)
+        :abandon -> send(w, {:telelem_owner_guard, ref, :abandon})
+      end
+
+      closure? = fn
+        {:DOWN, _, :process, ^l, _} -> true
+        {:telelem_owner_guard, ^ref, :abandon} -> true
+        _ -> false
+      end
+
+      msgs = await_mailbox!(w, &Enum.any?(&1, closure?))
+
+      assert Enum.find_index(msgs, &match?({_, ^ref, :started, _}, &1)) <
+               Enum.find_index(msgs, closure?),
+             "#{name}: the result must be ahead of the closure"
+
+      true = :erlang.resume_process(w)
+
+      # Relayed (relay before release), recorded and watched, never activated.
+      assert_receive {:telelem_owner_guard, ^ref, :started, {:ok, ^g}}, @t, inspect(name)
+      assert_receive {:DOWN, ^hm, :process, ^helper, _}, @t
+      await_watched!(w, g)
+      no_activation!(g, ref)
+      Process.exit(g, :kill)
+      assert_receive {:telelem_owner_witness, ^ref, :activation_never_released}, @t
+      assert_receive {:DOWN, ^wm, :process, ^w, :normal}, @t
+      refute_received {:telelem_owner_guard, ^ref, :watching, _, _}
+      Process.exit(l, :kill)
+    end
+  end
+
+  test "witness: a normal return only after its private helper monitor's :DOWN; the helper is gone at its loss relay and at every report" do
+    for how <- [:refuse, :ok_then_guard_down, :helper_killed] do
+      ref = make_ref()
+      l = spawn(fn -> receive do: (:exit -> :ok) end)
+      %{w: w, helper: helper, hm: hm, from: from} = fake_witness(ref, l, now() + 60_000)
+      wm = Process.monitor(w)
+      # Exactly one monitor of the witness on the exact helper, set at spawn.
+      {:monitors, ms} = Process.info(w, :monitors)
+      assert Enum.count(ms, &(&1 == {:process, helper})) == 1
+
+      case how do
+        :refuse ->
+          GenServer.reply(from, {:error, :max_children})
+          assert_receive {:telelem_owner_guard, ^ref, :started, :error}, @t
+
+        :ok_then_guard_down ->
+          g = recorder()
+          GenServer.reply(from, {:ok, g})
+          assert_receive {:recorded, ^g, {:telelem_owner_guard, ^ref, :activate}}, @t
+          Process.exit(g, :kill)
+
+        :helper_killed ->
+          Process.exit(helper, :kill)
+          # Relayed only on the :DOWN: the helper is already gone.
+          assert_receive {:telelem_owner_guard, ^ref, :started, :error}, @t
+          refute Process.alive?(helper)
+      end
+
+      assert_receive {:telelem_owner_witness, ^ref, _}, @t, inspect(how)
+      refute Process.alive?(helper)
+      assert_receive {:DOWN, ^hm, :process, ^helper, _}, @t
+      assert_receive {:DOWN, ^wm, :process, ^w, :normal}, @t
+      Process.exit(l, :kill)
+    end
+  end
+
   test "witness: one activation to the exact reported guard, relayed first; owner death only from its own exact monitor" do
     ref = make_ref()
     l = spawn(fn -> receive do: (:exit -> :ok) end)
@@ -780,7 +866,7 @@ defmodule Telelem.WireOwnerGuardTest do
     GenServer.reply(from, {:ok, g})
     assert_receive {:telelem_owner_guard, ^ref, :started, {:ok, ^g}}, @t
     assert_receive {:recorded, ^g, {:telelem_owner_guard, ^ref, :activate}}, @t
-    # The helper delivered its result and ended; its exact EXIT unlinked it.
+    # The helper delivered its result and ended; its exit removed the link.
     assert_receive {:DOWN, ^hm, :process, ^helper, :normal}, @t
     await_links!(w, [])
 
@@ -829,8 +915,10 @@ defmodule Telelem.WireOwnerGuardTest do
     wm = Process.monitor(w)
 
     send(w, {:EXIT, helper, :normal})
-    assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t
+    # Not evidence: the failure is relayed only on the helper monitor's :DOWN.
     assert_receive {:telelem_owner_guard, ^ref, :started, :error}, @t
+    refute Process.alive?(helper)
+    assert_receive {:DOWN, ^hm, :process, ^helper, :killed}, @t
     assert_receive {:telelem_owner_witness, ^ref, :activation_never_released}, @t
     assert_receive {:DOWN, ^wm, :process, ^w, :normal}, @t
   end
