@@ -15,10 +15,15 @@ defmodule Telelem.Serve.ListenerSpec do
 
   ## Policy and its accurate limits (pinned versions)
 
-    * `scheme: :https`, HTTP/1.1 only. `http_2_options: [enabled: false]`
+    * `scheme: :https`, HTTP/1 only. `http_2_options: [enabled: false]`
       makes Bandit advertise only `"http/1.1"` by ALPN and never switch a
       connection to HTTP/2, with or without ALPN. TLS settings are not set
-      here.
+      here. These options do **not** reject HTTP/1.0: the pinned Bandit
+      HTTP/1 handler parses and serves both `HTTP/1.1` and `HTTP/1.0`
+      request lines (it rejects other version text itself). An HTTP/1.0
+      request reaches the plug, and it is `Telelem.Serve.HTTP` that
+      answers any protocol other than `:"HTTP/1.1"` with 505
+      `version_not_supported`.
     * One request per connection: `http_1_options: [max_requests: 1]`. Bandit
       closes the connection after the first request's response. It is a
       per-connection cap; it does not bound the number of connections,
@@ -30,13 +35,21 @@ defmodule Telelem.Serve.ListenerSpec do
       []` (no plug exception is logged by status); `log_protocol_errors:
       false` and `log_client_closures: false`; `log_unknown_messages: false`.
     * `thousand_island_options: [silent_terminate_on_error: true]`. Under
-      Thousand Island 1.6.0 this only turns a handler's `{:error, reason,
-      state}` return (Bandit returns one after a plug exception or protocol
-      error) into a `{:shutdown, {:silent_termination, reason}}` exit, so the
-      connection process does not exit abnormally and produce a crash report.
-      Exceptions raised inside the handler outside that path are still
-      reported by the runtime, and Thousand Island and Bandit still emit
-      their telemetry events for errors.
+      Thousand Island 1.6.0 this only turns a handler callback's `{:error,
+      reason, state}` return into a `{:shutdown, {:silent_termination,
+      reason}}` exit instead of an abnormal exit with `reason`. It does not
+      act on the path this policy serves: after a plug exception or HTTP/1
+      protocol error the pinned `Bandit.Pipeline` handles the error itself
+      (telemetry, the `log_*` options above, an error response where it
+      can) and the Bandit HTTP/1 handler then returns `{:close, state}`, so
+      the connection ends as `{:shutdown, :local_closed}` whatever this
+      option is. In the pinned Bandit only the HTTP/2 and WebSocket
+      handlers return `{:error, reason, state}`, and both are disabled
+      here; the option is kept only as a fallback if that changes.
+      Exceptions raised from a handler callback are re-raised by Thousand
+      Island and reported by the runtime, a `:tcp_error`/`:ssl_error` still
+      stops the connection with that reason, and Thousand Island and Bandit
+      still emit their telemetry events for errors.
 
   These options do not make the listener silent. The pinned Bandit still has
   log calls no option disables (for example the HTTP/1 request-trailer

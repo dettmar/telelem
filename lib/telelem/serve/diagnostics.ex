@@ -22,11 +22,18 @@ defmodule Telelem.Serve.Diagnostics do
       when any module level is something else (it overrides the primary
       level for that module), or `:unobservable`.
     * `telemetry_registry`: `:ets` or `:persistent_term` for the two
-      registry forms defined by pinned telemetry, `:absent` when no
-      registry is installed or its table or table process is gone (pinned
-      telemetry would then report no handlers rather than an error), or
-      `:unknown` for any other form, for a registry that changed during the
-      observation, or if it could not be read.
+      registry descriptors pinned `telemetry_handler_table` stores, each
+      only with its own exact dispatch function
+      (`{:telemetry_ets, &:telemetry_ets.list_for_event/2, tid}` with the
+      table owned by the registry process, or `{:telemetry_pt,
+      &:telemetry_pt.list_for_event/2, map}`); `:absent` when no registry is
+      installed or its table or table process is gone (pinned telemetry
+      would then report no handlers rather than an error); or `:unknown`
+      for any other form, including a known tag with any other function of
+      arity 2 (the function `telemetry:execute/3` dispatches through would
+      then not be the one `telemetry:list_handlers/1` reflects), for a
+      descriptor that changed during the observation, or if it could not be
+      read.
     * `telemetry_handlers`: `:none` when no handler is attached to an event
       under `[:bandit]` or `[:thousand_island]`, `:present`, or
       `:unobservable` (always so unless the registry is `:ets` or
@@ -50,6 +57,19 @@ defmodule Telelem.Serve.Diagnostics do
   log levels of other processes, primary filters, telemetry handlers under
   other prefixes (such as `[:plug]`), tracing, `:sys` debugging or crash
   dumps. Telemetry events are still executed when no handler is attached.
+
+  The snapshot is a sequence of separate reads (the registry descriptor,
+  each telemetry prefix in turn, the descriptor again, then the primary
+  level, handler IDs and module levels), not one atomic view. An `:ok` therefore does not establish that
+  all of these were quiet at the same instant: a handler or level may have
+  appeared before one read and been removed before another. The registry
+  is read before and after the handler lookups and the result is
+  `:unknown` only if the descriptor itself changed. In the `:ets` form
+  attaching or detaching a handler changes only the table and stores an
+  equal descriptor, so such a change during or between the per-prefix
+  lookups leaves the descriptor stable and is not detected (in the
+  `:persistent_term` form the descriptor carries the handler map, so a
+  change inside that window is detected).
   """
 
   @codes [
@@ -241,26 +261,40 @@ defmodule Telelem.Serve.Diagnostics do
   @doc false
   # Classifies the pinned telemetry registry term (`persistent_term` key
   # `:telemetry`, set by `telemetry_handler_table`), the registry process and
-  # an ETS owner lookup. Public only for synthetic tests.
+  # an ETS owner lookup. Known only as `{:telemetry_ets,
+  # &:telemetry_ets.list_for_event/2, tid}` or `{:telemetry_pt,
+  # &:telemetry_pt.list_for_event/2, map}`. Public only for synthetic tests.
   @spec registry_kind(term(), pid() | nil, (term() -> term())) ::
           :ets | :persistent_term | :absent | :unknown
   def registry_kind(:absent, _registry_pid, _owner), do: :absent
 
-  def registry_kind({:telemetry_ets, fun, tid}, registry_pid, owner)
-      when is_function(fun, 2) and is_reference(tid) do
-    case {registry_pid, owner.(tid)} do
-      {nil, _} -> :absent
-      {_, :undefined} -> :absent
-      {pid, pid} when is_pid(pid) -> :ets
-      _ -> :unknown
+  def registry_kind({:telemetry_ets, fun, tid}, registry_pid, owner) when is_reference(tid) do
+    if pinned_dispatch?(:telemetry_ets, fun) do
+      case {registry_pid, owner.(tid)} do
+        {nil, _} -> :absent
+        {_, :undefined} -> :absent
+        {pid, pid} when is_pid(pid) -> :ets
+        _ -> :unknown
+      end
+    else
+      :unknown
     end
   end
 
-  def registry_kind({:telemetry_pt, fun, map}, _registry_pid, _owner)
-      when is_function(fun, 2) and is_map(map),
-      do: :persistent_term
+  def registry_kind({:telemetry_pt, fun, map}, _registry_pid, _owner) when is_map(map) do
+    if pinned_dispatch?(:telemetry_pt, fun), do: :persistent_term, else: :unknown
+  end
 
   def registry_kind(_, _registry_pid, _owner), do: :unknown
+
+  # `telemetry:execute/3` calls the descriptor's function, while
+  # `telemetry:list_handlers/1` calls `Mod:list_by_prefix/2`. Only the exact
+  # function pinned `telemetry_handler_table` stores for each form keeps the
+  # two in agreement, so anything else (an anonymous or other external
+  # function of the same arity, or the other form's function) is unknown.
+  # External funs compare by module, name and arity.
+  defp pinned_dispatch?(:telemetry_ets, fun), do: fun === (&:telemetry_ets.list_for_event/2)
+  defp pinned_dispatch?(:telemetry_pt, fun), do: fun === (&:telemetry_pt.list_for_event/2)
 
   defp guard(fallback, fun) do
     fun.()

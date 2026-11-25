@@ -1,6 +1,7 @@
 defmodule Telelem.Serve.ListenerSpecTest do
   # Pure policy checks plus read-only checks against the pinned dependency
-  # definitions (source attribute lists, compiled typespecs, struct keys). No
+  # definitions (source attribute lists and lines, compiled typespecs, struct
+  # keys). No
   # listener is started and no socket is opened.
   use ExUnit.Case, async: true
 
@@ -148,6 +149,30 @@ defmodule Telelem.Serve.ListenerSpecTest do
     end
 
     assert ThousandIsland.ServerConfig.__struct__().silent_terminate_on_error == false
+  end
+
+  test "pinned Bandit source behind the documented HTTP/1.0 and close-path limits" do
+    bandit = Mix.Project.deps_paths()[:bandit]
+    read = &File.read!(Path.join(bandit, &1))
+
+    # HTTP/1.0 is parsed and served by Bandit; Telelem.Serve.HTTP rejects it.
+    assert read.("lib/bandit/http1/socket.ex") =~
+             ~s({{1, 0}, [_method, _target, "HTTP/1.0"]} ->)
+
+    # A pipeline error closes the HTTP/1 connection with `{:close, state}`,
+    # never an `{:error, reason, state}` return, so silent_terminate_on_error
+    # does not act on the served path.
+    http1 = read.("lib/bandit/http1/handler.ex")
+    assert http1 =~ "{:error, _reason} -> {:close, state}"
+
+    error_return = ~r/\{:error,\s*[^,{}]+,\s*[^{}]*state\b/
+
+    for source <- [http1, read.("lib/bandit/initial_handler.ex")] do
+      refute source =~ error_return
+    end
+
+    # The pattern does find the disabled WebSocket handler's error returns.
+    assert read.("lib/bandit/websocket/handler.ex") =~ error_return
   end
 
   defp leaves(list) when is_list(list) and list != [] do

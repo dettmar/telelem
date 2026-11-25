@@ -158,39 +158,108 @@ defmodule Telelem.Serve.DiagnosticsTest do
       owner = spawn(fn -> receive(do: (:stop -> :ok)) end)
       other = spawn(fn -> receive(do: (:stop -> :ok)) end)
       on_exit(fn -> Enum.each([owner, other], &send(&1, :stop)) end)
-      %{owner: owner, other: other, tid: make_ref(), fun: fn _, _ -> [] end}
+      # The exact dispatch functions pinned `telemetry_handler_table` stores.
+      %{
+        owner: owner,
+        other: other,
+        tid: make_ref(),
+        ets_fun: &:telemetry_ets.list_for_event/2,
+        pt_fun: &:telemetry_pt.list_for_event/2
+      }
     end
 
-    test "known forms", %{owner: owner, tid: tid, fun: fun} do
-      assert Diagnostics.registry_kind({:telemetry_ets, fun, tid}, owner, fn ^tid -> owner end) ==
+    test "known forms", %{owner: owner, tid: tid, ets_fun: ets_fun, pt_fun: pt_fun} do
+      assert Diagnostics.registry_kind({:telemetry_ets, ets_fun, tid}, owner, fn ^tid -> owner end) ==
                :ets
 
-      assert Diagnostics.registry_kind({:telemetry_pt, fun, %{}}, owner, fn _ -> :undefined end) ==
+      assert Diagnostics.registry_kind(
+               {:telemetry_pt, pt_fun, %{}},
+               owner,
+               fn _ -> :undefined end
+             ) == :persistent_term
+
+      assert Diagnostics.registry_kind({:telemetry_pt, pt_fun, %{}}, nil, fn _ -> :undefined end) ==
                :persistent_term
 
-      assert Diagnostics.registry_kind({:telemetry_pt, fun, %{}}, nil, fn _ -> :undefined end) ==
-               :persistent_term
+      # A capture built at runtime is the same external function.
+      assert Diagnostics.registry_kind(
+               {:telemetry_ets, Function.capture(:telemetry_ets, :list_for_event, 2), tid},
+               owner,
+               fn _ -> owner end
+             ) == :ets
     end
 
-    test "absent registry, table or table process", %{owner: owner, tid: tid, fun: fun} do
+    test "absent registry, table or table process", %{owner: owner, tid: tid, ets_fun: ets_fun} do
       assert Diagnostics.registry_kind(:absent, owner, fn _ -> owner end) == :absent
 
-      assert Diagnostics.registry_kind({:telemetry_ets, fun, tid}, nil, fn _ -> owner end) ==
+      assert Diagnostics.registry_kind({:telemetry_ets, ets_fun, tid}, nil, fn _ -> owner end) ==
                :absent
 
-      assert Diagnostics.registry_kind({:telemetry_ets, fun, tid}, owner, fn _ -> :undefined end) ==
-               :absent
+      assert Diagnostics.registry_kind(
+               {:telemetry_ets, ets_fun, tid},
+               owner,
+               fn _ -> :undefined end
+             ) == :absent
     end
 
-    test "unknown forms", %{owner: owner, other: other, tid: tid, fun: fun} do
+    test "a known tag with any other arity-2 dispatch function is unknown",
+         %{owner: owner, tid: tid, ets_fun: ets_fun, pt_fun: pt_fun} do
+      # Each of these would pass an `is_function(fun, 2)` check. Lookups are
+      # synthetic and never call the function.
+      others = [
+        fn _, _ -> [] end,
+        fn tid, event -> :telemetry_ets.list_for_event(tid, event) end,
+        &:telemetry_ets.list_by_prefix/2,
+        &:telemetry_pt.list_by_prefix/2,
+        &:erlang.max/2,
+        &Map.get/2
+      ]
+
+      for fun <- others do
+        assert Diagnostics.registry_kind({:telemetry_ets, fun, tid}, owner, fn _ -> owner end) ==
+                 :unknown
+
+        assert Diagnostics.registry_kind({:telemetry_pt, fun, %{}}, owner, fn _ -> owner end) ==
+                 :unknown
+      end
+
+      # Each form's function under the other form's tag.
+      assert Diagnostics.registry_kind({:telemetry_ets, pt_fun, tid}, owner, fn _ -> owner end) ==
+               :unknown
+
+      assert Diagnostics.registry_kind({:telemetry_pt, ets_fun, %{}}, owner, fn _ -> owner end) ==
+               :unknown
+
+      # A mismatched ETS descriptor is unknown even when the table or table
+      # process is gone.
+      assert Diagnostics.registry_kind({:telemetry_ets, pt_fun, tid}, nil, fn _ -> owner end) ==
+               :unknown
+
+      assert Diagnostics.registry_kind(
+               {:telemetry_ets, fn _, _ -> [] end, tid},
+               owner,
+               fn _ -> :undefined end
+             ) == :unknown
+
+      # Pinned `default_impl/0` shape, never stored by the registry.
+      assert Diagnostics.registry_kind(
+               {:telemetry_ets, fn _, _ -> [] end, %{}},
+               owner,
+               fn _ -> owner end
+             ) == :unknown
+    end
+
+    test "unknown forms",
+         %{owner: owner, other: other, tid: tid, ets_fun: ets_fun, pt_fun: pt_fun} do
       unknown = [
-        {{:telemetry_ets, fun, tid}, owner, fn _ -> other end},
-        {{:telemetry_ets, fun, tid}, owner, fn _ -> :weird end},
-        {{:telemetry_ets, fn _ -> [] end, tid}, owner, fn _ -> owner end},
-        {{:telemetry_ets, fun, :named_table}, owner, fn _ -> owner end},
-        {{:telemetry_pt, fun, []}, owner, fn _ -> owner end},
-        {{:telemetry_other, fun, tid}, owner, fn _ -> owner end},
-        {{:telemetry_ets, fun}, owner, fn _ -> owner end},
+        {{:telemetry_ets, ets_fun, tid}, owner, fn _ -> other end},
+        {{:telemetry_ets, ets_fun, tid}, owner, fn _ -> :weird end},
+        {{:telemetry_ets, fn _, _, _ -> [] end, tid}, owner, fn _ -> owner end},
+        {{:telemetry_ets, ets_fun, :named_table}, owner, fn _ -> owner end},
+        {{:telemetry_pt, pt_fun, []}, owner, fn _ -> owner end},
+        {{:telemetry_other, ets_fun, tid}, owner, fn _ -> owner end},
+        {{:telemetry_ets, ets_fun}, owner, fn _ -> owner end},
+        {{:telemetry_ets, nil, tid}, owner, fn _ -> owner end},
         {nil, owner, fn _ -> owner end},
         {%{}, owner, fn _ -> owner end}
       ]
@@ -205,7 +274,10 @@ defmodule Telelem.Serve.DiagnosticsTest do
     test "returns only fixed atoms and changes nothing it reads" do
       before = global_state()
       snapshot = Diagnostics.observe()
-      assert global_state() == before
+      # Compared as a boolean so a failure reports no raw Logger or
+      # telemetry configuration.
+      unchanged? = global_state() == before
+      assert unchanged?, "observe/0 changed Logger, telemetry or process state"
 
       assert Map.keys(snapshot) |> Enum.sort() == Map.keys(@allowed) |> Enum.sort()
 
@@ -224,8 +296,17 @@ defmodule Telelem.Serve.DiagnosticsTest do
                if(:logger.get_handler_ids() == [], do: :none, else: :present)
 
       # The telemetry application is started under `mix test` and nothing in
-      # this suite persists the registry.
+      # this suite persists the registry, so the live descriptor is the ETS
+      # form with its exact pinned dispatch function (checked as a boolean so
+      # nothing raw is reported).
       assert snapshot.telemetry_registry == :ets
+
+      pinned = &:telemetry_ets.list_for_event/2
+
+      pinned_ets? =
+        match?({:telemetry_ets, ^pinned, _}, :persistent_term.get(:telemetry, :absent))
+
+      assert pinned_ets?, "live telemetry descriptor is not the pinned ETS form"
 
       attached? =
         :telemetry.list_handlers([:bandit]) != [] or
