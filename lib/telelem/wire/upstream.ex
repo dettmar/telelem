@@ -93,9 +93,152 @@ defmodule Telelem.Wire.Upstream do
   A `{:telelem_wire_probe, from, ref}` message is answered with
   `{ref, snapshot}`: a live view of retained bytes, credit and arming, for
   evidence.
+
+  ## Gated attempt (opt-in: `gate: [target:, deadline:]`)
+
+  Off by default; without `:gate` (or with exactly one `gate: nil`) nothing
+  below applies and every shape above is unchanged. More than one `:gate`
+  entry (a leading `gate: nil` included) raises `ArgumentError` before either
+  mode is chosen.
+
+  **Supported launch only.** A gated attempt runs only as a guarded owner
+  started by `Telelem.Wire.OwnerGuard` (see "Guarded owner" below).
+  `start_link/1` (and so `child_spec/1`) raises `ArgumentError`
+  (`"Upstream gate: a gated attempt starts only through
+  Telelem.Wire.OwnerGuard"`) for any single non-nil `:gate`, valid or not,
+  and spawns nothing; `init/1` given a gated payload exits
+  `{:shutdown, :guarded_only}` before any call. The interface below is
+  validated by `validate_guarded!/1` (the launcher's check, separately
+  testable) and once more in the owner after its GO.
+
+  It requires a coordinator started with `coordinator_grant`
+  (see `Telelem.Handoff`): the attempt attaches with
+  `Handoff.attach_grant/3`, which any other coordinator refuses with
+  `{:error, :grant_required}` before registering it, so the attempt ends
+  without dialing.
+
+  **Interface, validated by `validate_guarded!/1` in the launcher before
+  anything is spawned (`ArgumentError`, naming only the offending field) and
+  again in the owner.** Exactly the keys `:handoff` (pid), `:id`, `:controller` (pid),
+  `:body` (binary, at most `limits.max_request_body` bytes), `:limits` (a
+  `Telelem.Wire.Limits` whose every numeric field is an integer in `1..max`,
+  `max` being `2^32 - 1` for the `*_ms` timeouts and `2^31 - 1` for the byte
+  counts and socket buffer sizes, and whose relations `Limits.new/1`
+  accepts), `:gate`, and optionally `:terminal_deadline` equal to the gate's
+  deadline; each once. Legacy attempts and the `Limits` defaults are not
+  affected by these checks. `:lane`, `:recorder`, `:rid`, `:path` and
+  any other key are refused: the destination, trust and transport options
+  come only from the target and the limits, and no Recorder runs.
+  `:gate` is exactly `[target: t, deadline: d]`:
+
+    * `t` is a `Telelem.Sandbox.VerifiedTarget` that
+      `VerifiedTarget.check(t, t.deployment_id)` accepts **and** whose
+      `address` is IPv4 (`::1` is refused in this slice). The attempt dials
+      `t.host` (proved equal to the canonical text of `t.address`, so no
+      name resolution) on `t.port`, with `VerifiedTarget.tls_opts(t)` only
+      (fixture CA, `verify_peer`; no OS trust store fallback).
+    * `d` is the coordinator's absolute `:terminal_deadline`
+      (`System.monotonic_time(:millisecond)`). The same integer is passed as
+      `deadline:` to `Handoff.attach_grant/3`, `Handoff.begin_dispatch/3` and
+      `Handoff.finish/4`. It may be past, but at most
+      `Handoff.max_deadline_ahead_ms/0` (4_294_966_295 ms, `2^32 - 1` minus
+      the coordinator's 1000 ms grace) ahead of now; a later one is refused
+      before spawn, since no Handoff wait could cover `d + grace`.
+
+  **Order.**
+
+    1. `attach_grant(h, id, deadline: d)`. Its `:ok` comes only from a
+       `coordinator_grant` coordinator, after the authority reserved the
+       grant for this pid, so nothing is dialed before the reservation. A
+       coordinator without `coordinator_grant` replies
+       `{:error, :grant_required}` (controller:
+       `{:ended, {:attach, :error, :grant_required}, stats}`).
+    2. Check, without waiting: a coordinator `{:cancel, _}`, the
+       coordinator's `:DOWN` (the attach monitor) and `now < d`. Any of them
+       stops the attempt before dialing.
+    3. Connect and TLS (clamped, see below), then the same check.
+    4. `begin_dispatch(h, id, deadline: d)`. From its `:ok` the attempt's
+       claim is `:possible`, whether or not it then sends.
+    5. The same check, directly before the one `Mint.HTTP.request/5` call.
+       There is exactly one request call site, reached at most once.
+    6. While streaming: the clock is checked at the top of every loop turn
+       and before every `transfer/2`, and every wait (for the upstream or
+       for downstream credit) is bounded by the time left to `d`. Reaching
+       `d` stops the attempt (`:deadline`); no `finish` is attempted.
+
+  Every end closes the Mint connection (and so its socket) before the
+  voluntary `Handoff.cleaned/3`. `cleaned/3` is sent after a refused or
+  cancelled attach only (the coordinator then knows this pid), never after
+  an `{:error, _}` attach: another process must not acknowledge the attempt
+  id.
+
+  **Controller messages are sanitized** to a fixed vocabulary: the controller
+  gets `{:connect_failed, :refused | :ambiguous, kind}` or exactly one
+  `{:ended, reason, stats}`, also when attach is refused (legacy sends
+  nothing then). `kind`, `reason` and every nested term are atoms from fixed
+  lists, an HTTP status integer, or `:other`. No upstream body, error
+  message, TLS alert text, coordinator or requester reason term, socket,
+  pid, host or certificate is copied. `stats` carry counters, `claim` and a
+  `cleaned_ack` of `:ok | :error`.
+
+  **Timeout clamps applied (the only ones this slice can apply):**
+
+    * Connect: OTP `ssl` applies the one `timeout` given to the TCP connect
+      and again to the TLS handshake, so the attempt passes
+      `min(connect_timeout_ms, div(d - now, 2))` and does not dial when that
+      is below 1 ms.
+    * Waits for upstream data: `min(response_timeout_ms, d - now)`; for
+      downstream credit (legacy: unbounded): `d - now`.
+
+  **Limits, not solved here (no hard expiry).** The deadline is cooperative.
+  Not clamped: the request write (`Mint.HTTP.request/5` -> `:ssl.send/2` has
+  no per-call timeout; it can block on the kernel send buffer), `ready/2`,
+  `transfer/2` and `cleaned/3` (the coordinator's 5 s call timeout),
+  `attach_grant/3`, `begin_dispatch/3` and `finish/4` (`d` plus the coordinator's
+  grace), `Mint.HTTP.close/1` (OTP's own close behaviour), parsing of one
+  delivery, and scheduling. A blocked call delays the next check; nothing
+  here proves socket teardown timing or slot quiescence.
+
+  ## Guarded owner (TEL-012, `Telelem.Wire.OwnerGuard` only)
+
+  `guarded/1` is the fixed entry the guard spawns (linked and monitored, not
+  trapping exits). It takes only metadata (token, activation limit `A`,
+  deadline `D`, pinned coordinator; `A <= D`) and waits for one GO with the
+  exact token until `A` (at `A` it has expired; a stop before GO exits
+  `{:shutdown, :stopped}`). On GO, in this order:
+
+    1. the payload is validated once: a valid gated attempt pinned to the
+       same coordinator and to the same `D`, else `{:shutdown, :refused}`;
+    2. directly before the one `attach_grant/3` call, with nothing in
+       between: a pending scoped stop (`{:shutdown, :stopped}`), then `A`
+       (`now >= A`: `{:shutdown, :expired}`).
+
+  Each of these exits sends nothing anywhere and attaches nothing. `D` stays
+  the independent request deadline of every later step.
+
+  The guard's scoped stop (`{:telelem_owner_stop, token}`) is consumed,
+  without waiting, only at these checkpoints:
+
+    * before the attach (above);
+    * after attach, after connect and before the request (step 2, 3 and 5
+      above, as `{:stopped, stage, :guard_stop}`);
+    * while streaming: in the receive, before each credit-driven
+      `Handoff.transfer/2`, and before the terminal `Handoff.finish/3,4`
+      (the held `[DONE]` is then dropped); all as `:guard_stop`.
+
+  It is cooperative and not an atomic revocation: a stop that arrives after a
+  checkpoint does not undo or interrupt the call that follows it (a
+  `transfer/2` or `finish` already begun may complete), and a call that
+  blocks (for example `attach_grant/3` waiting for a reservation) does not
+  see it; the guard then kills the exact pid at its fence. Legacy attempts
+  never receive or match it.
+
+  Not covered by listener-free tests: the streaming checkpoints (they need a
+  TLS handshake to reach).
   """
 
   alias Telelem.Handoff
+  alias Telelem.Sandbox.VerifiedTarget
   alias Telelem.Wire.{Limits, Recorder, SSE}
 
   @tag :telelem_handoff
@@ -122,36 +265,256 @@ defmodule Telelem.Wire.Upstream do
   waits. When absent or `nil` (legacy M1), the attempt calls
   `Handoff.finish/3` exactly as before. Any other value raises
   `ArgumentError` in the caller, before the attempt is spawned.
+
+  A single non-nil `:gate` raises `ArgumentError` here and spawns nothing:
+  gated attempts start only through `Telelem.Wire.OwnerGuard` ("Gated
+  attempt" above). A duplicate `:gate` raises before either mode is chosen.
   """
   def start_link(opts) do
-    case Keyword.get(opts, :terminal_deadline) do
-      d when is_nil(d) or is_integer(d) ->
-        :ok
+    case mode!(opts) do
+      :legacy ->
+        case Keyword.get(opts, :terminal_deadline) do
+          d when is_nil(d) or is_integer(d) ->
+            :ok
 
-      other ->
-        raise ArgumentError,
-              "Upstream :terminal_deadline must be an integer or nil, got: #{inspect(other)}"
+          other ->
+            raise ArgumentError,
+                  "Upstream :terminal_deadline must be an integer or nil, got: #{inspect(other)}"
+        end
+
+      :gated ->
+        # Ordinary startup never spawns gated work, valid payload or not.
+        gate_error("a gated attempt starts only through Telelem.Wire.OwnerGuard")
     end
 
     {:ok, :proc_lib.spawn_link(__MODULE__, :init, [opts])}
   end
 
+  # Mode selection. Every `:gate` entry is counted first, so a duplicate
+  # (`[gate: nil, gate: [...]]` included) is refused before either mode is
+  # chosen; no `:gate`, or exactly one `gate: nil`, is legacy.
+  defp mode!(opts) do
+    gates = if is_list(opts), do: for({:gate, g} <- opts, do: g), else: []
+
+    case gates do
+      [] -> :legacy
+      [nil] -> :legacy
+      [_] -> :gated
+      _ -> gate_error(":gate must be given at most once")
+    end
+  end
+
+  @gate_keys [:handoff, :id, :controller, :body, :limits, :gate, :terminal_deadline]
+  @gate_required [:handoff, :id, :controller, :body, :limits, :gate]
+
+  # Gated attempts only: every numeric field of `Limits`, an integer in
+  # 1..max. Timeouts fit an Erlang `receive ... after` / timer (2^32 - 1 ms);
+  # byte counts and socket buffer sizes fit a signed 32-bit int. Checked
+  # before `Limits.new/1`, whose relations compare terms of any type.
+  @max_timeout_ms 4_294_967_295
+  @max_bytes 2_147_483_647
+  @gate_limit_ranges [
+    window: @max_bytes,
+    max_event: @max_bytes,
+    high_water: @max_bytes,
+    hard_cap: @max_bytes,
+    cleanup_timeout_ms: @max_timeout_ms,
+    cleanup_deadline_ms: @max_timeout_ms,
+    connect_timeout_ms: @max_timeout_ms,
+    register_timeout_ms: @max_timeout_ms,
+    response_timeout_ms: @max_timeout_ms,
+    max_request_body: @max_bytes,
+    upstream_recbuf: @max_bytes,
+    upstream_read_buffer: @max_bytes,
+    downstream_sndbuf: @max_bytes
+  ]
+
   @doc false
+  # The gated numeric limit ranges, `[{field, max}]` (min is always 1).
+  def gate_limit_ranges, do: @gate_limit_ranges
+
+  # The gated interface: a closed key set, each key once, and a target that
+  # VerifiedTarget re-validates. Messages name the field, never its value.
+  defp gate!(opts) do
+    unless is_list(opts) and Enum.all?(opts, &match?({k, _} when is_atom(k), &1)),
+      do: gate_error("options must be a keyword list")
+
+    keys = Keyword.keys(opts)
+    unless length(Enum.uniq(keys)) == length(keys), do: gate_error("each option at most once")
+
+    case keys -- @gate_keys do
+      [] -> :ok
+      [k | _] -> gate_error("option #{inspect(k)} is not accepted")
+    end
+
+    case @gate_required -- keys do
+      [] -> :ok
+      [k | _] -> gate_error("option #{inspect(k)} is required")
+    end
+
+    {target, deadline} =
+      case opts[:gate] do
+        [target: t, deadline: d] when is_integer(d) -> {t, d}
+        [deadline: d, target: t] when is_integer(d) -> {t, d}
+        _ -> gate_error(":gate must be exactly [target: _, deadline: integer]")
+      end
+
+    # Handoff's shared bound: every Handoff wait on `d` is `d + grace`, which
+    # must fit one wait. Checked before spawn and again in the attempt (later,
+    # so never looser). A past deadline passes and stops the attempt as before.
+    unless Handoff.deadline_in_range?(deadline),
+      do: gate_error(":gate deadline must be at most #{Handoff.max_deadline_ahead_ms()} ms ahead")
+
+    case target do
+      %VerifiedTarget{deployment_id: id} = t ->
+        case VerifiedTarget.check(t, id) do
+          :ok -> :ok
+          {:error, why} -> gate_error(":gate target rejected (#{inspect(why)})")
+        end
+
+        unless match?({_, _, _, _}, t.address), do: gate_error(":gate target must be IPv4")
+
+      _ ->
+        gate_error(":gate target must be a verified target")
+    end
+
+    case Keyword.fetch(opts, :terminal_deadline) do
+      :error -> :ok
+      {:ok, ^deadline} -> :ok
+      {:ok, _} -> gate_error(":terminal_deadline must equal the gate deadline")
+    end
+
+    unless is_pid(opts[:handoff]), do: gate_error(":handoff must be a pid")
+    unless is_pid(opts[:controller]), do: gate_error(":controller must be a pid")
+
+    limits =
+      case opts[:limits] do
+        %Limits{} = l -> l
+        _ -> gate_error(":limits must be a Telelem.Wire.Limits")
+      end
+
+    for {k, max} <- @gate_limit_ranges do
+      v = Map.get(limits, k)
+
+      unless is_integer(v) and v >= 1 and v <= max,
+        do: gate_error(":limits #{k} must be an integer in 1..#{max}")
+    end
+
+    limits =
+      try do
+        Limits.new(limits |> Map.from_struct() |> Map.to_list())
+      rescue
+        _ -> gate_error(":limits are inconsistent")
+      end
+
+    body = opts[:body]
+
+    unless is_binary(body) and byte_size(body) <= limits.max_request_body,
+      do: gate_error(":body must be a binary of at most max_request_body bytes")
+
+    %{target: target, deadline: deadline}
+  end
+
+  defp gate_error(msg), do: raise(ArgumentError, "Upstream gate: " <> msg)
+
+  # ── guarded owner entry (TEL-012, `Telelem.Wire.OwnerGuard`) ────────────
+
+  @go_tag :telelem_owner_go
+  @stop_tag :telelem_owner_stop
+
+  @doc false
+  # Launcher-side check of a guarded payload: gated mode only (one non-nil
+  # `:gate`), the full gated interface. Raises `ArgumentError` naming the
+  # field. Returns the pinned coordinator and the gate deadline.
+  def validate_guarded!(opts) do
+    unless mode!(opts) == :gated, do: gate_error(":gate is required")
+    %{deadline: d} = gate!(opts)
+    %{handoff: Keyword.fetch!(opts, :handoff), deadline: d}
+  end
+
+  @doc false
+  # The fixed owner entry, spawned only by `Telelem.Wire.OwnerGuard` (linked
+  # and monitored by the guard, not trapping exits). Waits for one GO carrying
+  # the exact token until the activation limit `until` (equality expires),
+  # validates the payload once against the pinned coordinator and gate
+  # deadline, then rechecks a pending stop and the limit directly before the
+  # gated attach. A scoped stop or no GO ends it without attaching. No result
+  # is sent anywhere before the attach.
+  def guarded(%{ref: ref, until: a, deadline: d, handoff: h} = meta)
+      when is_reference(ref) and is_integer(a) and is_integer(d) and a <= d and is_pid(h) and
+             map_size(meta) == 4 do
+    left = a - System.monotonic_time(:millisecond)
+
+    if left <= 0 do
+      exit({:shutdown, :expired})
+    else
+      receive do
+        {@go_tag, ^ref, opts} -> go(opts, meta)
+        {@stop_tag, ^ref} -> exit({:shutdown, :stopped})
+      after
+        min(left, @max_timeout_ms) -> guarded(meta)
+      end
+    end
+  end
+
+  def guarded(_), do: exit({:shutdown, :invalid_meta})
+
+  # One validation of the payload, pinned to this owner's coordinator and
+  # request deadline D. The pending stop and A are rechecked later, directly
+  # before the attach (`gated_attach/1`), so validation time cannot pass A.
+  defp go(opts, %{ref: ref, until: a, deadline: d, handoff: h}) do
+    gate =
+      try do
+        if mode!(opts) == :gated, do: gate!(opts)
+      rescue
+        ArgumentError -> nil
+      end
+
+    case gate do
+      %{deadline: ^d} ->
+        if Keyword.fetch!(opts, :handoff) === h,
+          do: run(opts, gate, %{token: ref, until: a}),
+          else: exit({:shutdown, :refused})
+
+      _ ->
+        exit({:shutdown, :refused})
+    end
+  end
+
+  @doc false
+  # Ordinary (legacy M1) startup only. A gated payload never runs from here:
+  # gated work is reachable only through `guarded/1`.
   def init(opts) do
+    if mode!(opts) == :gated, do: exit({:shutdown, :guarded_only})
+    run(opts, nil, nil)
+  end
+
+  # `gate` and `guard` are both nil (legacy) or both set (guarded owner).
+  defp run(opts, gate, guard) do
     %Limits{} = limits = Keyword.fetch!(opts, :limits)
 
     s = %{
       h: Keyword.fetch!(opts, :handoff),
       id: Keyword.fetch!(opts, :id),
       ctl: Keyword.fetch!(opts, :controller),
-      lane: Keyword.fetch!(opts, :lane),
-      path: Keyword.get(opts, :path, "/v1/chat/completions"),
+      lane: if(gate, do: gate_lane(gate.target), else: Keyword.fetch!(opts, :lane)),
+      path:
+        if(gate,
+          do: "/v1/chat/completions",
+          else: Keyword.get(opts, :path, "/v1/chat/completions")
+        ),
       body: Keyword.fetch!(opts, :body),
       limits: limits,
-      rec: Keyword.get(opts, :recorder),
-      rid: Keyword.get(opts, :rid),
+      rec: if(gate, do: nil, else: Keyword.get(opts, :recorder)),
+      rid: if(gate, do: nil, else: Keyword.get(opts, :rid)),
       # Absolute, shared with the coordinator; nil = legacy finish/3.
-      terminal_deadline: Keyword.get(opts, :terminal_deadline),
+      terminal_deadline: if(gate, do: gate.deadline, else: Keyword.get(opts, :terminal_deadline)),
+      # nil = legacy; else %{target:, deadline:} (see "Gated attempt").
+      gate: gate,
+      # nil, or the OwnerGuard token of a guarded owner's scoped stop.
+      stop_token: if(guard, do: guard.token),
+      # nil, or the guarded owner's activation limit A.
+      until: if(guard, do: guard.until),
       hmon: nil,
       conn: nil,
       ref: nil,
@@ -192,6 +555,10 @@ defmodule Telelem.Wire.Upstream do
       }
     }
 
+    if s.gate, do: gated_attach(s), else: legacy_attach(s)
+  end
+
+  defp legacy_attach(s) do
     case Handoff.attach(s.h, s.id) do
       {:ok, hmon} ->
         connect(%{s | hmon: hmon})
@@ -202,7 +569,128 @@ defmodule Telelem.Wire.Upstream do
     end
   end
 
+  # ── gated: attach, checks, clamps ───────────────────────────────────────
+
+  defp gate_lane(%VerifiedTarget{} = t),
+    do: %{name: t.deployment_id, host: t.host, port: t.port}
+
+  # Grant-specific attach: a coordinator without `coordinator_grant` answers
+  # {:error, :grant_required} before registering anything, so the attempt
+  # ends here, before any dial, and does not acknowledge.
+  #
+  # Guarded owners only. Directly before the real attach, after the one
+  # payload validation: a pending scoped stop, then the activation limit A
+  # (equality expires). D was pinned in go/2 and is checked on its own from
+  # here on; A <= D holds at the entry.
+  defp gated_attach(%{stop_token: tok, until: a} = s) when tok != nil and is_integer(a) do
+    if guard_stop?(s), do: exit({:shutdown, :stopped})
+    if System.monotonic_time(:millisecond) >= a, do: exit({:shutdown, :expired})
+
+    case Handoff.attach_grant(s.h, s.id, deadline: s.gate.deadline) do
+      {:ok, hmon} ->
+        s = %{s | hmon: hmon}
+
+        case check(s) do
+          :ok -> connect(s)
+          {:stop, cause} -> stop(s, {:stopped, :after_attach, cause})
+        end
+
+      {:cancel, reason} ->
+        # Registered (and maybe reserved) under this pid: acknowledge :none.
+        stop(s, {:attach, :cancel, reason})
+
+      {:error, reason} ->
+        # Not ours to acknowledge: the id may belong to another process.
+        report_end(s, {:attach, :error, reason}, :not_sent)
+    end
+  end
+
+  defp gated_attach(_), do: exit({:shutdown, :guarded_only})
+
+  # Non-blocking: a cancel or the coordinator's :DOWN already delivered, then
+  # the clock. Consumed messages end the attempt, so nothing is lost.
+  defp check(s) do
+    h = s.h
+    hmon = s.hmon
+
+    receive do
+      {@tag, ^h, {:cancel, reason}} -> {:stop, {:cancelled, reason}}
+    after
+      0 ->
+        receive do
+          {:DOWN, ^hmon, :process, _, _} -> {:stop, :handoff_down}
+        after
+          0 -> if guard_stop?(s), do: {:stop, :guard_stop}, else: clock(s)
+        end
+    end
+  end
+
+  defp clock(s), do: if(expired?(s), do: {:stop, :deadline}, else: :ok)
+
+  # A guarded owner's scoped cooperative stop, consumed without waiting.
+  defp guard_stop?(%{stop_token: nil}), do: false
+
+  defp guard_stop?(%{stop_token: tok}) do
+    receive do
+      {@stop_tag, ^tok} -> true
+    after
+      0 -> false
+    end
+  end
+
+  defp expired?(%{gate: nil}), do: false
+  defp expired?(%{gate: %{deadline: d}}), do: System.monotonic_time(:millisecond) >= d
+
+  @doc false
+  # OTP ssl applies one timeout to the TCP connect and again to the
+  # handshake: half the time left keeps both within the deadline.
+  def connect_clamp(limit_ms, deadline, now_ms),
+    do: min(limit_ms, div(max(deadline - now_ms, 0), 2))
+
+  @doc false
+  # A wait for upstream data (`base` ms) or for credit (`:infinity`).
+  def wait_clamp(base, deadline, now_ms) do
+    left = max(deadline - now_ms, 0)
+    if base == :infinity, do: left, else: min(base, left)
+  end
+
   # ── connect / dispatch ──────────────────────────────────────────────────
+
+  defp connect(%{gate: %{target: t, deadline: d}} = s) do
+    timeout = connect_clamp(s.limits.connect_timeout_ms, d, System.monotonic_time(:millisecond))
+
+    if timeout < 1 do
+      stop(s, {:stopped, :after_attach, :deadline})
+    else
+      opts = [
+        mode: :passive,
+        protocols: [:http1],
+        transport_opts:
+          VerifiedTarget.tls_opts(t) ++
+            [
+              timeout: timeout,
+              recbuf: s.limits.upstream_recbuf,
+              buffer: s.limits.upstream_read_buffer
+            ]
+      ]
+
+      case Mint.HTTP.connect(:https, t.host, t.port, opts) do
+        {:ok, conn} ->
+          s = %{s | conn: conn, sock: Mint.HTTP.get_socket(conn)}
+
+          case check(s) do
+            :ok -> dispatch(s)
+            {:stop, cause} -> stop(s, {:stopped, :after_connect, cause})
+          end
+
+        {:error, %Mint.TransportError{reason: reason}} ->
+          connect_failed(s, reason)
+
+        {:error, other} ->
+          connect_failed(s, other)
+      end
+    end
+  end
 
   defp connect(s) do
     %{host: host, port: port} = s.lane
@@ -251,8 +739,29 @@ defmodule Telelem.Wire.Upstream do
     note(s, {:connect_failed, s.lane.name, class, reason})
     # No request byte was written: the attempt's own claim is :none.
     _ = Handoff.cleaned(s.h, s.id, :none)
+    reason = if s.gate, do: public_connect_reason(reason), else: reason
     send(s.ctl, {:telelem_wire, self(), s.id, {:connect_failed, class, reason}})
     exit(:normal)
+  end
+
+  defp dispatch(%{gate: %{deadline: d}} = s) do
+    # The check right after TLS already consumed any earlier cancel/:DOWN.
+    case Handoff.begin_dispatch(s.h, s.id, deadline: d) do
+      :ok ->
+        # Permission released: exposure is possible from here, sent or not.
+        s = %{s | dispatched: true}
+
+        case check(s) do
+          :ok -> request(s)
+          {:stop, cause} -> stop(s, {:stopped, :before_request, cause})
+        end
+
+      {:cancel, reason} ->
+        stop(s, {:cancelled_before_dispatch, reason})
+
+      {:error, reason} ->
+        stop(s, {:dispatch_refused, reason})
+    end
   end
 
   defp dispatch(s) do
@@ -271,6 +780,12 @@ defmodule Telelem.Wire.Upstream do
       {:error, reason} -> stop(s, {:dispatch_refused, reason})
     end
 
+    request(s)
+  end
+
+  # The one request call site, reached at most once per attempt (`ref` is
+  # set only here, and nothing returns to the dispatch path afterwards).
+  defp request(%{ref: nil} = s) do
     headers = [
       {"content-type", "application/json"},
       {"accept", "text/event-stream"},
@@ -291,12 +806,19 @@ defmodule Telelem.Wire.Upstream do
   # ── main loop ───────────────────────────────────────────────────────────
 
   defp loop(s) do
+    # Gated: the deadline ends the attempt even while deliveries keep coming.
+    if expired?(s), do: stop(s, :deadline)
     s = s |> forward() |> maybe_end() |> maybe_arm()
     sock = s.sock
     h = s.h
     hmon = s.hmon
+    # nil outside a guarded owner: the clause below never matches then.
+    stop_tok = s.stop_token
 
     receive do
+      {@stop_tag, t} when t === stop_tok and stop_tok != nil ->
+        stop(s, :guard_stop)
+
       {:ssl, ^sock, data} = msg ->
         st = s.stats
         n = byte_size(data)
@@ -329,14 +851,23 @@ defmodule Telelem.Wire.Upstream do
         send(from, {ref, snapshot(s)})
         loop(s)
     after
-      idle_timeout(s) -> stop(s, {:upstream_timeout, s.limits.response_timeout_ms})
+      idle_timeout(s) ->
+        if expired?(s),
+          do: stop(s, :deadline),
+          else: stop(s, {:upstream_timeout, s.limits.response_timeout_ms})
     end
   end
 
   # Only time out while waiting for the upstream; waiting for credit is the
-  # downstream's business (its send timeout ends it).
-  defp idle_timeout(%{armed: true} = s), do: s.limits.response_timeout_ms
-  defp idle_timeout(_), do: :infinity
+  # downstream's business (its send timeout ends it). Gated: both waits are
+  # also bounded by the time left to the deadline.
+  defp idle_timeout(%{gate: %{deadline: d}} = s),
+    do: wait_clamp(legacy_idle_timeout(s), d, System.monotonic_time(:millisecond))
+
+  defp idle_timeout(s), do: legacy_idle_timeout(s)
+
+  defp legacy_idle_timeout(%{armed: true} = s), do: s.limits.response_timeout_ms
+  defp legacy_idle_timeout(_), do: :infinity
 
   defp on_socket(s, msg) do
     case Mint.HTTP.stream(s.conn, msg) do
@@ -516,8 +1047,15 @@ defmodule Telelem.Wire.Upstream do
   # ── downstream transfer (credit) ────────────────────────────────────────
 
   defp forward(%{role: :winner} = s) do
+    if expired?(s), do: stop(s, :deadline)
+
     case :queue.peek(s.pending) do
       {:value, {_kind, ev}} when byte_size(ev) <= s.credit ->
+        # Guarded owners: a scoped stop already delivered prevents this
+        # transfer (legacy: never matches, no receive). One arriving after
+        # this check is seen only at the next checkpoint.
+        if guard_stop?(s), do: stop(s, :guard_stop)
+
         case Handoff.transfer(s.h, ev) do
           :ok ->
             {_, q} = :queue.out(s.pending)
@@ -593,6 +1131,9 @@ defmodule Telelem.Wire.Upstream do
   end
 
   defp authorize_done(%{held_done: done, terminal: {:ok, reason}} = s) do
+    # Guarded owners: a scoped stop already delivered prevents the terminal
+    # finish; the held [DONE] is then dropped (legacy: never matches).
+    if guard_stop?(s), do: stop(s, :guard_stop)
     note(s, {:done_released, %{terminal: s.terminal}})
 
     case finish(s, {:upstream_done, reason}, done) do
@@ -735,6 +1276,12 @@ defmodule Telelem.Wire.Upstream do
 
   # ── end ─────────────────────────────────────────────────────────────────
 
+  defp stop(%{gate: g} = s, reason) when g != nil do
+    # Close first: the voluntary acknowledgement follows a closed transport.
+    if s.conn, do: Mint.HTTP.close(s.conn)
+    report_end(s, reason, Handoff.cleaned(s.h, s.id, claim(s)))
+  end
+
   defp stop(s, reason) do
     if s.conn, do: Mint.HTTP.close(s.conn)
 
@@ -754,6 +1301,144 @@ defmodule Telelem.Wire.Upstream do
     send(s.ctl, {:telelem_wire, self(), s.id, {:ended, reason, stats}})
     exit(:normal)
   end
+
+  defp claim(s), do: if(s.dispatched, do: :possible, else: :none)
+
+  # Gated end: exactly one sanitized {:ended, _, _} to the controller.
+  defp report_end(s, reason, ack) do
+    st = s.stats
+
+    st =
+      if s.rest != "",
+        do: %{st | partial_discarded: st.partial_discarded + byte_size(s.rest)},
+        else: st
+
+    ack =
+      case ack do
+        :ok -> :ok
+        :not_sent -> :not_sent
+        _ -> :error
+      end
+
+    stats = Map.merge(st, %{claim: claim(s), cleaned_ack: ack, unsent_pending: s.pending_bytes})
+    send(s.ctl, {:telelem_wire, self(), s.id, {:ended, public_reason(reason), stats}})
+    exit(:normal)
+  end
+
+  # ── gated: the controller's fixed vocabulary ────────────────────────────
+
+  @kinds [
+    # coordinator / Handoff replies and cancel reasons
+    :dispatch_deadline,
+    :admission_refused,
+    :ended,
+    :closed,
+    :cancelled,
+    :unconfirmed,
+    :handoff_down,
+    :timeout,
+    :pending,
+    :duplicate,
+    :deadline_required,
+    :grant_required,
+    :already_attached,
+    :not_attached,
+    :unknown_attempt,
+    :linked_to_handoff,
+    :not_permitted,
+    :not_winner,
+    :invalid_marker,
+    :authority_down,
+    :requester_down,
+    :lost_to,
+    :winner_down,
+    :cleanup_timeout,
+    :never_registered,
+    # gated checks
+    :deadline
+  ]
+
+  # An allowed atom, or the allowed atom heading a tuple; anything else is
+  # :other. Nothing nested is copied.
+  defp kind(k) when is_atom(k), do: if(k in @kinds, do: k, else: :other)
+  defp kind(t) when is_tuple(t) and tuple_size(t) > 0, do: t |> elem(0) |> kind()
+  defp kind(_), do: :other
+
+  @connect_kinds [
+    :econnrefused,
+    :timeout,
+    :closed,
+    :econnreset,
+    :econnaborted,
+    :ehostunreach,
+    :enetunreach,
+    :eaddrnotavail,
+    :eaddrinuse
+  ]
+
+  defp public_connect_reason(r) when is_atom(r), do: if(r in @connect_kinds, do: r, else: :other)
+  defp public_connect_reason({:tls_alert, _}), do: :tls_alert
+  defp public_connect_reason(_), do: :other
+
+  @same [
+    :finished,
+    :finish_unconfirmed,
+    :deadline,
+    :guard_stop,
+    :upstream_ended_without_done,
+    :no_semantic_content
+  ]
+
+  @first [
+    :handoff_down,
+    :dispatch_error,
+    :upstream_timeout,
+    :upstream_error_event,
+    :upstream_broken,
+    :done_without_finish_reason,
+    :unsupported_finish_reason
+  ]
+
+  @with_kind [
+    :finish_refused,
+    :cancelled_before_dispatch,
+    :dispatch_refused,
+    :cancelled,
+    :lost,
+    :ready_error,
+    :transfer_refused
+  ]
+
+  @violations [:unsupported_framing, :event_after_done, :bad_sentinel, :unsupported]
+  @stages [:after_attach, :after_connect, :before_request]
+
+  @doc false
+  def public_reason(r) when r in @same, do: r
+  def public_reason(t) when is_tuple(t) and elem(t, 0) in @first, do: elem(t, 0)
+  def public_reason({tag, r}) when tag in @with_kind, do: {tag, kind(r)}
+
+  def public_reason({:attach, how, r}) when how in [:cancel, :error], do: {:attach, how, kind(r)}
+
+  def public_reason({:stopped, stage, cause}) when stage in @stages,
+    do: {:stopped, stage, public_cause(cause)}
+
+  def public_reason({:upstream_status, code, _}) when is_integer(code) and code in 100..599,
+    do: {:upstream_status, code}
+
+  def public_reason({:upstream_status, _, _}), do: {:upstream_status, :other}
+
+  def public_reason({:protocol_violation, w}) do
+    k = if is_tuple(w) and tuple_size(w) > 0, do: elem(w, 0), else: w
+    {:protocol_violation, if(k in @violations, do: k, else: :other)}
+  end
+
+  def public_reason({:overflow, {k, _}}) when k in [:max_event, :hard_cap], do: {:overflow, k}
+  def public_reason({:overflow, _}), do: {:overflow, :other}
+  def public_reason(_), do: :other
+
+  defp public_cause({:cancelled, r}), do: {:cancelled, kind(r)}
+  defp public_cause(c) when c in [:handoff_down, :deadline, :guard_stop], do: c
+  defp public_cause(_), do: :other
 
   defp snapshot(s) do
     %{

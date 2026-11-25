@@ -1,0 +1,4 @@
+#!/bin/bash
+# Foreground route-store startup after a boot-input preflight; never provisions, opens
+# no listener and dials nothing. See scripts/route-store/launch.
+exec "$(dirname "${BASH_SOURCE[0]}")/launch" boot-validated "$@"

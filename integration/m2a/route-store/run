@@ -5,7 +5,7 @@
 # disposable host directories.
 #
 #   integration/m2a/route-store/run                     # exit 0 PASS · 1 FAIL · 2 prerequisite missing
-#   integration/m2a/route-store/run --cleanup-selftest  # only case 0 (stubbed docker; no daemon needed)
+#   integration/m2a/route-store/run --cleanup-selftest  # only cases 0 and 0b (stubbed docker; no daemon needed)
 #
 # Every store is a fresh `mktemp -d` directory (mode 700) that is removed on exit.
 # Readiness and acknowledgements are JSON lines read from the writer's stdout through
@@ -61,7 +61,7 @@ python3 -I -c 'import os, signal; os.pidfd_open(os.getpid()); signal.pidfd_send_
   prereq "python3 >= 3.9 with os.pidfd_open (kernel >= 5.3)"
 [[ -r $HERE/supervise ]] || prereq "$HERE/supervise"
 if ((!SELFTEST_ONLY)); then
-  for x in "$RS/provision" "$RS/start" "$RS/launch" "$WRAP"; do [[ -x $x ]] || prereq "executable $x"; done
+  for x in "$RS/provision" "$RS/start" "$RS/boot-validated" "$RS/launch" "$WRAP"; do [[ -x $x ]] || prereq "executable $x"; done
   command -v docker >/dev/null 2>&1 || prereq "docker CLI"
   docker info >/dev/null 2>&1 || prereq "a reachable docker daemon for the invoking user"
   docker image inspect "$IMAGE" >/dev/null 2>&1 || prereq "runner image $IMAGE (scripts/setup)"
@@ -691,10 +691,98 @@ cleanup_selftest() (
   exit "$fails"
 )
 
+# --- case 0b: the launcher's docker argv (stubbed docker CLI; no container) ---------------
+# Runs the real scripts/route-store/launch with a `docker` executable first on PATH that
+# answers `image inspect` from STUB_ID/STUB_VOLS and, for `run`, only records its argv
+# (NUL-separated) and exits 0. Nothing is created and no daemon is contacted.
+launcher_selftest() (
+  trap - EXIT INT TERM HUP
+  local d="$BASE/lsel" fails=0 a=() rc i img n
+  mkdir -m 700 "$d" "$d/bin" "$d/store" "$d/boot" "$d/b,x"
+  cat >"$d/bin/docker" <<'STUB'
+#!/bin/bash
+case "${1-} ${2-}" in
+  "image inspect")
+    case ${3-} in
+      --format)
+        case $4 in
+          '{{.Id}}') printf '%s\n' "$STUB_ID" ;;
+          '{{json (index .Config "Volumes")}}') printf '%s\n' "$STUB_VOLS" ;;
+          *) exit 1 ;;
+        esac ;;
+      *) exit 0 ;;
+    esac ;;
+  "run "*) shift; printf '%s\0' "$@" >"$STUB_ARGV" ;;
+  *) exit 1 ;;
+esac
+STUB
+  chmod 700 "$d/bin/docker"
+  ck() { if [[ $2 == "$3" ]]; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s (got %s, want %s)\n' "$1" "'$2'" "'$3'"; fails=$((fails + 1)); fi; }
+  img="sha256:$(printf 'a%.0s' {1..64})"
+  # lrun ENV... -- LAUNCH ARGS...: -> rc, $d/err, and the recorded argv in a=().
+  lrun() {
+    local e=()
+    while [[ $1 != -- ]]; do e+=("$1"); shift; done
+    shift
+    rm -f "$d/argv"
+    env -u TELELEM_IMAGE PATH="$d/bin:$PATH" STUB_ID="$img" STUB_ARGV="$d/argv" "${e[@]}" "$RS/launch" "$@" >/dev/null 2>"$d/err"
+    rc=$?
+    a=()
+    [[ -e $d/argv ]] && mapfile -d '' a <"$d/argv"
+  }
+  BVL=(boot-validated --store "$d/store" --boot "$d/boot" --image-id "$img" --manifest-sha256 "$(printf 'b%.0s' {1..64})"
+    --tenant local --route chat --container-name telelem-rs-lsel)
+  lrun STUB_VOLS='{"/data":{}}' -- "${BVL[@]}"
+  ck "launch: an approved image that declares VOLUME paths is refused (exit 2), no docker run" \
+    "$rc $(grep -c 'declares VOLUME paths' "$d/err") ${#a[@]}" "2 1 0"
+  lrun STUB_VOLS='{}' -- "${BVL[@]}"
+  ck "launch: an empty VOLUME map is accepted" "$rc $((${#a[@]} > 0))" "0 1"
+  lrun STUB_VOLS=null -- "${BVL[@]}"
+  ck "launch: no VOLUME config: docker run is called" "$rc $((${#a[@]} > 0))" "0 1"
+  local mounts=() vs=0 ent= hc=0 at=-1
+  for ((i = 0; i < ${#a[@]}; i++)); do
+    case ${a[i]} in
+      --mount) mounts+=("${a[i + 1]}") ;;
+      -v | --volume) vs=$((vs + 1)) ;;
+      --entrypoint) ent=${a[i + 1]} ;;
+      --no-healthcheck) hc=1 ;;
+    esac
+    [[ ${a[i]} == "$img" && $at == -1 ]] && at=$i
+  done
+  n=0
+  for i in "${mounts[@]}"; do [[ $i == type=bind,source=/*,target=/*,bind-recursive=disabled,bind-propagation=private ]] && n=$((n + 1)); done
+  ck "launch: 13 binds, each non-recursive and private, no -v" "${#mounts[@]} $n $vs" "13 13 0"
+  n=$(printf '%s\n' "${mounts[@]}" | grep -c ',readonly,')
+  ck "launch: 12 of them read-only; only /sbx/store is writable" \
+    "$n $(printf '%s\n' "${mounts[@]}" | grep -v ',readonly,' | sed -E 's/.*,target=([^,]*),.*/\1/')" "12 /sbx/store"
+  ck "launch: the boot dir is bound read-only at /sbx/boot" \
+    "$(printf '%s\n' "${mounts[@]}" | grep -c "^type=bind,source=$d/boot,target=/sbx/boot,readonly,")" 1
+  ck "launch: ENTRYPOINT replaced by /usr/bin/env, HEALTHCHECK disabled" "$ent $hc" "/usr/bin/env 1"
+  ck "launch: the image is the approved ID, followed by -i and the fixed env list" \
+    "$at ${a[*]:at+1:9}" \
+    "$at -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 ERL_INETRC=/opt/route-store/inetrc ERL_CRASH_DUMP_SECONDS=0 /bin/sh /opt/route-store/entry.sh boot-validated"
+  lrun STUB_VOLS=null -- boot-validated --store "$d/store" --boot "$d/b,x" --image-id "$img" \
+    --manifest-sha256 "$(printf 'b%.0s' {1..64})" --tenant local --route chat
+  ck "launch: a mount source with a comma is refused (exit 2), no docker run" \
+    "$rc $(grep -c 'contains a comma' "$d/err") ${#a[@]}" "2 1 0"
+  # Legacy start: the same argv shape as before boot-validated existed (-v binds, image
+  # then /bin/sh entry.sh start ...).
+  lrun -- start --store "$d/store" --tenant local --route chat --container-name telelem-rs-lsel
+  ck "launch start (unchanged): -v binds only, no --mount/--entrypoint/--no-healthcheck" \
+    "$rc $(printf '%s\n' "${a[@]}" | grep -cx -e '--mount' -e '--entrypoint' -e '--no-healthcheck') $(printf '%s\n' "${a[@]}" | grep -cx -- -v)" "0 0 8"
+  ck "launch start (unchanged): ends with the image, /bin/sh entry.sh start and its args" \
+    "${a[*]: -8}" "telelem-mix:elixir-1.20.5-otp-28.5.0.8-hex-2.7.0 /bin/sh /opt/route-store/entry.sh start --tenant local --route chat"
+  ((fails > 100)) && fails=100
+  exit "$fails"
+)
+
 # =========================================================================================
 echo "# 0. cleanup ownership (stubbed docker) and the process supervisor (own children only)"
 cleanup_selftest
 expect "case 0: every check above held" "$?" 0
+echo "# 0b. launcher argv for boot-validated and start (stubbed docker CLI; nothing runs)"
+launcher_selftest
+expect "case 0b: every check above held" "$?" 0
 if ((SELFTEST_ONLY)); then
   echo
   echo "passed $PASS, failed $FAIL"
@@ -922,6 +1010,231 @@ out=$(timeout -k 5 "$T" docker run --rm --name "$n" --label telelem.route-store=
 rc=$?
 expect "main.exs without the wrapper's lock exits 4" "$rc $(grep -c 'does not hold the store lock' <<<"$out")" "4 1"
 expect "store untouched (interrupted temp not removed or promoted)" "$(snapshot "$STORE")" "$before"
+
+echo "# 8. boot-validated: approved image ID, closed boot inputs, then the same lock/FileStore path"
+# The suite's approval is the ID of the runner image it already uses, read once here.
+IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)
+[[ $IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]] || abort "cannot read the runner image ID"
+NB=0
+# new_boot -> BOOT: fresh, empty staging dir (mode 700) next to the stores.
+new_boot() { NB=$((NB + 1)); BOOT="$BASE/b$NB"; mkdir -m 700 "$BOOT"; }
+# boot_fixture DIR: generate throwaway boot inputs into DIR inside the runner image
+# (offline, registered like case 7), -> BSHA (manifest digest).
+boot_fixture() {
+  cname "fx$NB" test "$1"
+  BSHA=$(timeout -k 5 "$T" docker run --rm --pull never --name "$CNAME" --label telelem.route-store=test \
+    --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 -e HOME=/tmp -v "$HERE/boot_fixture.exs:/opt/fx.exs:ro" \
+    -v "$1:/sbx/store" "$IMAGE_ID" elixir /opt/fx.exs /sbx/store local 2>/dev/null)
+  [[ $BSHA =~ ^[0-9a-f]{64}$ ]] || abort "boot fixture generation failed in $1"
+}
+# remanifest DIR: rewrite DIR/manifest.json's per-role bytes/sha256 for the files now in
+# DIR (so a later check is reached), -> BSHA.
+REMAN_PY='import hashlib, json, os, sys
+d = sys.argv[1]
+names = {"bootstrap": "bootstrap.json", "fixture_ca": "fixture-ca.pem",
+         "downstream_cert": "downstream-cert.pem", "downstream_key": "downstream-key.pem"}
+p = os.path.join(d, "manifest.json")
+m = json.load(open(p))
+for role, n in names.items():
+    b = open(os.path.join(d, n), "rb").read()
+    m["files"][role] = {"bytes": len(b), "sha256": hashlib.sha256(b).hexdigest()}
+out = json.dumps(m, separators=(",", ":")).encode()
+open(p, "wb").write(out)
+print(hashlib.sha256(out).hexdigest())'
+remanifest() { BSHA=$(python3 -I -c "$REMAN_PY" "$1"); }
+copy_boot() { new_boot; cp -p -- "$1"/* "$BOOT"/; } # SRC -> BOOT (a copy of SRC's five files)
+BV=(--image-id "$IMAGE_ID" --tenant local --route chat)
+# Every boot-validated refusal is fixed text: at most one stdout event and stderr lines
+# that all start with "route-store: " (no raw errors, stack traces or crash reports),
+# and no key material anywhere.
+KEYB64=
+fixed_output() {
+  local bad
+  bad=$(grep -cv '^route-store: ' <<<"$ERR")
+  [[ -z $ERR ]] && bad=0
+  printf '%s %s %s' "$(grep -c . <<<"$OUT")" "$bad" \
+    "$(grep -cF -e "PRIVATE KEY" ${KEYB64:+-e "$KEYB64"} <<<"$OUT$ERR")"
+}
+
+new_store
+BS=$STORE
+run_cmd bv-prov provision "$BS" "${PROV_ARGS[@]}"
+expect "control: provision a store for boot-validated" "$RC" 0
+new_boot
+GOOD=$BOOT
+boot_fixture "$GOOD"
+GOODSHA=$BSHA
+KEYB64=$(sed -n 2p "$GOOD/downstream-key.pem")
+before=$(snapshot "$BS")
+
+# 8a. Launcher refusals: before any container, store untouched.
+lr() { # NAME EXPECTED_STDERR_FRAGMENT ARGS... (env may be prefixed by the caller)
+  local n=$1 frag=$2
+  shift 2
+  run_cmd "$n" boot-validated "$BS" --boot "$GOOD" --manifest-sha256 "$GOODSHA" "$@"
+  expect "launcher refuses ($n): exit 2, '$frag', no container, store unchanged" \
+    "$RC $(grep -cF -- "$frag" <<<"$ERR") $(if ps_ids "name=^${CNAME}\$"; then echo "${IDS:-none}"; else echo "lookup failed"; fi) $(snapshot "$BS")" \
+    "2 1 none $before"
+}
+lr bv-tag "full local image ID" --image-id "$IMAGE" --tenant local --route chat
+lr bv-unknown "not present locally" --image-id "sha256:$(printf '1%.0s' {1..64})" --tenant local --route chat
+lr bv-harness "takes only" "${BV[@]}" --harness-control
+lr bv-dup "given twice" "${BV[@]}" --tenant local
+TELELEM_IMAGE=x lr bv-envimg "TELELEM_IMAGE is not used" "${BV[@]}"
+mkdir -m 700 "$BS/inner"
+run_cmd bv-overlap boot-validated "$BS" --boot "$BS/inner" --manifest-sha256 "$GOODSHA" "${BV[@]}"
+expect "launcher refuses a boot dir inside the store (exit 2)" "$RC $(grep -c 'must not overlap --store' <<<"$ERR")" "2 1"
+rmdir "$BS/inner"
+
+# 8b. Positive: ready only after every check, as PID 1 holding the lock; SIGTERM stops.
+cname bv-w1 boot-validated "$BS"
+WNAME=$CNAME
+d="$BASE/w-bv1"
+mkdir "$d" && mkfifo "$d/out"
+exec {WOUT}<>"$d/out"
+WIN=
+spawn "$WNAME" -- "$RS/boot-validated" --container-name "$WNAME" --store "$BS" --boot "$GOOD" \
+  --manifest-sha256 "$GOODSHA" "${BV[@]}" </dev/null >&"$WOUT" 2>"$d/err" || abort "boot-validated writer not started: $WHY"
+event
+expect "boot-validated ready: mode, rev 1, manifest digest, deployments a,b" \
+  "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["mode"]') $(jget "$LINE" 'd["record"]["rev"]') $(jget "$LINE" 'd["boot"]["manifest_sha256"]') $(jget "$LINE" '",".join(d["boot"]["deployments"])')" \
+  "ready boot_validated 1 $GOODSHA a,b"
+expect "ready reports the manifested fixture CA digest" "$(jget "$LINE" 'd["boot"]["fixture_ca_sha256"]')" \
+  "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"]["fixture_ca"]["sha256"])' "$GOOD/manifest.json")"
+expect "ready line carries no key material" "$(grep -cF -e "PRIVATE KEY" -e "$KEYB64" <<<"$LINE")" 0
+verify_writer "$WNAME" "$BS" boot-validated || abort "verify the boot-validated writer: $WHY"
+ok "boot-validated writer verified: beam.smp as PID 1 (host pid $VPID) holding the store lock"
+INSPECT_PY='import json, sys
+c = json.load(sys.stdin)[0]
+h = c["HostConfig"]
+ms = sorted((m["Destination"], m["Type"], m["RW"], m.get("Propagation")) for m in c["Mounts"])
+nonrec = all((m.get("BindOptions") or {}).get("NonRecursive") is True for m in h.get("Mounts") or [])
+src = ["boundary", "plan_digest", "file_store", "revision", "path_policy", "id", "bindings", "verified_target", "bootstrap"]
+want = sorted([("/opt/telelem/src/%s.ex" % s, "bind", False, "private") for s in src] +
+  [("/opt/route-store", "bind", False, "private"), ("/opt/lock/with-route-store-lock", "bind", False, "private"),
+   ("/sbx/boot", "bind", False, "private"), ("/sbx/store", "bind", True, "private")])
+env = c["Config"]["Env"] or []
+cmd = c["Config"]["Cmd"] or []
+hc = (c["Config"].get("Healthcheck") or {}).get("Test")
+ok = [c["Image"] == sys.argv[1], h["NetworkMode"] == "none", h["LogConfig"]["Type"] == "none",
+      h["ReadonlyRootfs"] is True, h["CapDrop"] == ["ALL"], ms == want, nonrec,
+      len(h.get("Mounts") or []) == len(want), not h.get("Binds"),
+      c["Config"].get("Entrypoint") == ["/usr/bin/env"], cmd[:1] == ["-i"], hc == ["NONE"],
+      not any("KEY" in a for a in cmd),
+      not any(k in e for e in env for k in ("KEY", "SECRET", "TOKEN"))]
+print("ok" if all(ok) else "mismatch %r %r" % (ok, ms))'
+expect "docker inspect: approved ID, network none, log none, ro rootfs, closed non-recursive private binds, entrypoint env -i, no healthcheck, no key in env/argv" \
+  "$(docker inspect "$CID" 2>/dev/null | python3 -I -c "$INSPECT_PY" "$IMAGE_ID")" ok
+run_cmd bv-busy boot-validated "$BS" --boot "$GOOD" --manifest-sha256 "$GOODSHA" "${BV[@]}"
+expect "second boot-validated against the running store: busy 75" "$RC $(grep -c '^with-route-store-lock: busy' <<<"$ERR")" "75 1"
+run_cmd bv-busy-start start "$BS" --tenant local --route chat
+expect "start against the running boot-validated store: busy 75, store unchanged" "$RC $(snapshot "$BS")" "75 $before"
+client_sig TERM
+event
+expect "SIGTERM: orderly stop event" "$(jget "$LINE" 'd["event"]') $(jget "$LINE" 'd["reason"]')" "stopped sigterm"
+writer_wait
+expect "boot-validated exit 0, nothing on stderr, nothing holds the store, record unchanged" \
+  "$WAIT_RC $(wc -c <"$d/err") $(holders_of "$BS") $(snapshot "$BS")" "0 0  $before"
+exec {WOUT}>&-
+
+# 8c. Fail closed: exit 5 before any FileStore call, one fixed error event, store unchanged.
+bv_refused() { # NAME BOOT SHA WANT_CODE [ARGS...]
+  local n=$1 b=$2 s=$3 code=$4 args
+  shift 4
+  if (($#)); then args=("$@"); else args=("${BV[@]}"); fi
+  run_cmd "$n" boot-validated "$BS" --boot "$b" --manifest-sha256 "$s" "${args[@]}"
+  expect "boot refused ($n): exit 5, $code, store unchanged" \
+    "$RC $(jget "$OUT" 'd["event"]+"/"+d["op"]+"/"+d["reason"]') $(snapshot "$BS")" "5 error/boot/$code $before"
+  expect "boot refused ($n): fixed output (1 event, only route-store: lines, no key)" "$(fixed_output)" "1 0 0"
+}
+bv_refused bv-digest "$GOOD" "$(printf '0%.0s' {1..64})" manifest_digest_mismatch
+bv_refused bv-tenant "$GOOD" "$GOODSHA" manifest_tenant --image-id "$IMAGE_ID" --tenant other --route chat
+copy_boot "$GOOD"
+cp -- "$BS/route.rec" "$BOOT/route.rec"
+bv_refused bv-routerec "$BOOT" "$GOODSHA" boot_dir_not_closed
+copy_boot "$GOOD"
+sed -i 's/18443/18445/' "$BOOT/bootstrap.json"
+bv_refused bv-tamper "$BOOT" "$GOODSHA" file_digest_mismatch
+copy_boot "$GOOD"
+sed -i 's/"tenant_id":"local"/"tenant_id":"other"/' "$BOOT/bootstrap.json"
+remanifest "$BOOT"
+bv_refused bv-bstenant "$BOOT" "$BSHA" bootstrap_tenant
+copy_boot "$GOOD"
+OTHER=$BOOT
+boot_fixture "$OTHER"
+copy_boot "$GOOD"
+cp -- "$OTHER/downstream-key.pem" "$BOOT/downstream-key.pem"
+remanifest "$BOOT"
+bv_refused bv-keymismatch "$BOOT" "$BSHA" downstream_key_mismatch
+copy_boot "$GOOD"
+chmod 644 "$BOOT/downstream-key.pem"
+bv_refused bv-keymode "$BOOT" "$GOODSHA" file_mode
+
+# 8d. Boot checks pass on an unprovisioned store: FileStore refuses, fixed text.
+new_store
+before=$(snapshot "$STORE")
+run_cmd bv-unprov boot-validated "$STORE" --boot "$GOOD" --manifest-sha256 "$GOODSHA" "${BV[@]}"
+expect "boot-validated never provisions: exit 3 not_provisioned, store still empty" \
+  "$RC $(jget "$OUT" 'd["op"]+"/"+d["reason"]') $(snapshot "$STORE")" "3 start/not_provisioned $before"
+
+# 8e. In-container checks, reached by bypassing the launcher (as case 7 does): the same
+# docker run as `launch boot-validated` (case 0b shows its argv), with one thing changed
+# per run.
+bv_direct() { # NAME STORE RS_DIR EXTRA_ENV BOOT_MOUNT_MODE(ro|rw) [EXTRA docker args...] -> RC OUT ERR
+  local n st=$2 rsd=$3 xenv=$4 bmode=$5 m=() f nr=bind-recursive=disabled,bind-propagation=private
+  cname "$1" test "$st"
+  n=$CNAME
+  shift 5
+  for f in ops/boundary.ex ops/plan_digest.ex ops/file_store.ex route/revision.ex sandbox/path_policy.ex \
+    sandbox/id.ex sandbox/bindings.ex sandbox/verified_target.ex sandbox/bootstrap.ex; do
+    m+=(--mount "type=bind,source=$ROOT/lib/telelem/$f,target=/opt/telelem/src/${f##*/},readonly,$nr")
+  done
+  m+=(--mount "type=bind,source=$rsd,target=/opt/route-store,readonly,$nr")
+  m+=(--mount "type=bind,source=$WRAP,target=/opt/lock/with-route-store-lock,readonly,$nr")
+  if [[ $bmode == ro ]]; then
+    m+=(--mount "type=bind,source=$GOOD,target=/sbx/boot,readonly,$nr")
+  else
+    m+=(--mount "type=bind,source=$GOOD,target=/sbx/boot,$nr")
+  fi
+  m+=(--mount "type=bind,source=$st,target=/sbx/store,$nr")
+  timeout -k 5 "$T" docker run --rm --pull never --log-driver none --name "$n" --label telelem.route-store=test \
+    --network none --read-only --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+    --workdir / --no-healthcheck --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 "${m[@]}" "$@" \
+    --entrypoint /usr/bin/env "$IMAGE_ID" -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp LANG=C.UTF-8 \
+    ERL_INETRC=/opt/route-store/inetrc ERL_CRASH_DUMP_SECONDS=0 $xenv \
+    /bin/sh /opt/route-store/entry.sh boot-validated --tenant local --route chat --manifest-sha256 "$GOODSHA" \
+    >"$BASE/out" 2>"$BASE/err"
+  RC=$?
+  OUT=$(<"$BASE/out") ERR=$(<"$BASE/err")
+}
+# Control: unchanged, on the unprovisioned store of 8d, every boot check passes and
+# FileStore refuses (so the command ends by itself; a ready writer would not).
+bv_direct bv-direct-control "$STORE" "$RS" "" ro </dev/null
+expect "control: the direct command passes every boot check (exit 3 not_provisioned)" \
+  "$RC $(jget "$OUT" 'd["op"]+"/"+d["reason"]')" "3 start/not_provisioned"
+before=$(snapshot "$BS")
+# d_refused NAME WHO CODE: exit 5, one fixed line from WHO (entry: stderr only, no BEAM
+# event; beam: the error event), store unchanged.
+d_refused() {
+  local got
+  if [[ $2 == entry ]]; then got="$RC ${OUT:-none} $ERR"; else got="$RC $(jget "$OUT" 'd["op"]+"/"+d["reason"]')"; fi
+  local want="5 none route-store: boot refused: $3"
+  [[ $2 == beam ]] && want="5 boot/$3"
+  expect "$1: refused $3 (exit 5), store unchanged" "$got $(snapshot "$BS")" "$want $before"
+  expect "$1: fixed output (only route-store: lines, no key)" "$(fixed_output | cut -d' ' -f2-)" "0 0"
+}
+bv_direct bv-env "$BS" "$RS" "ERL_AFLAGS=-noinput" ro </dev/null
+d_refused "extra env var before any BEAM" entry entry_env_unexpected
+mkdir -m 700 "$BASE/rs-alt"
+cp -p -- "$RS"/* "$BASE/rs-alt/"
+printf '{lookup, [native]}.\n' >>"$BASE/rs-alt/inetrc"
+bv_direct bv-resolver "$BS" "$BASE/rs-alt" "" ro </dev/null
+d_refused "resolver file not the pinned bytes, before any BEAM" entry entry_resolver_unpinned
+bv_direct bv-extramount "$BS" "$RS" "" ro -v "$GOOD:/opt/extra:ro" </dev/null
+d_refused "an extra read-only mount, before any BEAM (entry.sh mountinfo check)" entry entry_mount_unexpected
+bv_direct bv-bootrw "$BS" "$RS" "" rw </dev/null
+d_refused "the boot dir mounted writable, before any BEAM (entry.sh mountinfo check)" entry entry_mount_app_mode
 
 echo
 echo "passed $PASS, failed $FAIL"
