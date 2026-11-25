@@ -138,6 +138,130 @@ defmodule Telelem.Admission.CoordinatorGrantTest do
     assert Authority.snapshot(ctx.auth).grants == %{}
   end
 
+  # Every bounded wait is `deadline + grace`, and one wait is at most
+  # 2^32 - 1 ms. "Beyond" cases sit 60 s past the bound so the time the test
+  # itself takes cannot move them back inside it; "at" cases use the test's
+  # own `now`, which the code's later clock can only make shorter.
+  @max_wait 4_294_967_295
+  @beyond [Handoff.max_deadline_ahead_ms() + 60_000, @max_wait, 1_000_000_000_000_000]
+
+  test "the shared deadline bound: 2^32 - 1 ms minus the grace" do
+    assert Handoff.max_deadline_ahead_ms() == @max_wait - @grace
+    assert Handoff.max_deadline_ahead_ms() == 4_294_966_295
+    n = now()
+    assert Handoff.deadline_in_range?(n + 4_294_966_295, n)
+    refute Handoff.deadline_in_range?(n + 4_294_966_296, n)
+    # A past deadline is in range: its expiry handling is unchanged.
+    assert Handoff.deadline_in_range?(n - 1_000_000_000_000_000, n)
+  end
+
+  test "grant mode refuses a deadline beyond the bound at start; legacy and past deadlines start",
+       ctx do
+    req = idle()
+
+    grant = fn d ->
+      Handoff.start(
+        requester: req,
+        attempts: [:primary],
+        admission_authority: ctx.auth,
+        terminal_deadline: d,
+        coordinator_grant: {:one_primary, @units}
+      )
+    end
+
+    {:links, links} = Process.info(self(), :links)
+
+    for ahead <- @beyond do
+      assert {:error, {:bad_option, :terminal_deadline}} = grant.(now() + ahead), inspect(ahead)
+    end
+
+    # Legacy admission mode (no coordinator_grant) is not range-checked.
+    # (Unchanged and not covered: a deadline past the VM's timer range, such
+    # as the last @beyond value, still fails its init in send_after/4.)
+    for ahead <- Enum.take(@beyond, 2) do
+      {:ok, legacy} =
+        Handoff.start(
+          requester: req,
+          attempts: [:primary],
+          admission_authority: ctx.auth,
+          terminal_deadline: now() + ahead
+        )
+
+      refute Map.has_key?(Handoff.status(legacy), :grant)
+      Process.exit(legacy, :kill)
+    end
+
+    assert {:links, ^links} = Process.info(self(), :links)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+
+    # At the bound: starts, and attach_grant's deadline + grace wait does not
+    # overflow; the grant is reserved for the caller.
+    d = now() + Handoff.max_deadline_ahead_ms()
+    {:ok, h} = grant.(d)
+    on_exit(fn -> Process.exit(h, :kill) end)
+    me = self()
+    assert {:ok, _} = Handoff.attach_grant(h, :primary, deadline: d)
+    assert %{grant: :reserved, attempts: %{primary: %{pid: ^me}}} = Handoff.status(h)
+
+    assert [{_, %{owner: ^me, state: :reserved}}] =
+             Map.to_list(Authority.snapshot(ctx.auth).grants)
+
+    # A past deadline still starts; its own deadline timer ends the request
+    # (no grant was reserved), and attach_grant then takes the existing typed
+    # path for a gone coordinator: not refused by the bound, no raise.
+    pd = now() - 1
+    {:ok, past} = grant.(pd)
+    pmon = Process.monitor(past)
+    assert_receive {:DOWN, ^pmon, :process, ^past, _}, @t
+    assert Handoff.attach_grant(past, :primary, deadline: pd) == {:error, :handoff_down}
+  end
+
+  test "attach_grant/3, attach/3, begin_dispatch/3 and finish/4 refuse a distant deadline in the caller, before any call",
+       ctx do
+    req = idle()
+    d = now() + 60_000
+
+    {:ok, h} =
+      Handoff.start(
+        requester: req,
+        attempts: [:primary],
+        admission_authority: ctx.auth,
+        terminal_deadline: d,
+        coordinator_grant: {:one_primary, @units},
+        trace: self(),
+        register_timeout: 60_000
+      )
+
+    on_exit(fn -> Process.exit(h, :kill) end)
+    before = Handoff.status(h)
+    {:monitors, mons} = Process.info(self(), :monitors)
+
+    for ahead <- @beyond do
+      far = now() + ahead
+
+      for f <- [
+            fn -> Handoff.attach_grant(h, :primary, deadline: far) end,
+            fn -> Handoff.attach(h, :primary, deadline: far) end,
+            fn -> Handoff.begin_dispatch(h, :primary, deadline: far) end,
+            fn -> Handoff.finish(h, :t, @marker, deadline: far) end
+          ] do
+        e = assert_raise ArgumentError, f
+        assert e.message =~ ":deadline must be at most 4294966295 ms ahead of now"
+      end
+    end
+
+    # Nothing reached the coordinator: no trace, no registration, no grant,
+    # and no monitor left behind in the caller.
+    assert Handoff.status(h) == before
+    refute_received {:telelem_handoff_trace, ^h, _}
+    assert {:monitors, ^mons} = Process.info(self(), :monitors)
+    assert Authority.snapshot(ctx.auth).grants == %{}
+
+    # The same coordinator still serves an in-range deadline.
+    assert {:ok, _} = Handoff.attach_grant(h, :primary, deadline: d)
+    assert %{grant: :reserved} = Handoff.status(h)
+  end
+
   # ── happy path ──────────────────────────────────────────────────────────
 
   test "reserve for the attached pid before connect, authorize after it, one permission, one send, marker, nothing private outward",

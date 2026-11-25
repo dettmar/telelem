@@ -8,8 +8,8 @@ defmodule Telelem.WireUpstreamGateTest do
   `{:connect_failed, _, _}` message, which each case refutes).
 
   What this covers: the closed option interface (refused in the caller, no
-  process spawned) including a duplicate `:gate` and the gated numeric limit
-  ranges, the grant-specific attach (`Handoff.attach_grant/3`: a typed
+  process spawned) including a duplicate `:gate`, the gated numeric limit
+  ranges and Handoff's shared deadline bound, the grant-specific attach (`Handoff.attach_grant/3`: a typed
   `:grant_required` refusal from a coordinator without `coordinator_grant`,
   `[:primary]` included, with nothing changed), legacy defaults and ordinary
   attach, the pure timeout clamps and the
@@ -110,6 +110,15 @@ defmodule Telelem.WireUpstreamGateTest do
       tampered_digest: Keyword.put(good, :gate, target: %{t | ca_sha256: ["00"]}, deadline: d),
       ipv6: Keyword.put(good, :gate, target: v6, deadline: d),
       other_deadline: Keyword.put(good, :terminal_deadline, d + 1),
+      # Beyond Handoff's shared bound (2^32 - 1 - grace ms ahead), with 60 s
+      # of margin so the test's own runtime cannot bring it back in range.
+      distant_deadline:
+        Keyword.put(good, :gate,
+          target: t,
+          deadline: now() + Handoff.max_deadline_ahead_ms() + 60_000
+        ),
+      overflow_deadline: Keyword.put(good, :gate, target: t, deadline: now() + 4_294_967_295),
+      huge_deadline: Keyword.put(good, :gate, target: t, deadline: now() + 1_000_000_000_000_000),
       handoff_not_pid: Keyword.put(good, :handoff, :name),
       controller_not_pid: Keyword.put(good, :controller, nil),
       limits_map: Keyword.put(good, :limits, Map.from_struct(l)),
@@ -239,6 +248,55 @@ defmodule Telelem.WireUpstreamGateTest do
                    @t
 
     refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
+  end
+
+  test "a gate deadline at the shared bound, or already past, spawns; attach_grant's wait does not overflow",
+       ctx do
+    {:ok, h} = Handoff.start(requester: idle(), attempts: [:primary])
+    on_exit(fn -> Process.exit(h, :kill) end)
+
+    # The test's `now` is not later than the caller's check, so `at` is at
+    # most the bound ahead there and inside the attempt.
+    for d <- [now() + Handoff.max_deadline_ahead_ms(), now() - 1] do
+      {:ok, up} =
+        Upstream.start_link(
+          handoff: h,
+          id: :primary,
+          controller: self(),
+          body: "{}",
+          limits: Limits.new(),
+          gate: [target: ctx.target, deadline: d]
+        )
+
+      assert_receive {:telelem_wire, ^up, :primary,
+                      {:ended, {:attach, :error, :grant_required}, _}},
+                     @t
+
+      refute_received {:telelem_wire, ^up, _, {:connect_failed, _, _}}
+    end
+  end
+
+  test "legacy deadlines are not range-checked: a distant legacy :terminal_deadline still spawns",
+       ctx do
+    {:ok, h} = Handoff.start(requester: idle(), attempts: [:other])
+    on_exit(fn -> Process.exit(h, :kill) end)
+    lane = %{name: "a", host: "127.0.0.1", port: 1, cacerts: [ctx.der]}
+
+    {:ok, up} =
+      Upstream.start_link(
+        handoff: h,
+        id: :primary,
+        controller: self(),
+        lane: lane,
+        body: "{}",
+        limits: Limits.new(),
+        terminal_deadline: now() + 1_000_000_000_000_000
+      )
+
+    mon = Process.monitor(up)
+    # Attach refused (unknown id): legacy ends silently, before any dial.
+    assert_receive {:DOWN, ^mon, :process, _, :normal}, @t
+    refute_received {:telelem_wire, ^up, _, _}
   end
 
   test "legacy limits are not range-checked: a legacy attempt still spawns with them", ctx do

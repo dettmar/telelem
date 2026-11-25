@@ -352,6 +352,20 @@ defmodule Telelem.Handoff do
   # How long past the shared deadline finish/3 waits for the decision before
   # fencing the coordinator (scheduling slack, not policy).
   @decision_grace 1_000
+  # The longest wait `receive ... after` / `GenServer.call/3` accept is
+  # 2^32 - 1 ms. A caller's bound is `deadline + grace`, so a deadline is
+  # usable only while at most this far ahead of now; every later wait for it
+  # is shorter.
+  @max_deadline_ahead 4_294_967_295 - @decision_grace
+
+  @doc false
+  # The shared safe bound (ms): a deadline more than this far ahead of
+  # `System.monotonic_time(:millisecond)` is refused. Past deadlines are not.
+  def max_deadline_ahead_ms, do: @max_deadline_ahead
+
+  @doc false
+  def deadline_in_range?(d, now \\ System.monotonic_time(:millisecond)) when is_integer(d),
+    do: d - now <= @max_deadline_ahead
 
   @type attempt_id :: term()
   @type charge :: :none | :possible
@@ -392,7 +406,10 @@ defmodule Telelem.Handoff do
       `:never_registered`.
     * `:coordinator_grant`. Default `nil`. `{:one_primary, units}` opts in to
       "Coordinator grant". Requires `:admission_authority`,
-      `:terminal_deadline` and `attempts: [:primary]` exactly.
+      `:terminal_deadline` and `attempts: [:primary]` exactly. A
+      `:terminal_deadline` more than `2^32 - 1 - 1000` ms (4_294_966_295)
+      ahead of now stops with `{:bad_option, :terminal_deadline}` before
+      any timer is armed; a past one is accepted.
     * `:receipts`. Default `nil`. `[store:, producer:, store_mode:, meta:]` opts in
       to "Receipts". Requires `:coordinator_grant` and `terminal_ack: true`.
   """
@@ -433,7 +450,11 @@ defmodule Telelem.Handoff do
   The grant-specific attach: `attach/3` that succeeds **only** on a
   coordinator started with `coordinator_grant` (see "Coordinator grant").
   `deadline:` (an integer, the shared `:terminal_deadline`) is required;
-  anything else raises `ArgumentError` in the caller before any call.
+  anything else, or a deadline more than 4_294_966_295 ms ahead of now
+  (`2^32 - 1` ms, the longest wait, minus the grace), raises
+  `ArgumentError` in the caller before any call. The same bound applies to
+  `deadline:` on `attach/3`, `begin_dispatch/3` and `finish/4`; a past
+  deadline is not refused here.
 
   The coordinator checks its mode in the same step that would register the
   caller, before anything else: a coordinator without `coordinator_grant`
@@ -483,9 +504,23 @@ defmodule Telelem.Handoff do
 
   defp deadline_opt(opts, fun) do
     case Keyword.get(opts, :deadline) do
-      d when is_nil(d) or is_integer(d) -> d
+      nil -> nil
+      d when is_integer(d) -> in_range!(d, fun)
       other -> raise ArgumentError, "#{fun} :deadline must be an integer, got: #{inspect(other)}"
     end
+  end
+
+  # Before any monitor or message: a deadline whose `+ grace` bound cannot be
+  # waited for is refused in the caller, so the coordinator never sees the
+  # call. A past deadline passes (its expiry handling is unchanged).
+  defp in_range!(d, fun) do
+    if deadline_in_range?(d),
+      do: d,
+      else:
+        raise(
+          ArgumentError,
+          "#{fun} :deadline must be at most #{@max_deadline_ahead} ms ahead of now"
+        )
   end
 
   # One deferred reply, bounded by the shared absolute deadline plus the
@@ -562,7 +597,7 @@ defmodule Telelem.Handoff do
           nil
 
         d when is_integer(d) ->
-          d + @decision_grace
+          in_range!(d, "finish/4") + @decision_grace
 
         other ->
           raise ArgumentError, "finish/4 :deadline must be an integer, got: #{inspect(other)}"
@@ -732,6 +767,11 @@ defmodule Telelem.Handoff do
 
       not valid_grant_opt?(grant_opt, admission, ids, deadline) ->
         {:stop, {:bad_option, :coordinator_grant}}
+
+      grant_opt != nil and not deadline_in_range?(deadline) ->
+        # Grant mode: every attempt wait is `deadline + grace`; refuse a
+        # deadline no wait can cover, before any timer or registration.
+        {:stop, {:bad_option, :terminal_deadline}}
 
       not (is_nil(receipts_cfg) or (grant_opt != nil and terminal_ack and receipts_cfg != :error)) ->
         {:stop, {:bad_option, :receipts}}

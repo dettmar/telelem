@@ -128,7 +128,10 @@ defmodule Telelem.Wire.Upstream do
     * `d` is the coordinator's absolute `:terminal_deadline`
       (`System.monotonic_time(:millisecond)`). The same integer is passed as
       `deadline:` to `Handoff.attach_grant/3`, `Handoff.begin_dispatch/3` and
-      `Handoff.finish/4`.
+      `Handoff.finish/4`. It may be past, but at most
+      `Handoff.max_deadline_ahead_ms/0` (4_294_966_295 ms, `2^32 - 1` minus
+      the coordinator's 1000 ms grace) ahead of now; a later one is refused
+      before spawn, since no Handoff wait could cover `d + grace`.
 
   **Order.**
 
@@ -304,6 +307,12 @@ defmodule Telelem.Wire.Upstream do
         [deadline: d, target: t] when is_integer(d) -> {t, d}
         _ -> gate_error(":gate must be exactly [target: _, deadline: integer]")
       end
+
+    # Handoff's shared bound: every Handoff wait on `d` is `d + grace`, which
+    # must fit one wait. Checked before spawn and again in the attempt (later,
+    # so never looser). A past deadline passes and stops the attempt as before.
+    unless Handoff.deadline_in_range?(deadline),
+      do: gate_error(":gate deadline must be at most #{Handoff.max_deadline_ahead_ms()} ms ahead")
 
     case target do
       %VerifiedTarget{deployment_id: id} = t ->
