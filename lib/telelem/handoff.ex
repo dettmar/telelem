@@ -273,7 +273,10 @@ defmodule Telelem.Handoff do
       `{:activate, s}` from the exact requester pid. Every other message is
       ignored, except the exact expiry, the requester's or the authority's
       `:DOWN` (the coordinator then stops `:normal`) and the observer's `:DOWN`
-      (recorded as `:lost`, silently). `terminate/2` while inactive sends,
+      (recorded as `:lost`, silently). Every cast (the API sends none) is
+      ignored the same way: no change, no crash, nothing sent; once active,
+      or without the option, a cast is unchanged (`GenServer`'s default
+      raises). `terminate/2` while inactive sends,
       emits and publishes nothing, whatever the reason (a parent exit
       included). The requester learns of these stops only from its monitor.
     * Activation is one step in the coordinator, from the requester only and
@@ -295,17 +298,24 @@ defmodule Telelem.Handoff do
       `{:error, :duplicate}` (the requester) or `{:error, :not_requester}`.
       A coordinator without the option answers `{:error, :no_activation}`.
 
-  `activate/2` is the requester's wait. It is bounded by the absolute `s`,
-  never kills the coordinator, never waits for a `:DOWN` and never retries.
-  Before submission it returns `{:error, :activation_expired}` (`now >= s`)
-  or `{:error, :handoff_down}` (no process); neither can have published
-  anything. After submission, anything but a reply (a timeout at `s`, or the
-  coordinator's exit) is `{:error, :unconfirmed}`: ingress may or may not
-  have been published, and the caller must not treat it as "not activated".
+  `activate/2` is the requester's wait. It is bounded by the absolute `s`
+  (`:gen_server.receive_response/2` with `{:abs, s}`, then a clock check
+  after the reply: a reply observed at `now >= s` is not used), never kills
+  the coordinator, never waits for a `:DOWN` and never retries. Before
+  submission it returns `{:error, :activation_expired}` (`now >= s`) or
+  `{:error, :handoff_down}` (a local pid not alive, or a name resolving to
+  no process); neither sent anything.
+  After submission, anything but a reply checked before `s` (a timeout, the
+  coordinator's exit for any reason, `:noproc` included, or a reply
+  observed at or after `s`) is `{:error, :unconfirmed}`: ingress may or may
+  not have been published, and the caller must not treat it as "not
+  activated". The bound is a clock check, not real-time scheduling.
 
-  Known limit: an activation check that passes just before `s` with a reply
-  that reaches the caller after its own bound at `s` is reported as
-  `:unconfirmed` while the coordinator is active.
+  Known limits: an activation check that passes just before `s` with a reply
+  the caller observes at or after `s` is reported as `:unconfirmed` while
+  the coordinator is active. A coordinator that exits between the caller's
+  liveness check and the send was not submitted to, but is reported
+  `:unconfirmed` (conservative).
 
   ## Charges: a local, conservative hint
 
@@ -507,37 +517,73 @@ defmodule Telelem.Handoff do
     * `{:error, :activation_expired}`: `now >= limit`, either here before
       sending (nothing was sent) or at the coordinator's check (it stopped).
       Not active, nothing published.
-    * `{:error, :handoff_down}`: no coordinator process when the call was
-      made; nothing was submitted.
-    * `{:error, :unconfirmed}`: submitted, but no reply by `limit` or the
-      coordinator exited first. It may be active with `ingress` published.
-      Never retry or treat it as "not activated".
+    * `{:error, :handoff_down}`: before sending, `h` was a local pid that
+      was not alive (or a name that resolved to no process); nothing was
+      submitted.
+    * `{:error, :unconfirmed}`: submitted, and no reply was received and
+      checked before `limit`: a timeout, the coordinator's exit for any
+      reason (`:noproc` included), or a reply observed at or after `limit`.
+      It may be active with `ingress` published. Never retry or treat it as
+      "not activated".
     * Other `{:error, _}` replies (`:not_requester`,
       `:activation_limit_mismatch`, `:duplicate`, `:no_activation`,
-      `:receipts_unbound`) are the coordinator's decision; only
-      `:duplicate` means it is (still) active.
+      `:receipts_unbound`), received before `limit`, are the coordinator's
+      decision; only `:duplicate` means it is (still) active.
 
-  The wait ends at `limit` at the latest. The coordinator is not killed and
-  no `:DOWN` is awaited; a reply after the bound is discarded.
+  The request is sent with `:gen_server.send_request/2` and awaited with
+  `:gen_server.receive_response/2` and the absolute timeout `{:abs, limit}`;
+  a reply is returned only if a clock read after receiving it is still
+  `< limit`. On a timeout the request is abandoned (OTP deactivates its
+  reply alias, so a late reply is discarded). The coordinator is not killed
+  and no `:DOWN` is awaited. This is a monotonic-clock check, not a
+  real-time guarantee: the caller may be scheduled after `limit`, and is
+  then told `:unconfirmed`, never a decision.
   """
   def activate(h, limit) when is_integer(limit) do
     in_range!(limit, "activate/2")
 
-    if System.monotonic_time(:millisecond) >= limit do
-      {:error, :activation_expired}
-    else
-      try do
-        GenServer.call(h, {:activate, limit}, remaining(limit))
-      catch
-        # The monitor saw no process before the request was sent.
-        :exit, {:noproc, _} -> {:error, :handoff_down}
-        :exit, _ -> {:error, :unconfirmed}
-      end
+    cond do
+      # Known non-submission only: nothing has been sent in either branch.
+      System.monotonic_time(:millisecond) >= limit -> {:error, :activation_expired}
+      not submittable?(h) -> {:error, :handoff_down}
+      true -> await_activation(:gen_server.send_request(h, {:activate, limit}), limit)
     end
   end
 
   def activate(_h, other),
     do: raise(ArgumentError, "activate/2 limit must be an integer, got: #{inspect(other)}")
+
+  # Before the request: is there anything it could be submitted to? A dead
+  # local pid stays dead, so `false` proves non-submission. A name resolving
+  # to no process likewise. Anything else is submitted (a coordinator dying
+  # after this check is then reported :unconfirmed, conservatively).
+  defp submittable?(h) do
+    case GenServer.whereis(h) do
+      nil -> false
+      pid when is_pid(pid) and node(pid) == node() -> Process.alive?(pid)
+      _remote -> true
+    end
+  end
+
+  # After submission. The bound is the absolute `limit`, handed to OTP as
+  # `{:abs, limit}` so the remaining time is computed at the wait, after the
+  # request was sent. A reply counts only if a clock read after receiving it
+  # is still `< limit` (equality is expired). Everything else, `:noproc`
+  # included, is unconfirmed. On a timeout `receive_response/2` deactivates
+  # the reply alias (so a later reply is discarded by the runtime) and
+  # nothing waits for a :DOWN.
+  defp await_activation(req, limit) do
+    case :gen_server.receive_response(req, {:abs, limit}) do
+      {:reply, reply} ->
+        if System.monotonic_time(:millisecond) < limit, do: reply, else: {:error, :unconfirmed}
+
+      {:error, {_reason, _server}} ->
+        {:error, :unconfirmed}
+
+      :timeout ->
+        {:error, :unconfirmed}
+    end
+  end
 
   # ── Attempt API (call from the attempt process itself) ───────────────────
 
@@ -1318,6 +1364,30 @@ defmodule Telelem.Handoff do
   end
 
   def handle_call(:status, _from, s), do: {:reply, status_map(s), s}
+
+  @impl true
+  # While inactive a cast is ignored like every other message: no state
+  # change, no crash, nothing sent or published. Otherwise unchanged: the
+  # body of GenServer's default handle_cast/2 (it raises), copied because
+  # calling `super` for a GenServer callback is deprecated.
+  def handle_cast(_msg, %{activation: %{state: :inactive}} = s), do: {:noreply, s}
+
+  def handle_cast(msg, s) do
+    proc =
+      case Process.info(self(), :registered_name) do
+        {_, []} -> self()
+        {_, name} -> name
+      end
+
+    # As in the default: keeps Dialyzer from flagging a non-local return.
+    case :erlang.phash2(1, 1) do
+      0 ->
+        raise "attempted to cast GenServer #{inspect(proc)} but no handle_cast/2 clause was provided"
+
+      1 ->
+        {:stop, {:bad_cast, msg}, s}
+    end
+  end
 
   @impl true
   # While inactive every message goes through the one gate first.

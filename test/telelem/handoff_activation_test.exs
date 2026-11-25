@@ -16,14 +16,19 @@ defmodule Telelem.HandoffActivationTest do
 
   Interleavings are forced by suspending the coordinator
   (`:erlang.suspend_process/1`) while a request sits in its mailbox. The
-  case "check passed before `s`, reply after the caller's own bound" cannot
-  be forced without a seam between the coordinator's clock check and its
-  reply; it is covered by the two lost-reply cases (the caller abandons its
-  request, and the caller dies), which reach the same coordinator state.
-  The abandon case sends the documented request term `{:activate, s}`
-  through `:gen_server.send_request/2` and abandons it with
+  case "check passed before `s`, reply observed by the caller at or after
+  `s`" is forced by suspending the caller instead, after its request was
+  sent: the coordinator activates and replies, the clock passes `s`, then
+  the caller resumes with the reply already in its mailbox. The lost-reply
+  cases (the caller abandons its request, and the caller dies) reach the
+  same coordinator state. The abandon case sends the documented request term
+  `{:activate, s}` through `:gen_server.send_request/2` and abandons it with
   `receive_response(req, 0)`, which is what `activate/2`'s own timeout does
-  (the reply alias is deactivated).
+  (the reply alias is deactivated). The `:noproc`-after-submission case
+  uses a scripted fake server (it receives the request, then exits
+  `:noproc`): a real coordinator cannot be made to exit with that reason
+  after the request is queued without a seam, and only `activate/2`'s own
+  classification is under test there.
 
       scripts/mix test test/telelem/handoff_activation_test.exs --seed 0
   """
@@ -449,7 +454,12 @@ defmodule Telelem.HandoffActivationTest do
       try do
         # Submitted before s (now < s), handled only after it; the expiry
         # message (due at s) is queued behind it.
-        req_call!(r, fn -> Handoff.activate(h, r.s) end, @window + @t)
+        res = req_call!(r, fn -> Handoff.activate(h, r.s) end, @window + @t)
+        # Returned with the coordinator still alive (suspended): it was not
+        # killed and no :DOWN was awaited; the request's monitor is gone.
+        assert Process.alive?(h)
+        assert {:monitors, []} = Process.info(r.req, :monitors)
+        res
       after
         true = :erlang.resume_process(h)
       end
@@ -527,6 +537,130 @@ defmodule Telelem.HandoffActivationTest do
     assert %{observed_outcome: :failed} = lookup!(ctx.store, "caller-died")
     assert {:receipt, :ingress, :ok} in collected(r)
     assert :activated in collected(r)
+  end
+
+  test "a reply received but observed at s is :unconfirmed (post-reply clock check); the coordinator stays active",
+       ctx do
+    r = start_inactive!(ctx, "late-reply", activation_limit: now() + @window)
+    h = r.h
+    session = :trace.session_create(:handoff_activation_late_reply, self(), [])
+    1 = :trace.process(session, r.req, true, [:send])
+    1 = :trace.process(session, h, true, [:send])
+    true = :erlang.suspend_process(h)
+    ref = req_do(r, fn -> Handoff.activate(h, r.s) end)
+
+    try do
+      # Submitted while the coordinator is suspended; then the caller is
+      # suspended too, so it cannot take the reply before s.
+      assert_receive {:trace, _, :send, {:"$gen_call", _, {:activate, _}}, ^h}, @t
+      true = :erlang.suspend_process(r.req)
+      true = :erlang.resume_process(h)
+
+      # The coordinator's own check passes before s and it replies :ok to the
+      # caller, whose reply alias is still active.
+      assert %{activation: :active} = Handoff.status(h)
+      # gen_server replies to the request's alias (a reference), not the pid.
+      assert_receive {:trace, ^h, :send, {[:alias | _], :ok}, _alias}, @t
+      assert now() < r.s
+      wait_until(r.s)
+    after
+      :trace.session_destroy(session)
+      true = :erlang.resume_process(r.req)
+    end
+
+    # The reply is in the caller's mailbox when it resumes, but its clock
+    # read is >= s: not used as a decision.
+    assert_receive {:req_did, ^ref, {:error, :unconfirmed}}, @t
+    req_quiet!(r)
+
+    # Active with ingress published, untouched by s (the expiry was cancelled).
+    assert %{activation: :active, outcome: nil, phase: :open} = Handoff.status(h)
+    assert [{:ingress, 0, :none, :none, :none}] = events!(ctx.store, "late-reply")
+    assert :ok = req_call!(r, fn -> Handoff.cancel(h, :gone) end)
+    assert_receive {:req, {:telelem_handoff, ^h, {:failed, :gone}}}, @t
+    assert [:ingress, :terminal] = kinds!(ctx.store, "late-reply")
+  end
+
+  test "after submission any exit, :noproc included, is :unconfirmed; only a dead pid before sending is :handoff_down",
+       ctx do
+    test = self()
+    s = now() + 30_000
+
+    # A scripted server: it receives the activation (so it was submitted),
+    # reports it, then exits with the given reason.
+    for reason <- [:noproc, :normal, :boom] do
+      fake =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", _from, {:activate, ^s}} = m ->
+              send(test, {:fake_got, self(), m})
+              exit(reason)
+          end
+        end)
+
+      assert {:error, :unconfirmed} = in_proc(fn -> Handoff.activate(fake, s) end),
+             inspect(reason)
+
+      assert_received {:fake_got, ^fake, _}
+    end
+
+    # Known non-submission: a coordinator already gone (pid not alive).
+    r = start_inactive!(ctx, "down-before")
+    hmon = Process.monitor(r.h)
+    Process.exit(r.h, :kill)
+    assert_receive {:DOWN, ^hmon, :process, _, :killed}, @t
+
+    session = :trace.session_create(:handoff_activation_down, self(), [])
+    1 = :trace.process(session, r.req, true, [:send])
+    assert {:error, :handoff_down} = activate!(r)
+    trace_ref = :trace.delivered(session, r.req)
+    assert_receive {:trace_delivered, _, ^trace_ref}, @t
+    :trace.session_destroy(session)
+    # Nothing was sent to it.
+    h = r.h
+    refute_received {:trace, _, :send, _, ^h}
+
+    # A name that resolves to no process: not submitted either.
+    assert {:error, :handoff_down} = Handoff.activate(:telelem_no_such_handoff, s)
+  end
+
+  # ── casts ───────────────────────────────────────────────────────────────
+
+  @tag :capture_log
+  test "inactive: casts are ignored silently (no change, no crash); once active a cast is unchanged",
+       ctx do
+    r = start_inactive!(ctx, "cast")
+    h = r.h
+    hmon = Process.monitor(h)
+    mons = monitored(h)
+
+    for msg <- [{:activate, r.s}, {:cancel, :gone}, {:terminal_written, :ok}, :status, :junk] do
+      GenServer.cast(h, msg)
+      :ok = req_call!(r, fn -> GenServer.cast(h, msg) end)
+    end
+
+    assert %{
+             activation: :inactive,
+             phase: :open,
+             outcome: nil,
+             grant: :idle,
+             observer: :up,
+             attempts: %{primary: %{pid: nil, cleanup: nil, charge: nil}}
+           } = Handoff.status(h)
+
+    refute_received {:DOWN, ^hmon, _, _, _}
+    assert monitored(h) == mons
+    assert_quiet!(r)
+    assert Store.stats(ctx.store).receipts == 0
+    assert Authority.snapshot(ctx.auth).grants == %{}
+
+    # Still activatable, exactly once.
+    assert :ok = activate!(r)
+    assert [:ingress] = kinds!(ctx.store, "cast")
+
+    # Active: unchanged default (GenServer's handle_cast/2 raises).
+    GenServer.cast(h, :junk)
+    assert_receive {:DOWN, ^hmon, :process, ^h, {%RuntimeError{}, _}}, @t
   end
 
   # ── lifecycle expiry ────────────────────────────────────────────────────
